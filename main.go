@@ -26,6 +26,16 @@ type Config struct {
 	TestBasePort     int
 	ProxyPort        int
 	MinimumSpeed     float64
+	MaxTestPerCycle  int
+}
+
+// MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
+// The subscription is latency-sorted, so testing beyond this is wasted work.
+func (c *Config) MaxTestPerCycleVal() int {
+	if c.MaxTestPerCycle > 0 {
+		return c.MaxTestPerCycle
+	}
+	return 20
 }
 
 func parseConfig() (*Config, error) {
@@ -156,6 +166,18 @@ func parseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: MINIMUM_SPEED=%q: must be >= 0.1", v)
 		}
 		cfg.MinimumSpeed = n
+	}
+
+	cfg.MaxTestPerCycle = 20
+	if v := os.Getenv("MAX_TEST_PER_CYCLE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: MAX_TEST_PER_CYCLE=%q: must be a valid integer", v)
+		}
+		if n < 1 || n > 500 {
+			return nil, fmt.Errorf("error: MAX_TEST_PER_CYCLE=%q: must be between 1 and 500", v)
+		}
+		cfg.MaxTestPerCycle = n
 	}
 
 	return cfg, nil
@@ -325,33 +347,50 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 		return
 	}
 
-	results := TestAll(configs, cfg.TestBasePort, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize)
-	results = SortResults(results)
+	// The subscription is latency-sorted (viberayd serves best configs first).
+	// Test in that order and promote the first configs that clear the
+	// MINIMUM_SPEED bar — no need to test the entire list. This bounds each
+	// cycle to roughly WAN_COUNT tests plus the candidates we actually use.
+	results := []*TestResult{}
+	tested := 0
+	for _, c := range configs {
+		if pool.ActiveCount() >= cfg.WanCount && len(pool.GetSlotsByState(StateEmpty)) == 0 {
+			break
+		}
+		if tested >= cfg.MaxTestPerCycleVal() {
+			break
+		}
+		result := TestSpeed(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize)
+		tested++
+		results = append(results, result)
 
-	writeSortedTxt(results)
-
-	for _, r := range results {
+		// Fill empty slots immediately as soon as a config passes.
+		if result.Error != nil || result.Speed < cfg.MinimumSpeed {
+			continue
+		}
 		emptySlots := pool.GetSlotsByState(StateEmpty)
 		if len(emptySlots) == 0 {
 			break
 		}
-		if r.Error != nil || r.Speed < cfg.MinimumSpeed {
-			continue
-		}
 		slotIdx := emptySlots[0]
-		pool.StartTesting(slotIdx, r.Config)
-		cmd, path, err := StartXray(r.Config, cfg.WanBasePort+slotIdx)
+		pool.StartTesting(slotIdx, result.Config)
+		cmd, path, err := StartXray(result.Config, cfg.WanBasePort+slotIdx)
 		if err != nil {
 			slog.Warn("cycle: xray start failed", "error", err)
 			pool.ResetEmpty(slotIdx)
 			continue
 		}
 		pool.SetActive(slotIdx, cmd, path)
-		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", r.Config.Server, "speed", r.Speed)
+		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed)
 	}
 
+	writeSortedTxt(results)
+
+	// Replacement: only consider candidates tested this cycle, and only when
+	// the pool is already full — replace the first active WAN with the best
+	// new config we actually measured.
 	activeSlots := pool.GetSlotsByState(StateActive)
-	if len(activeSlots) > 0 {
+	if len(activeSlots) == cfg.WanCount && len(results) > 0 {
 		var bestNewConfig *ProxyConfig
 		var bestNewSpeed float64
 		for _, r := range results {
@@ -386,7 +425,7 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 		}
 	}
 
-	slog.Info("cycle: complete", "active", pool.ActiveCount())
+	slog.Info("cycle: complete", "active", pool.ActiveCount(), "tested", tested)
 }
 
 func main() {
