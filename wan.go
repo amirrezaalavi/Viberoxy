@@ -33,14 +33,16 @@ func (s WANState) String() string {
 }
 
 type WANSlot struct {
-	Index       int
-	State       WANState
-	Config      *ProxyConfig
-	Cmd         *exec.Cmd
-	ConfigPath  string
-	ServicePort int
-	ConnCount   int64
-	DrainAt     time.Time
+	Index            int
+	State            WANState
+	Config           *ProxyConfig
+	Cmd              *exec.Cmd
+	ConfigPath       string
+	ServicePort      int
+	ConnCount        int64
+	ConsecutiveFails int64
+	SpeedMbps        float64
+	DrainAt          time.Time
 
 	mu sync.Mutex
 }
@@ -128,6 +130,8 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.Cmd = nil
 	slot.ConfigPath = ""
 	slot.ConnCount = 0
+	slot.ConsecutiveFails = 0
+	slot.SpeedMbps = 0
 	slot.DrainAt = time.Time{}
 	slot.mu.Unlock()
 	return nil
@@ -172,7 +176,28 @@ func (p *WANPool) ActiveCount() int {
 	return count
 }
 
-func (p *WANPool) HealthyActiveCount() int {
+// HealthyActiveCount returns the number of active/draining slots considered
+// healthy. Called with no arguments it health-checks the underlying xray
+// process (legacy behavior). Called with a threshold it counts slots whose
+// ConsecutiveFails is strictly below the threshold.
+func (p *WANPool) HealthyActiveCount(thresholds ...int) int {
+	if len(thresholds) > 0 {
+		threshold := thresholds[0]
+		count := 0
+		for _, slot := range p.Slots {
+			slot.mu.Lock()
+			s := slot.State
+			fails := atomic.LoadInt64(&slot.ConsecutiveFails)
+			slot.mu.Unlock()
+			if s == StateActive || s == StateDraining {
+				if fails < int64(threshold) {
+					count++
+				}
+			}
+		}
+		return count
+	}
+
 	count := 0
 	for _, slot := range p.Slots {
 		slot.mu.Lock()
@@ -186,6 +211,44 @@ func (p *WANPool) HealthyActiveCount() int {
 		}
 	}
 	return count
+}
+
+// RecordFailure atomically increments a slot's consecutive-failure counter.
+func (p *WANPool) RecordFailure(index int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	atomic.AddInt64(&p.Slots[index].ConsecutiveFails, 1)
+}
+
+// RecordSuccess atomically resets a slot's consecutive-failure counter.
+func (p *WANPool) RecordSuccess(index int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	atomic.StoreInt64(&p.Slots[index].ConsecutiveFails, 0)
+}
+
+// SlotSpeedMbps returns the last measured speed for a slot (0 if unknown).
+func (p *WANPool) SlotSpeedMbps(index int) float64 {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.SpeedMbps
+}
+
+// SetSlotSpeedMbps records the measured speed for a slot.
+func (p *WANPool) SetSlotSpeedMbps(index int, speed float64) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	slot.SpeedMbps = speed
 }
 
 func (p *WANPool) GetLeastLoaded() int {

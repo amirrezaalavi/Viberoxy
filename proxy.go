@@ -6,20 +6,24 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type ProxyServer struct {
-	port   int
-	pool   *WANPool
-	server *http.Server
+	port      int
+	pool      *WANPool
+	server    *http.Server
+	AccessLog bool
 }
 
 func NewProxyServer(port int, pool *WANPool) *ProxyServer {
 	return &ProxyServer{
-		port: port,
-		pool: pool,
+		port:      port,
+		pool:      pool,
+		AccessLog: true,
 	}
 }
 
@@ -66,6 +70,7 @@ func (p *ProxyServer) Stop(ctx context.Context) error {
 }
 
 func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	targetHost := r.Host
 	if targetHost == "" {
 		http.Error(w, "Bad Request", 400)
@@ -81,12 +86,16 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	p.pool.IncConnCount(wanIndex)
 	defer p.pool.DecConnCount(wanIndex)
 
+	metricProxyConnections.Inc(strconv.Itoa(wanIndex), "connect")
+
 	servicePort := p.pool.Slots[wanIndex].ServicePort
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", servicePort)
 
 	conn, err := socks5Dial(r.Context(), socksAddr, targetHost)
 	if err != nil {
+		p.pool.RecordFailure(wanIndex)
 		slog.Warn("socks5 dial failed", "wan", wanIndex, "target", targetHost, "error", err)
+		p.logAccess(targetHost, wanIndex, 0, 0, start, "err")
 		http.Error(w, "Bad Gateway", 502)
 		return
 	}
@@ -109,18 +118,44 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	var wg sync.WaitGroup
+	var upBytes, downBytes int64
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, clientConn)
+		n, _ := io.Copy(conn, clientConn)
+		atomic.AddInt64(&upBytes, n)
 		conn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(clientConn, conn)
+		n, _ := io.Copy(clientConn, conn)
+		atomic.AddInt64(&downBytes, n)
 		clientConn.Close()
 	}()
 	wg.Wait()
+
+	up := atomic.LoadInt64(&upBytes)
+	down := atomic.LoadInt64(&downBytes)
+	metricProxyBytes.Add(float64(up), strconv.Itoa(wanIndex), "up")
+	metricProxyBytes.Add(float64(down), strconv.Itoa(wanIndex), "down")
+	metricProxyLatency.Observe(time.Since(start).Seconds())
+	p.pool.RecordSuccess(wanIndex)
+	p.logAccess(targetHost, wanIndex, up, down, start, "ok")
+}
+
+// logAccess emits one structured access-log line per proxied connection.
+func (p *ProxyServer) logAccess(target string, wan int, up, down int64, start time.Time, status string) {
+	if !p.AccessLog {
+		return
+	}
+	slog.Info("proxy access",
+		"target", target,
+		"wan", wan,
+		"bytes_up", up,
+		"bytes_down", down,
+		"latency_ms", time.Since(start).Milliseconds(),
+		"status", status,
+	)
 }
 
 func (p *ProxyServer) handleDefault(w http.ResponseWriter, r *http.Request) {

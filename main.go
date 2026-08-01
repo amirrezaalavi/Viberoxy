@@ -25,8 +25,10 @@ type Config struct {
 	WanBasePort      int
 	TestBasePort     int
 	ProxyPort        int
+	MetricsPort      int
 	MinimumSpeed     float64
 	MaxTestPerCycle  int
+	AccessLog        bool
 }
 
 // MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
@@ -180,6 +182,30 @@ func parseConfig() (*Config, error) {
 		cfg.MaxTestPerCycle = n
 	}
 
+	// METRICS_PORT: 0 disables the observability server (/metrics, /healthz,
+	// /readyz). Any value in 1..65535 starts it on that port.
+	cfg.MetricsPort = 0
+	if v := os.Getenv("METRICS_PORT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: METRICS_PORT=%q: must be a valid integer", v)
+		}
+		if n < 0 || n > 65535 {
+			return nil, fmt.Errorf("error: METRICS_PORT=%q: must be between 0 and 65535", v)
+		}
+		cfg.MetricsPort = n
+	}
+
+	// ACCESS_LOG: enable one structured log line per proxied connection.
+	cfg.AccessLog = true
+	if v := os.Getenv("ACCESS_LOG"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: ACCESS_LOG=%q: must be a boolean (true/false)", v)
+		}
+		cfg.AccessLog = b
+	}
+
 	return cfg, nil
 }
 
@@ -270,6 +296,7 @@ func startup(cfg *Config, ctx context.Context) {
 				continue
 			}
 			pool.SetActive(slotIdx, cmd, path)
+			pool.SetSlotSpeedMbps(slotIdx, result.Speed)
 			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed)
 		}
 
@@ -291,11 +318,26 @@ func startup(cfg *Config, ctx context.Context) {
 	}
 
 	proxy := NewProxyServer(cfg.ProxyPort, pool)
+	proxy.AccessLog = cfg.AccessLog
 	go func() {
 		if err := proxy.Start(ctx); err != nil && err != http.ErrServerClosed {
 			slog.Error("proxy server error", "error", err)
 		}
 	}()
+
+	var obsSrv *http.Server
+	if cfg.MetricsPort > 0 {
+		obsSrv = &http.Server{
+			Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
+			Handler: NewObservabilityHandler(pool),
+		}
+		go func() {
+			if err := obsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("metrics server error", "error", err)
+			}
+		}()
+		slog.Info("metrics server started", "port", cfg.MetricsPort)
+	}
 
 	slog.Info("viberoxy started", "wans", pool.ActiveCount(), "proxy_port", cfg.ProxyPort)
 
@@ -305,6 +347,11 @@ func startup(cfg *Config, ctx context.Context) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	proxy.Stop(shutdownCtx)
+	if obsSrv != nil {
+		if err := obsSrv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("metrics server shutdown", "error", err)
+		}
+	}
 	pool.ShutdownAll()
 	slog.Info("viberoxy stopped")
 }
@@ -381,6 +428,7 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 			continue
 		}
 		pool.SetActive(slotIdx, cmd, path)
+		pool.SetSlotSpeedMbps(slotIdx, result.Speed)
 		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed)
 	}
 

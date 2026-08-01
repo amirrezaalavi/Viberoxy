@@ -418,6 +418,73 @@ func TestHealthyActiveCount(t *testing.T) {
 	}
 }
 
+func TestRecordFailureSuccess(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	if f := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); f != 2 {
+		t.Errorf("ConsecutiveFails = %d, want 2", f)
+	}
+
+	pool.RecordSuccess(0)
+	if f := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); f != 0 {
+		t.Errorf("ConsecutiveFails after success = %d, want 0", f)
+	}
+
+	// Out-of-range indices must be no-ops.
+	pool.RecordFailure(99)
+	pool.RecordSuccess(-1)
+	if f := atomic.LoadInt64(&pool.Slots[1].ConsecutiveFails); f != 0 {
+		t.Errorf("slot 1 ConsecutiveFails = %d, want 0", f)
+	}
+}
+
+func TestHealthyActiveCount_Threshold(t *testing.T) {
+	pool := NewWANPool(3, 10700)
+	pool.Slots[0].State = StateActive
+	pool.Slots[1].State = StateActive
+	pool.Slots[2].State = StateActive
+
+	pool.RecordFailure(1)
+	pool.RecordFailure(1)
+	pool.RecordFailure(1)
+	pool.RecordFailure(2)
+
+	// Threshold 3: healthy means ConsecutiveFails < 3 → slots 0 and 2.
+	if c := pool.HealthyActiveCount(3); c != 2 {
+		t.Errorf("HealthyActiveCount(3) = %d, want 2", c)
+	}
+	// Threshold 1: only slots with zero consecutive failures → slot 0.
+	if c := pool.HealthyActiveCount(1); c != 1 {
+		t.Errorf("HealthyActiveCount(1) = %d, want 1", c)
+	}
+	// Threshold 0: no slot has fails < 0.
+	if c := pool.HealthyActiveCount(0); c != 0 {
+		t.Errorf("HealthyActiveCount(0) = %d, want 0", c)
+	}
+	// Draining slots participate too.
+	pool.Slots[1].State = StateDraining
+	if c := pool.HealthyActiveCount(3); c != 2 {
+		t.Errorf("HealthyActiveCount(3) with draining = %d, want 2", c)
+	}
+}
+
+func TestSlotSpeedMbps(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	if s := pool.SlotSpeedMbps(0); s != 0 {
+		t.Errorf("initial speed = %v, want 0", s)
+	}
+	pool.SetSlotSpeedMbps(0, 42.5)
+	if s := pool.SlotSpeedMbps(0); s != 42.5 {
+		t.Errorf("speed = %v, want 42.5", s)
+	}
+	if s := pool.SlotSpeedMbps(99); s != 0 {
+		t.Errorf("out-of-range speed = %v, want 0", s)
+	}
+}
+
 func TestResetEmpty_FromTesting(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})

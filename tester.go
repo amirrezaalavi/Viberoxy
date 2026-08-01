@@ -18,6 +18,9 @@ type TestResult struct {
 }
 
 func TestSpeed(cfg *ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64) *TestResult {
+	start := time.Now()
+	defer func() { metricTestDuration.Observe(time.Since(start).Seconds()) }()
+
 	cmd, configPath, err := StartXray(cfg, testPort)
 	if err != nil {
 		return &TestResult{Config: cfg, Error: fmt.Errorf("start xray: %w", err)}

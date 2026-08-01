@@ -50,6 +50,8 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"TEST_BASE_PORT",
 		"PROXY_PORT",
 		"MINIMUM_SPEED",
+		"METRICS_PORT",
+		"ACCESS_LOG",
 	} {
 		unsetenv(t, key)
 	}
@@ -92,6 +94,12 @@ func TestParseConfig_Defaults(t *testing.T) {
 	}
 	if cfg.MinimumSpeed != 5.0 {
 		t.Errorf("MinimumSpeed = %f, want %f", cfg.MinimumSpeed, 5.0)
+	}
+	if cfg.MetricsPort != 0 {
+		t.Errorf("MetricsPort = %d, want 0 (off)", cfg.MetricsPort)
+	}
+	if !cfg.AccessLog {
+		t.Error("AccessLog = false, want true (default)")
 	}
 }
 
