@@ -25,6 +25,11 @@ func TestSpeed(cfg *ProxyConfig, testPort int, timeout time.Duration, downloadUR
 	defer StopXray(cmd, configPath)
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", testPort)
+	// xray binds its SOCKS port asynchronously after spawn; dialing before
+	// the port is open fails every test with connection refused.
+	if err := waitPortReady(socksAddr, 5*time.Second); err != nil {
+		return &TestResult{Config: cfg, Error: fmt.Errorf("xray not ready: %w", err)}
+	}
 	speed, err := DownloadMeasurer(socksAddr, downloadURL, downloadSize, timeout)
 	if err != nil {
 		return &TestResult{Config: cfg, Error: err}
@@ -97,6 +102,19 @@ func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, 
 	}
 
 	return float64(n*8) / elapsed / 1_000_000, nil
+}
+
+func waitPortReady(addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("port %s not reachable within %v", addr, timeout)
 }
 
 func socks5Dial(ctx context.Context, socksAddr, targetAddr string) (net.Conn, error) {

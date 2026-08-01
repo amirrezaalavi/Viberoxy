@@ -255,7 +255,7 @@ func startup(cfg *Config, ctx context.Context) {
 			break
 		}
 
-		for _, idx := range pool.GetSlotsByState(StateActive, StateTesting) {
+		for _, idx := range pool.GetSlotsByState(StateTesting) {
 			pool.ResetEmpty(idx)
 		}
 
