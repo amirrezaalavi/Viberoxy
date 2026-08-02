@@ -176,6 +176,24 @@ func (p *WANPool) ActiveCount() int {
 	return count
 }
 
+// HasServerPort reports whether any active or draining slot already serves
+// the given upstream server:port. Used to avoid promoting the same endpoint
+// into two WAN slots (WAN dedupe). Testing and empty slots are ignored.
+func (p *WANPool) HasServerPort(server string, port int) bool {
+	for _, slot := range p.Slots {
+		slot.mu.Lock()
+		s := slot.State
+		cfg := slot.Config
+		slot.mu.Unlock()
+		if s == StateActive || s == StateDraining {
+			if cfg != nil && cfg.Server == server && cfg.Port == port {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HealthyActiveCount returns the number of active/draining slots considered
 // healthy. Called with no arguments it health-checks the underlying xray
 // process (legacy behavior). Called with a threshold it counts slots whose

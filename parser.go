@@ -46,6 +46,22 @@ func decodeLines(body string) []string {
 	return strings.Split(body, "\n")
 }
 
+// IsXraySupported reports whether a parsed config can be rendered as a real
+// xray outbound. hysteria2, tuic and wireguard parse fine, but buildOutbound
+// maps them to a "freedom" outbound — direct egress, i.e. a traffic leak — so
+// they must never be promoted to a WAN slot. Configs are not removed from the
+// subscription; they are simply skipped during promotion.
+func IsXraySupported(cfg *ProxyConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	switch cfg.Protocol {
+	case "hysteria2", "tuic", "wireguard":
+		return false
+	}
+	return true
+}
+
 func ParseSingle(raw string) *ProxyConfig {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

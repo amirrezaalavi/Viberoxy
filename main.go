@@ -31,6 +31,7 @@ type Config struct {
 	KeepaliveInterval int
 	WanFailThreshold  int
 	AccessLog         bool
+	AllowDegradedBoot bool
 }
 
 // MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
@@ -236,6 +237,18 @@ func parseConfig() (*Config, error) {
 		cfg.AccessLog = b
 	}
 
+	// ALLOW_DEGRADED_BOOT: start the proxy as soon as the first WAN slot is
+	// active instead of waiting for the full WAN_COUNT. When false, the
+	// proxy (and observability server) only start after the pool is full.
+	cfg.AllowDegradedBoot = true
+	if v := os.Getenv("ALLOW_DEGRADED_BOOT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: ALLOW_DEGRADED_BOOT=%q: must be a boolean (true/false)", v)
+		}
+		cfg.AllowDegradedBoot = b
+	}
+
 	return cfg, nil
 }
 
@@ -285,10 +298,68 @@ func writeSortedTxt(results []*TestResult) {
 	}
 }
 
+// logUnsupportedOnce logs a "skipping unsupported protocol" notice at most
+// once per protocol per cycle, so leak-guarded configs (hysteria2/tuic/
+// wireguard) don't spam the log. Each promotion loop passes a fresh set per
+// cycle.
+func logUnsupportedOnce(logged map[string]bool, proto string) {
+	if logged[proto] {
+		return
+	}
+	logged[proto] = true
+	slog.Info("skipping unsupported protocol", "protocol", proto)
+}
+
 func startup(cfg *Config, ctx context.Context) {
 	slog.Info("starting viberoxy...")
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
+
+	var (
+		proxy        *ProxyServer
+		obsSrv       *http.Server
+		proxyStarted bool
+	)
+
+	// startServices boots the HTTPS proxy, the observability server and the
+	// keepalive loop exactly once. With degraded boot enabled this happens
+	// as soon as the first WAN slot is active; otherwise only after the pool
+	// is full. Idempotent, so later calls (e.g. after the pool reaches the
+	// full WAN_COUNT) are no-ops.
+	startServices := func() {
+		if proxyStarted {
+			return
+		}
+		proxyStarted = true
+
+		proxy = NewProxyServer(cfg.ProxyPort, pool)
+		proxy.AccessLog = cfg.AccessLog
+		if cfg.WanFailThreshold > 0 {
+			proxy.WanFailThreshold = cfg.WanFailThreshold
+		}
+		go func() {
+			if err := proxy.Start(ctx); err != nil && err != http.ErrServerClosed {
+				slog.Error("proxy server error", "error", err)
+			}
+		}()
+
+		if cfg.MetricsPort > 0 {
+			obsSrv = &http.Server{
+				Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
+				Handler: NewObservabilityHandler(pool),
+			}
+			go func() {
+				if err := obsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					slog.Error("metrics server error", "error", err)
+				}
+			}()
+			slog.Info("metrics server started", "port", cfg.MetricsPort)
+		}
+
+		if cfg.KeepaliveInterval > 0 {
+			go keepaliveLoop(cfg, pool, ctx)
+		}
+	}
 
 	for {
 		configs := fetchSubscription(cfg.SubscriberURL)
@@ -303,10 +374,22 @@ func startup(cfg *Config, ctx context.Context) {
 		}
 
 		slog.Info("startup: testing configs...", "count", len(configs))
+		skippedUnsupported := map[string]bool{}
 		var tested int
 		for _, c := range configs {
 			if pool.ActiveCount() >= cfg.WanCount {
 				break
+			}
+			// Leak guard: protocols that map to a freedom (direct) xray
+			// outbound must never be promoted to a WAN slot.
+			if !IsXraySupported(c) {
+				logUnsupportedOnce(skippedUnsupported, c.Protocol)
+				continue
+			}
+			// WAN dedupe: never promote the same server:port twice.
+			if pool.HasServerPort(c.Server, c.Port) {
+				slog.Info("skipping duplicate wan", "server", c.Server, "port", c.Port)
+				continue
 			}
 			result := TestSpeed(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize)
 			tested++
@@ -328,12 +411,21 @@ func startup(cfg *Config, ctx context.Context) {
 			pool.SetActive(slotIdx, cmd, path)
 			pool.SetSlotSpeedMbps(slotIdx, result.Speed)
 			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed)
+
+			// Degraded boot: serve traffic as soon as the first WAN is up,
+			// then keep filling slots until the full WAN_COUNT is reached.
+			if cfg.AllowDegradedBoot && !proxyStarted && pool.ActiveCount() >= 1 {
+				startServices()
+				slog.Info("viberoxy started (degraded)", "wans", pool.ActiveCount(), "needed", cfg.WanCount)
+			}
 		}
 
 		if pool.ActiveCount() >= cfg.WanCount {
 			break
 		}
 
+		// Preserve active slots across retries: only reset slots that are
+		// still mid-test; any xray process already promoted stays up.
 		for _, idx := range pool.GetSlotsByState(StateTesting) {
 			pool.ResetEmpty(idx)
 		}
@@ -347,36 +439,8 @@ func startup(cfg *Config, ctx context.Context) {
 		}
 	}
 
-	proxy := NewProxyServer(cfg.ProxyPort, pool)
-	proxy.AccessLog = cfg.AccessLog
-	if cfg.WanFailThreshold > 0 {
-		proxy.WanFailThreshold = cfg.WanFailThreshold
-	}
-	go func() {
-		if err := proxy.Start(ctx); err != nil && err != http.ErrServerClosed {
-			slog.Error("proxy server error", "error", err)
-		}
-	}()
-
-	var obsSrv *http.Server
-	if cfg.MetricsPort > 0 {
-		obsSrv = &http.Server{
-			Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
-			Handler: NewObservabilityHandler(pool),
-		}
-		go func() {
-			if err := obsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				slog.Error("metrics server error", "error", err)
-			}
-		}()
-		slog.Info("metrics server started", "port", cfg.MetricsPort)
-	}
-
+	startServices()
 	slog.Info("viberoxy started", "wans", pool.ActiveCount(), "proxy_port", cfg.ProxyPort)
-
-	if cfg.KeepaliveInterval > 0 {
-		go keepaliveLoop(cfg, pool, ctx)
-	}
 
 	runLoop(cfg, pool, proxy, ctx)
 
@@ -479,12 +543,24 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 	// cycle to roughly WAN_COUNT tests plus the candidates we actually use.
 	results := []*TestResult{}
 	tested := 0
+	skippedUnsupported := map[string]bool{}
 	for _, c := range configs {
 		if pool.ActiveCount() >= cfg.WanCount && len(pool.GetSlotsByState(StateEmpty)) == 0 {
 			break
 		}
 		if tested >= cfg.MaxTestPerCycleVal() {
 			break
+		}
+		// Leak guard: never speed-test or promote protocols that map to a
+		// freedom (direct) xray outbound.
+		if !IsXraySupported(c) {
+			logUnsupportedOnce(skippedUnsupported, c.Protocol)
+			continue
+		}
+		// WAN dedupe: never promote the same server:port twice.
+		if pool.HasServerPort(c.Server, c.Port) {
+			slog.Info("skipping duplicate wan", "server", c.Server, "port", c.Port)
+			continue
 		}
 		result := TestSpeed(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize)
 		tested++

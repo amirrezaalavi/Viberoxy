@@ -5,10 +5,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -54,6 +58,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"ACCESS_LOG",
 		"KEEPALIVE_INTERVAL",
 		"WAN_FAIL_THRESHOLD",
+		"ALLOW_DEGRADED_BOOT",
 	} {
 		unsetenv(t, key)
 	}
@@ -108,6 +113,9 @@ func TestParseConfig_Defaults(t *testing.T) {
 	}
 	if !cfg.AccessLog {
 		t.Error("AccessLog = false, want true (default)")
+	}
+	if !cfg.AllowDegradedBoot {
+		t.Error("AllowDegradedBoot = false, want true (default)")
 	}
 }
 
@@ -253,6 +261,254 @@ func TestParseConfig_EmptyDownloadEndpoint(t *testing.T) {
 	}
 	if cfg.DownloadEndpoint != "" {
 		t.Errorf("DownloadEndpoint = %q, want empty string", cfg.DownloadEndpoint)
+	}
+}
+
+func TestParseConfig_AllowDegradedBootFalse(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ALLOW_DEGRADED_BOOT", "false")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.AllowDegradedBoot {
+		t.Error("AllowDegradedBoot = true, want false")
+	}
+}
+
+func TestParseConfig_AllowDegradedBootTrue(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ALLOW_DEGRADED_BOOT", "true")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if !cfg.AllowDegradedBoot {
+		t.Error("AllowDegradedBoot = false, want true")
+	}
+}
+
+func TestParseConfig_InvalidAllowDegradedBoot(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ALLOW_DEGRADED_BOOT", "maybe")
+
+	_, err := parseConfig()
+	if err == nil {
+		t.Fatal("expected error for ALLOW_DEGRADED_BOOT=maybe, got nil")
+	}
+}
+
+// consecutiveFreePorts returns a port whose next n-1 ports are also free, so
+// callers can hand it to configs that bind base+index.
+func consecutiveFreePorts(t *testing.T, n int) int {
+	t.Helper()
+	for {
+		base := freePort(t)
+		ok := true
+		for i := 1; i < n; i++ {
+			l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+i))
+			if err != nil {
+				ok = false
+				break
+			}
+			l.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+}
+
+// TestStartup_DegradedBoot verifies that with ALLOW_DEGRADED_BOOT the proxy
+// starts as soon as the first WAN slot is active, before the pool reaches the
+// full WAN_COUNT. The second speed test is gated behind a channel: while it
+// is blocked, the pool has exactly one active WAN, so the proxy port becoming
+// reachable proves degraded boot. Requires a real xray binary (like
+// TestTestSpeed); skipped otherwise.
+func TestStartup_DegradedBoot(t *testing.T) {
+	if _, err := exec.LookPath("xray"); err != nil {
+		t.Skip("xray not found in PATH, skipping degraded boot integration test")
+	}
+
+	// Two distinct upstreams so both WAN slots fill without tripping the
+	// server:port dedupe.
+	socksA, addrA := startTestSocksServer(t)
+	defer socksA.Close()
+	socksB, addrB := startTestSocksServer(t)
+	defer socksB.Close()
+	hostA, portStrA, err := net.SplitHostPort(addrA)
+	if err != nil {
+		t.Fatalf("split socksA addr: %v", err)
+	}
+	portA, _ := strconv.Atoi(portStrA)
+	hostB, portStrB, err := net.SplitHostPort(addrB)
+	if err != nil {
+		t.Fatalf("split socksB addr: %v", err)
+	}
+	portB, _ := strconv.Atoi(portStrB)
+
+	// The download server blocks the SECOND speed test until the gate is
+	// closed. While blocked, only WAN slot 0 is active.
+	var mu sync.Mutex
+	requests := 0
+	gate := make(chan struct{})
+	downloadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		first := requests == 1
+		mu.Unlock()
+		if !first {
+			<-gate
+		}
+		w.Header().Set("Content-Length", "50000")
+		w.Write(testDownloadData[:50000])
+	}))
+	defer downloadServer.Close()
+
+	sub := fmt.Sprintf("socks5://%s:%d#wan-a\nsocks5://%s:%d#wan-b\n", hostA, portA, hostB, portB)
+	encoded := base64.StdEncoding.EncodeToString([]byte(sub))
+	subServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(encoded))
+	}))
+	defer subServer.Close()
+
+	cfg := &Config{
+		SubscriberURL:     subServer.URL,
+		FetchInterval:     300,
+		TestTimeout:       10,
+		DownloadSize:      50000,
+		DownloadEndpoint:  downloadServer.URL,
+		DownloadFallback:  downloadServer.URL,
+		WanCount:          2,
+		WanBasePort:       consecutiveFreePorts(t, 2),
+		TestBasePort:      consecutiveFreePorts(t, 2),
+		ProxyPort:         freePort(t),
+		MinimumSpeed:      0.1,
+		AllowDegradedBoot: true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		startup(cfg, ctx)
+	}()
+
+	// The proxy must come up while only 1 of 2 WANs is active (the second
+	// speed test is still blocked on the gate).
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)
+	if err := waitForPort(proxyAddr, 15*time.Second); err != nil {
+		close(gate)
+		cancel()
+		<-done
+		t.Fatalf("proxy did not start with 1 of %d WANs active (degraded boot): %v", cfg.WanCount, err)
+	}
+
+	// Release the second speed test; the pool fills to WAN_COUNT and startup
+	// enters the run loop.
+	close(gate)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup did not return within 5s after context cancel")
+	}
+}
+
+// TestStartup_NoDegradedBoot_PoolMustFill verifies that with
+// ALLOW_DEGRADED_BOOT=false the proxy does NOT start with a single active
+// WAN: while the second speed test is gated, the proxy port must stay closed.
+// Requires a real xray binary; skipped otherwise.
+func TestStartup_NoDegradedBoot_PoolMustFill(t *testing.T) {
+	if _, err := exec.LookPath("xray"); err != nil {
+		t.Skip("xray not found in PATH, skipping degraded boot integration test")
+	}
+
+	socksA, addrA := startTestSocksServer(t)
+	defer socksA.Close()
+	socksB, addrB := startTestSocksServer(t)
+	defer socksB.Close()
+	hostA, portStrA, err := net.SplitHostPort(addrA)
+	if err != nil {
+		t.Fatalf("split socksA addr: %v", err)
+	}
+	portA, _ := strconv.Atoi(portStrA)
+	hostB, portStrB, err := net.SplitHostPort(addrB)
+	if err != nil {
+		t.Fatalf("split socksB addr: %v", err)
+	}
+	portB, _ := strconv.Atoi(portStrB)
+
+	var mu sync.Mutex
+	requests := 0
+	gate := make(chan struct{})
+	downloadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		first := requests == 1
+		mu.Unlock()
+		if !first {
+			<-gate
+		}
+		w.Header().Set("Content-Length", "50000")
+		w.Write(testDownloadData[:50000])
+	}))
+	defer downloadServer.Close()
+
+	sub := fmt.Sprintf("socks5://%s:%d#wan-a\nsocks5://%s:%d#wan-b\n", hostA, portA, hostB, portB)
+	encoded := base64.StdEncoding.EncodeToString([]byte(sub))
+	subServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(encoded))
+	}))
+	defer subServer.Close()
+
+	cfg := &Config{
+		SubscriberURL:     subServer.URL,
+		FetchInterval:     300,
+		TestTimeout:       10,
+		DownloadSize:      50000,
+		DownloadEndpoint:  downloadServer.URL,
+		DownloadFallback:  downloadServer.URL,
+		WanCount:          2,
+		WanBasePort:       consecutiveFreePorts(t, 2),
+		TestBasePort:      consecutiveFreePorts(t, 2),
+		ProxyPort:         freePort(t),
+		MinimumSpeed:      0.1,
+		AllowDegradedBoot: false,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		startup(cfg, ctx)
+	}()
+
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)
+	// Give the first test + activation plenty of time; the proxy must NOT
+	// be listening while the second WAN is still gated.
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", proxyAddr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			close(gate)
+			cancel()
+			<-done
+			t.Fatalf("proxy started before pool was full (degraded boot disabled)")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	close(gate)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup did not return within 5s after context cancel")
 	}
 }
 

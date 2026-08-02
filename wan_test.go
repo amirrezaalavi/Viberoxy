@@ -226,6 +226,69 @@ func TestActiveCount(t *testing.T) {
 	}
 }
 
+func TestHasServerPort(t *testing.T) {
+	pool := NewWANPool(3, 10700)
+
+	// Empty pool: never a match.
+	if pool.HasServerPort("1.2.3.4", 443) {
+		t.Error("HasServerPort on empty pool = true, want false")
+	}
+
+	// Active slot matches its own server:port.
+	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})
+	cmd := exec.Command("sleep", "9999")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start cmd: %v", err)
+	}
+	defer cmd.Process.Kill()
+	if err := pool.SetActive(0, cmd, "/tmp/cfg.json"); err != nil {
+		t.Fatalf("SetActive error: %v", err)
+	}
+
+	if !pool.HasServerPort("1.2.3.4", 443) {
+		t.Error("HasServerPort(active match) = false, want true")
+	}
+	if pool.HasServerPort("1.2.3.4", 8443) {
+		t.Error("HasServerPort(same server, different port) = true, want false")
+	}
+	if pool.HasServerPort("5.6.7.8", 443) {
+		t.Error("HasServerPort(different server) = true, want false")
+	}
+
+	// Draining slots still count as occupied (they serve traffic until the
+	// drain grace period expires).
+	if err := pool.MarkDraining(0); err != nil {
+		t.Fatalf("MarkDraining error: %v", err)
+	}
+	if !pool.HasServerPort("1.2.3.4", 443) {
+		t.Error("HasServerPort(draining match) = false, want true")
+	}
+
+	// A testing slot is NOT a match: the config may fail to activate.
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty error: %v", err)
+	}
+	pool.StartTesting(0, &ProxyConfig{Server: "9.9.9.9", Port: 9999})
+	if pool.HasServerPort("9.9.9.9", 9999) {
+		t.Error("HasServerPort(testing slot) = true, want false")
+	}
+
+	// Reset clears the config, so no stale match remains.
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty error: %v", err)
+	}
+	if pool.HasServerPort("9.9.9.9", 9999) {
+		t.Error("HasServerPort(after reset) = true, want false")
+	}
+
+	// Empty slots with a leftover config pointer are ignored.
+	pool.Slots[1].State = StateEmpty
+	pool.Slots[1].Config = &ProxyConfig{Server: "1.1.1.1", Port: 80}
+	if pool.HasServerPort("1.1.1.1", 80) {
+		t.Error("HasServerPort(empty slot with stale config) = true, want false")
+	}
+}
+
 func TestGetLeastLoaded(t *testing.T) {
 	pool := NewWANPool(3, 10700)
 
