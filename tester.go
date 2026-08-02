@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"time"
@@ -105,6 +107,76 @@ func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, 
 	}
 
 	return float64(n*8) / elapsed / 1_000_000, nil
+}
+
+// ProbeWANURL is the endpoint used by keepalive probes. It is a variable so
+// tests can point it at a local server instead of the real ipify service.
+var ProbeWANURL = "https://api.ipify.org/"
+
+// probeDialTarget returns the host:port pair socks5Dial should be given for a
+// probe URL. socks5Dial requires an explicit port, but u.Host omits it for
+// default schemes (https://api.ipify.org/ -> "api.ipify.org"), which made
+// every probe of a healthy WAN fail with "missing port in address".
+func probeDialTarget(u *url.URL) string {
+	if _, _, err := net.SplitHostPort(u.Host); err == nil {
+		return u.Host
+	}
+	port := "443"
+	if u.Scheme == "http" {
+		port = "80"
+	}
+	return net.JoinHostPort(u.Host, port)
+}
+
+// ProbeWAN checks a WAN slot end-to-end with a lightweight HTTP GET through
+// its SOCKS5 listener. Unlike DownloadMeasurer it transfers no meaningful
+// payload — just enough to prove the dial + HTTP round trip both work. Any
+// failure (dial, write, response parse, non-2xx status, body read) is
+// returned as an error.
+func ProbeWAN(socksAddr string, timeout time.Duration) error {
+	u, err := url.Parse(ProbeWANURL)
+	if err != nil {
+		return fmt.Errorf("parse probe url: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := socks5Dial(ctx, socksAddr, probeDialTarget(u))
+	if err != nil {
+		return fmt.Errorf("socks dial: %w", err)
+	}
+	defer conn.Close()
+
+	// The raw conn does not honor the request context, so bound the whole
+	// probe with an explicit deadline.
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("set probe deadline: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ProbeWANURL, nil)
+	if err != nil {
+		return fmt.Errorf("create probe request: %w", err)
+	}
+	if err := req.Write(conn); err != nil {
+		return fmt.Errorf("write probe request: %w", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		return fmt.Errorf("read probe response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("probe status: %s", resp.Status)
+	}
+
+	// Drain a small slice of the body to confirm data actually flows.
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)); err != nil {
+		return fmt.Errorf("read probe body: %w", err)
+	}
+	return nil
 }
 
 func waitPortReady(addr string, timeout time.Duration) error {

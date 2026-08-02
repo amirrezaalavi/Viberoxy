@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -267,6 +268,104 @@ func TestSOCKS5Dial_InvalidAddr(t *testing.T) {
 	_, err := socks5Dial(ctx, socksAddr, "127.0.0.1:1")
 	if err == nil {
 		t.Fatal("expected error connecting to unreachable address, got nil")
+	}
+}
+
+func TestProbeWAN(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("1.2.3.4"))
+	}))
+	defer probeServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = probeServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err != nil {
+		t.Fatalf("ProbeWAN error: %v", err)
+	}
+}
+
+// TestProbeWAN_PortlessURL is a regression test for the keepalive probe
+// failing on URLs without an explicit port (e.g. https://api.ipify.org/):
+// socks5Dial requires host:port, so the dial target must get the default
+// port appended.
+func TestProbeWAN_PortlessURL(t *testing.T) {
+	orig := ProbeWANURL
+	defer func() { ProbeWANURL = orig }()
+
+	ProbeWANURL = "https://api.ipify.org/"
+	u, err := url.Parse(ProbeWANURL)
+	if err != nil {
+		t.Fatalf("parse probe url: %v", err)
+	}
+	if got := probeDialTarget(u); got != "api.ipify.org:443" {
+		t.Errorf("probeDialTarget(https portless) = %q, want %q", got, "api.ipify.org:443")
+	}
+
+	ProbeWANURL = "http://example.com/speed"
+	u, _ = url.Parse(ProbeWANURL)
+	if got := probeDialTarget(u); got != "example.com:80" {
+		t.Errorf("probeDialTarget(http portless) = %q, want %q", got, "example.com:80")
+	}
+
+	ProbeWANURL = "https://127.0.0.1:8443/"
+	u, _ = url.Parse(ProbeWANURL)
+	if got := probeDialTarget(u); got != "127.0.0.1:8443" {
+		t.Errorf("probeDialTarget(explicit port) = %q, want %q", got, "127.0.0.1:8443")
+	}
+}
+
+func TestProbeWAN_Timeout(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.Write([]byte("done"))
+	}))
+	defer slowServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = slowServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if err := ProbeWAN(socksAddr, 100*time.Millisecond); err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestProbeWAN_SocksUnreachable(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	if err := ProbeWAN(addr, 500*time.Millisecond); err == nil {
+		t.Fatal("expected error for unreachable socks listener, got nil")
+	}
+}
+
+func TestProbeWAN_BadStatus(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	errServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer errServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = errServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err == nil {
+		t.Fatal("expected error for non-2xx probe status, got nil")
 	}
 }
 
