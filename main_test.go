@@ -58,6 +58,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"ACCESS_LOG",
 		"KEEPALIVE_INTERVAL",
 		"WAN_FAIL_THRESHOLD",
+		"STABILITY_PROBES",
 		"ALLOW_DEGRADED_BOOT",
 	} {
 		unsetenv(t, key)
@@ -110,6 +111,9 @@ func TestParseConfig_Defaults(t *testing.T) {
 	}
 	if cfg.WanFailThreshold != 2 {
 		t.Errorf("WanFailThreshold = %d, want %d", cfg.WanFailThreshold, 2)
+	}
+	if cfg.StabilityProbes != 0 {
+		t.Errorf("StabilityProbes = %d, want 0 (disabled by default)", cfg.StabilityProbes)
 	}
 	if !cfg.AccessLog {
 		t.Error("AccessLog = false, want true (default)")
@@ -190,6 +194,45 @@ func TestParseConfig_InvalidWanFailThreshold(t *testing.T) {
 	_, err := parseConfig()
 	if err == nil {
 		t.Fatal("expected error for WAN_FAIL_THRESHOLD < 1, got nil")
+	}
+}
+
+func TestParseConfig_StabilityProbesValid(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "STABILITY_PROBES", "3")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.StabilityProbes != 3 {
+		t.Errorf("StabilityProbes = %d, want 3", cfg.StabilityProbes)
+	}
+}
+
+func TestParseConfig_StabilityProbesZero(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "STABILITY_PROBES", "0")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.StabilityProbes != 0 {
+		t.Errorf("StabilityProbes = %d, want 0", cfg.StabilityProbes)
+	}
+}
+
+func TestParseConfig_InvalidStabilityProbes(t *testing.T) {
+	for _, v := range []string{"abc", "6", "-1", "2.5"} {
+		t.Run(v, func(t *testing.T) {
+			setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+			setenv(t, "STABILITY_PROBES", v)
+
+			if _, err := parseConfig(); err == nil {
+				t.Fatalf("expected error for STABILITY_PROBES=%q, got nil", v)
+			}
+		})
 	}
 }
 

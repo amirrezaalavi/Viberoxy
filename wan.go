@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,7 +43,11 @@ type WANSlot struct {
 	ConnCount        int64
 	ConsecutiveFails int64
 	SpeedMbps        float64
-	DrainAt          time.Time
+	// StabilityScore ranks upstream exit churn (distinct exit IPs minus
+	// 1; 0 = stable or never probed). Used for replacement preference
+	// only — a churny slot is never rejected on this alone.
+	StabilityScore int
+	DrainAt        time.Time
 
 	mu sync.Mutex
 }
@@ -132,6 +137,7 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.ConnCount = 0
 	slot.ConsecutiveFails = 0
 	slot.SpeedMbps = 0
+	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
 	slot.mu.Unlock()
 	return nil
@@ -276,6 +282,50 @@ func (p *WANPool) SetSlotSpeedMbps(index int, speed float64) {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 	slot.SpeedMbps = speed
+}
+
+// SlotStabilityScore returns the last measured stability score for a slot
+// (0 = unknown/stable when never probed).
+func (p *WANPool) SlotStabilityScore(index int) int {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.StabilityScore
+}
+
+// SetSlotStability records the measured stability score for a slot and
+// exposes it as the viberoxy_wan_stability gauge.
+func (p *WANPool) SetSlotStability(index int, score int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	slot.StabilityScore = score
+	slot.mu.Unlock()
+	metricWanStability.Set(float64(score), strconv.Itoa(index))
+}
+
+// PickReplacementSlot returns the index of the active slot to prefer when
+// replacing a WAN: the one with the highest stability score (least stable
+// exit IP, i.e. most churn). Equal scores resolve to the lowest index, so
+// with stability probing disabled (all scores 0/unknown) it returns the
+// first active slot — the historical behavior. Returns -1 for an empty
+// slice.
+func (p *WANPool) PickReplacementSlot(activeSlots []int) int {
+	if len(activeSlots) == 0 {
+		return -1
+	}
+	best := activeSlots[0]
+	for _, idx := range activeSlots[1:] {
+		if p.SlotStabilityScore(idx) > p.SlotStabilityScore(best) {
+			best = idx
+		}
+	}
+	return best
 }
 
 // DefaultFailThreshold is the number of consecutive failures after which a

@@ -191,6 +191,8 @@ func TestObservabilityHandler(t *testing.T) {
 	for _, want := range []string{
 		"# HELP viberoxy_wans_active",
 		"# TYPE viberoxy_wans_active gauge",
+		"# HELP viberoxy_wan_stability",
+		"# TYPE viberoxy_wan_stability gauge",
 		"# HELP viberoxy_proxy_connections_total",
 		"# TYPE viberoxy_proxy_connections_total counter",
 		"# TYPE viberoxy_proxy_latency_seconds histogram",
@@ -217,6 +219,26 @@ func TestRefreshPoolMetrics(t *testing.T) {
 	}
 	if v := metricWanSpeedMbps.Value("1"); v != 0 {
 		t.Errorf("wan_speed_mbps[1] = %v, want 0 (no speed recorded)", v)
+	}
+}
+
+func TestMetricWanStability(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	// Unknown/never probed: gauge stays unset (0).
+	if v := metricWanStability.Value("0"); v != 0 {
+		t.Errorf("wan_stability[0] = %v, want 0 (unset)", v)
+	}
+
+	pool.SetSlotStability(0, 2)
+	if v := metricWanStability.Value("0"); v != 2 {
+		t.Errorf("wan_stability[0] = %v, want 2", v)
+	}
+
+	// Out-of-range writes must not touch any series.
+	pool.SetSlotStability(99, 9)
+	if v := metricWanStability.Value("1"); v != 0 {
+		t.Errorf("wan_stability[1] = %v, want 0 (untouched)", v)
 	}
 }
 

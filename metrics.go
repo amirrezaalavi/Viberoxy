@@ -260,6 +260,7 @@ var (
 	metricsRegistry        = NewRegistry()
 	metricWansActive       = NewGauge("viberoxy_wans_active", "Number of active WAN slots.")
 	metricWanSpeedMbps     = NewGauge("viberoxy_wan_speed_mbps", "Last measured speed in Mbps per WAN slot.", "index")
+	metricWanStability     = NewGauge("viberoxy_wan_stability", "Stability score per WAN slot (distinct exit IPs minus 1; 0 = stable or unprobed).", "index")
 	metricProxyConnections = NewCounter("viberoxy_proxy_connections_total", "Total CONNECT attempts handled by the proxy.", "wan", "proto")
 	metricProxyBytes       = NewCounter("viberoxy_proxy_bytes_total", "Bytes relayed through the proxy.", "wan", "direction")
 	metricProxyLatency     = NewHistogram("viberoxy_proxy_latency_seconds", "Tunnel latency from CONNECT to close, in seconds.")
@@ -270,6 +271,7 @@ var (
 func init() {
 	metricsRegistry.Register(metricWansActive)
 	metricsRegistry.Register(metricWanSpeedMbps)
+	metricsRegistry.Register(metricWanStability)
 	metricsRegistry.Register(metricProxyConnections)
 	metricsRegistry.Register(metricProxyBytes)
 	metricsRegistry.Register(metricProxyLatency)

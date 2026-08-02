@@ -30,6 +30,7 @@ type Config struct {
 	MaxTestPerCycle   int
 	KeepaliveInterval int
 	WanFailThreshold  int
+	StabilityProbes   int
 	AccessLog         bool
 	AllowDegradedBoot bool
 }
@@ -213,6 +214,23 @@ func parseConfig() (*Config, error) {
 		cfg.WanFailThreshold = n
 	}
 
+	// STABILITY_PROBES: how many exit-IP probes to run per passed speed
+	// test (0 disables stability ranking entirely). Each probe is a GET
+	// through the same temp xray; the distinct exit IPs observed become
+	// the slot's stability score, used only as a preference when choosing
+	// which active WAN to replace — never to reject a config.
+	cfg.StabilityProbes = 0
+	if v := os.Getenv("STABILITY_PROBES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: STABILITY_PROBES=%q: must be a valid integer", v)
+		}
+		if n < 0 || n > 5 {
+			return nil, fmt.Errorf("error: STABILITY_PROBES=%q: must be between 0 and 5", v)
+		}
+		cfg.StabilityProbes = n
+	}
+
 	// METRICS_PORT: 0 disables the observability server (/metrics, /healthz,
 	// /readyz). Any value in 1..65535 starts it on that port.
 	cfg.MetricsPort = 0
@@ -391,7 +409,7 @@ func startup(cfg *Config, ctx context.Context) {
 				slog.Info("skipping duplicate wan", "server", c.Server, "port", c.Port)
 				continue
 			}
-			result := TestSpeed(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize)
+			result := TestSpeedWithStability(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
 			tested++
 			if result.Error != nil || result.Speed < cfg.MinimumSpeed {
 				continue
@@ -410,7 +428,8 @@ func startup(cfg *Config, ctx context.Context) {
 			}
 			pool.SetActive(slotIdx, cmd, path)
 			pool.SetSlotSpeedMbps(slotIdx, result.Speed)
-			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed)
+			pool.SetSlotStability(slotIdx, result.StabilityScore)
+			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed, "stability", result.StabilityScore)
 
 			// Degraded boot: serve traffic as soon as the first WAN is up,
 			// then keep filling slots until the full WAN_COUNT is reached.
@@ -562,7 +581,7 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 			slog.Info("skipping duplicate wan", "server", c.Server, "port", c.Port)
 			continue
 		}
-		result := TestSpeed(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize)
+		result := TestSpeedWithStability(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
 		tested++
 		results = append(results, result)
 
@@ -584,44 +603,37 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 		}
 		pool.SetActive(slotIdx, cmd, path)
 		pool.SetSlotSpeedMbps(slotIdx, result.Speed)
-		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed)
+		pool.SetSlotStability(slotIdx, result.StabilityScore)
+		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed, "stability", result.StabilityScore)
 	}
 
 	writeSortedTxt(results)
 
 	// Replacement: only consider candidates tested this cycle, and only when
-	// the pool is already full — replace the first active WAN with the best
-	// new config we actually measured.
+	// the pool is already full — replace a WAN with the best new config we
+	// actually measured (fastest; speed ties broken by lower stability
+	// score). The slot replaced is the least stable active WAN when scores
+	// are known, else the first active slot (historical behavior).
 	activeSlots := pool.GetSlotsByState(StateActive)
 	if len(activeSlots) == cfg.WanCount && len(results) > 0 {
-		var bestNewConfig *ProxyConfig
-		var bestNewSpeed float64
-		for _, r := range results {
-			if r.Error != nil || r.Speed < cfg.MinimumSpeed {
-				continue
-			}
-			alreadyActive := false
+		alreadyActive := func(cfg *ProxyConfig) bool {
 			for _, idx := range activeSlots {
 				activeCfg := pool.Slots[idx].Config
-				if activeCfg != nil && activeCfg.Server == r.Config.Server && activeCfg.Port == r.Config.Port {
-					alreadyActive = true
-					break
+				if activeCfg != nil && activeCfg.Server == cfg.Server && activeCfg.Port == cfg.Port {
+					return true
 				}
 			}
-			if alreadyActive {
-				continue
-			}
-			bestNewConfig = r.Config
-			bestNewSpeed = r.Speed
-			break
+			return false
 		}
+		best := bestNewCandidate(results, cfg.MinimumSpeed, alreadyActive)
 
-		if bestNewConfig != nil {
-			replaceIdx := activeSlots[0]
+		if best != nil {
+			replaceIdx := pool.PickReplacementSlot(activeSlots)
 			slog.Info("cycle: replacing wan",
 				"index", replaceIdx,
-				"new_server", bestNewConfig.Server,
-				"new_speed", bestNewSpeed)
+				"new_server", best.Config.Server,
+				"new_speed", best.Speed,
+				"new_stability", best.StabilityScore)
 			if err := pool.MarkDraining(replaceIdx); err != nil {
 				slog.Warn("cycle: failed to mark draining", "index", replaceIdx, "error", err)
 			}

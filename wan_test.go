@@ -638,6 +638,74 @@ func TestSlotSpeedMbps(t *testing.T) {
 	}
 }
 
+func TestSlotStabilityScore(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	if s := pool.SlotStabilityScore(0); s != 0 {
+		t.Errorf("initial stability = %d, want 0 (unknown/stable)", s)
+	}
+	pool.SetSlotStability(0, 3)
+	if s := pool.SlotStabilityScore(0); s != 3 {
+		t.Errorf("stability = %d, want 3", s)
+	}
+	if s := pool.SlotStabilityScore(99); s != 0 {
+		t.Errorf("out-of-range stability = %d, want 0", s)
+	}
+
+	// Out-of-range writes are no-ops.
+	pool.SetSlotStability(99, 7)
+	pool.SetSlotStability(-1, 7)
+	if s := pool.SlotStabilityScore(1); s != 0 {
+		t.Errorf("slot 1 stability = %d, want 0 (untouched)", s)
+	}
+
+	// ResetEmpty clears the score.
+	pool.SetSlotStability(0, 2)
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty error: %v", err)
+	}
+	if s := pool.SlotStabilityScore(0); s != 0 {
+		t.Errorf("stability after reset = %d, want 0", s)
+	}
+}
+
+func TestPickReplacementSlot(t *testing.T) {
+	pool := NewWANPool(4, 10700)
+
+	// Empty list -> -1.
+	if idx := pool.PickReplacementSlot(nil); idx != -1 {
+		t.Errorf("PickReplacementSlot(nil) = %d, want -1", idx)
+	}
+
+	// All scores unknown (0): historical behavior — first active slot.
+	slots := []int{0, 1, 2}
+	if idx := pool.PickReplacementSlot(slots); idx != 0 {
+		t.Errorf("PickReplacementSlot(all unknown) = %d, want 0", idx)
+	}
+
+	// The least stable slot (highest score) wins.
+	pool.SetSlotStability(0, 2)
+	pool.SetSlotStability(1, 4)
+	pool.SetSlotStability(2, 1)
+	if idx := pool.PickReplacementSlot(slots); idx != 1 {
+		t.Errorf("PickReplacementSlot = %d, want 1 (highest stability score)", idx)
+	}
+
+	// Ties resolve to the lowest index in the given order.
+	pool.SetSlotStability(2, 4)
+	if idx := pool.PickReplacementSlot(slots); idx != 1 {
+		t.Errorf("PickReplacementSlot(tie) = %d, want 1 (first of tied)", idx)
+	}
+	if idx := pool.PickReplacementSlot([]int{2, 1, 0}); idx != 2 {
+		t.Errorf("PickReplacementSlot(ordered [2 1 0]) = %d, want 2", idx)
+	}
+
+	// A single active slot is always itself.
+	if idx := pool.PickReplacementSlot([]int{3}); idx != 3 {
+		t.Errorf("PickReplacementSlot([3]) = %d, want 3", idx)
+	}
+}
+
 func TestResetEmpty_FromTesting(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})
