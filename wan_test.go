@@ -254,6 +254,80 @@ func TestGetLeastLoaded_AllEmpty(t *testing.T) {
 	}
 }
 
+func TestGetLeastLoaded_SkipsUnhealthy(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	for i := 0; i < 2; i++ {
+		pool.StartTesting(i, &ProxyConfig{})
+		cmd := exec.Command("sleep", "9999")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start cmd: %v", err)
+		}
+		defer cmd.Process.Kill()
+		pool.SetActive(i, cmd, "/tmp/cfg.json")
+	}
+
+	// Slot 0 is unhealthy (2 fails >= threshold 2) despite fewer connections.
+	atomic.StoreInt64(&pool.Slots[0].ConnCount, 1)
+	atomic.StoreInt64(&pool.Slots[1].ConnCount, 5)
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+
+	if idx := pool.GetLeastLoaded(2); idx != 1 {
+		t.Errorf("GetLeastLoaded(2) = %d, want 1 (skip unhealthy slot 0)", idx)
+	}
+
+	// The default threshold (2) behaves identically.
+	if idx := pool.GetLeastLoaded(); idx != 1 {
+		t.Errorf("GetLeastLoaded() = %d, want 1 (default threshold)", idx)
+	}
+
+	// A successful probe clears slot 0, which then wins on connection count.
+	pool.RecordSuccess(0)
+	if idx := pool.GetLeastLoaded(2); idx != 0 {
+		t.Errorf("GetLeastLoaded(2) after recovery = %d, want 0", idx)
+	}
+}
+
+func TestGetLeastLoaded_AllUnhealthy(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	for i := 0; i < 2; i++ {
+		pool.StartTesting(i, &ProxyConfig{})
+		cmd := exec.Command("sleep", "9999")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start cmd: %v", err)
+		}
+		defer cmd.Process.Kill()
+		pool.SetActive(i, cmd, "/tmp/cfg.json")
+	}
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	pool.RecordFailure(1)
+	pool.RecordFailure(1)
+
+	if idx := pool.GetLeastLoaded(2); idx != -1 {
+		t.Errorf("GetLeastLoaded(2) = %d, want -1 (all slots unhealthy)", idx)
+	}
+}
+
+func TestGetLeastLoaded_ThresholdOne(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	for i := 0; i < 2; i++ {
+		pool.StartTesting(i, &ProxyConfig{})
+		cmd := exec.Command("sleep", "9999")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start cmd: %v", err)
+		}
+		defer cmd.Process.Kill()
+		pool.SetActive(i, cmd, "/tmp/cfg.json")
+	}
+
+	// With threshold 1, a single failure excludes a slot.
+	pool.RecordFailure(0)
+	if idx := pool.GetLeastLoaded(1); idx != 1 {
+		t.Errorf("GetLeastLoaded(1) = %d, want 1", idx)
+	}
+}
+
 func TestIncDecConnCount(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	pool.IncConnCount(0)
@@ -437,6 +511,22 @@ func TestRecordFailureSuccess(t *testing.T) {
 	pool.RecordSuccess(-1)
 	if f := atomic.LoadInt64(&pool.Slots[1].ConsecutiveFails); f != 0 {
 		t.Errorf("slot 1 ConsecutiveFails = %d, want 0", f)
+	}
+}
+
+func TestSlotConsecutiveFails(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	if f := pool.SlotConsecutiveFails(0); f != 0 {
+		t.Errorf("initial fails = %d, want 0", f)
+	}
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	if f := pool.SlotConsecutiveFails(0); f != 3 {
+		t.Errorf("fails = %d, want 3", f)
+	}
+	if f := pool.SlotConsecutiveFails(99); f != 0 {
+		t.Errorf("out-of-range fails = %d, want 0", f)
 	}
 }
 

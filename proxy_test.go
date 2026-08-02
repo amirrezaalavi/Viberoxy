@@ -39,6 +39,9 @@ func TestNewProxyServer(t *testing.T) {
 	if proxy.server != nil {
 		t.Error("expected nil server")
 	}
+	if proxy.WanFailThreshold != DefaultFailThreshold {
+		t.Errorf("WanFailThreshold = %d, want default %d", proxy.WanFailThreshold, DefaultFailThreshold)
+	}
 }
 
 func TestHandleConnect_MethodNotAllowed(t *testing.T) {
@@ -362,6 +365,42 @@ func TestHandleConnect_DialFailureCounted(t *testing.T) {
 	}
 	if fails := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); fails != failsBefore+1 {
 		t.Errorf("ConsecutiveFails = %d, want %d", fails, failsBefore+1)
+	}
+}
+
+func TestHandleConnect_SkipsUnhealthyWAN(t *testing.T) {
+	pool := NewWANPool(1, 0)
+	pool.Slots[0].ServicePort = freePort(t) // nothing listening there
+	pool.Slots[0].State = StateActive
+	// 2 fails >= default threshold 2 → slot excluded from load balancing.
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+
+	proxyPort := freePort(t)
+	proxy := NewProxyServer(proxyPort, pool)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go proxy.Start(ctx)
+
+	waitForPort(fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	// With the only slot unhealthy, the proxy must answer 503 instead of
+	// attempting (and failing) the SOCKS5 dial with 502.
+	if resp.StatusCode != 503 {
+		t.Errorf("expected 503 (no healthy WAN), got %d", resp.StatusCode)
 	}
 }
 

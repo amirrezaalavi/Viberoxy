@@ -13,17 +13,19 @@ import (
 )
 
 type ProxyServer struct {
-	port      int
-	pool      *WANPool
-	server    *http.Server
-	AccessLog bool
+	port             int
+	pool             *WANPool
+	server           *http.Server
+	AccessLog        bool
+	WanFailThreshold int
 }
 
 func NewProxyServer(port int, pool *WANPool) *ProxyServer {
 	return &ProxyServer{
-		port:      port,
-		pool:      pool,
-		AccessLog: true,
+		port:             port,
+		pool:             pool,
+		AccessLog:        true,
+		WanFailThreshold: DefaultFailThreshold,
 	}
 }
 
@@ -77,7 +79,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wanIndex := p.pool.GetLeastLoaded()
+	wanIndex := p.pool.GetLeastLoaded(p.WanFailThreshold)
 	if wanIndex < 0 {
 		http.Error(w, "No WAN Available", 503)
 		return

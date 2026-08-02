@@ -52,6 +52,8 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"MINIMUM_SPEED",
 		"METRICS_PORT",
 		"ACCESS_LOG",
+		"KEEPALIVE_INTERVAL",
+		"WAN_FAIL_THRESHOLD",
 	} {
 		unsetenv(t, key)
 	}
@@ -98,6 +100,12 @@ func TestParseConfig_Defaults(t *testing.T) {
 	if cfg.MetricsPort != 0 {
 		t.Errorf("MetricsPort = %d, want 0 (off)", cfg.MetricsPort)
 	}
+	if cfg.KeepaliveInterval != 300 {
+		t.Errorf("KeepaliveInterval = %d, want %d", cfg.KeepaliveInterval, 300)
+	}
+	if cfg.WanFailThreshold != 2 {
+		t.Errorf("WanFailThreshold = %d, want %d", cfg.WanFailThreshold, 2)
+	}
 	if !cfg.AccessLog {
 		t.Error("AccessLog = false, want true (default)")
 	}
@@ -137,6 +145,43 @@ func TestParseConfig_ValidOverrides(t *testing.T) {
 	}
 	if cfg.MinimumSpeed != 10.5 {
 		t.Errorf("MinimumSpeed = %f, want %f", cfg.MinimumSpeed, 10.5)
+	}
+}
+
+func TestParseConfig_KeepaliveOverrides(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "KEEPALIVE_INTERVAL", "60")
+	setenv(t, "WAN_FAIL_THRESHOLD", "5")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.KeepaliveInterval != 60 {
+		t.Errorf("KeepaliveInterval = %d, want 60", cfg.KeepaliveInterval)
+	}
+	if cfg.WanFailThreshold != 5 {
+		t.Errorf("WanFailThreshold = %d, want 5", cfg.WanFailThreshold)
+	}
+}
+
+func TestParseConfig_InvalidKeepaliveInterval(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "KEEPALIVE_INTERVAL", "5")
+
+	_, err := parseConfig()
+	if err == nil {
+		t.Fatal("expected error for KEEPALIVE_INTERVAL < 10, got nil")
+	}
+}
+
+func TestParseConfig_InvalidWanFailThreshold(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "WAN_FAIL_THRESHOLD", "0")
+
+	_, err := parseConfig()
+	if err == nil {
+		t.Fatal("expected error for WAN_FAIL_THRESHOLD < 1, got nil")
 	}
 }
 

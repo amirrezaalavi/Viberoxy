@@ -15,20 +15,22 @@ import (
 )
 
 type Config struct {
-	SubscriberURL    string
-	FetchInterval    int
-	TestTimeout      int
-	DownloadSize     int64
-	DownloadEndpoint string
-	DownloadFallback string
-	WanCount         int
-	WanBasePort      int
-	TestBasePort     int
-	ProxyPort        int
-	MetricsPort      int
-	MinimumSpeed     float64
-	MaxTestPerCycle  int
-	AccessLog        bool
+	SubscriberURL     string
+	FetchInterval     int
+	TestTimeout       int
+	DownloadSize      int64
+	DownloadEndpoint  string
+	DownloadFallback  string
+	WanCount          int
+	WanBasePort       int
+	TestBasePort      int
+	ProxyPort         int
+	MetricsPort       int
+	MinimumSpeed      float64
+	MaxTestPerCycle   int
+	KeepaliveInterval int
+	WanFailThreshold  int
+	AccessLog         bool
 }
 
 // MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
@@ -182,6 +184,34 @@ func parseConfig() (*Config, error) {
 		cfg.MaxTestPerCycle = n
 	}
 
+	// KEEPALIVE_INTERVAL: seconds between end-to-end WAN health probes
+	// (HTTP GET through each slot's SOCKS5 listener).
+	cfg.KeepaliveInterval = 300
+	if v := os.Getenv("KEEPALIVE_INTERVAL"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: KEEPALIVE_INTERVAL=%q: must be a valid integer", v)
+		}
+		if n < 10 {
+			return nil, fmt.Errorf("error: KEEPALIVE_INTERVAL=%q: must be >= 10", v)
+		}
+		cfg.KeepaliveInterval = n
+	}
+
+	// WAN_FAIL_THRESHOLD: consecutive probe/dial failures before a WAN slot
+	// is excluded from load balancing and marked draining for replacement.
+	cfg.WanFailThreshold = 2
+	if v := os.Getenv("WAN_FAIL_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: WAN_FAIL_THRESHOLD=%q: must be a valid integer", v)
+		}
+		if n < 1 {
+			return nil, fmt.Errorf("error: WAN_FAIL_THRESHOLD=%q: must be >= 1", v)
+		}
+		cfg.WanFailThreshold = n
+	}
+
 	// METRICS_PORT: 0 disables the observability server (/metrics, /healthz,
 	// /readyz). Any value in 1..65535 starts it on that port.
 	cfg.MetricsPort = 0
@@ -319,6 +349,9 @@ func startup(cfg *Config, ctx context.Context) {
 
 	proxy := NewProxyServer(cfg.ProxyPort, pool)
 	proxy.AccessLog = cfg.AccessLog
+	if cfg.WanFailThreshold > 0 {
+		proxy.WanFailThreshold = cfg.WanFailThreshold
+	}
 	go func() {
 		if err := proxy.Start(ctx); err != nil && err != http.ErrServerClosed {
 			slog.Error("proxy server error", "error", err)
@@ -340,6 +373,10 @@ func startup(cfg *Config, ctx context.Context) {
 	}
 
 	slog.Info("viberoxy started", "wans", pool.ActiveCount(), "proxy_port", cfg.ProxyPort)
+
+	if cfg.KeepaliveInterval > 0 {
+		go keepaliveLoop(cfg, pool, ctx)
+	}
 
 	runLoop(cfg, pool, proxy, ctx)
 
@@ -372,6 +409,48 @@ func runLoop(cfg *Config, pool *WANPool, proxy *ProxyServer, ctx context.Context
 		case <-ticker.C:
 			runCycle(cfg, pool, gracePeriod)
 		}
+	}
+}
+
+// keepaliveLoop probes every active/draining WAN through its SOCKS5 listener
+// once per KEEPALIVE_INTERVAL. It stops when ctx is cancelled.
+func keepaliveLoop(cfg *Config, pool *WANPool, ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(cfg.KeepaliveInterval) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probeAllWANs(cfg, pool)
+		}
+	}
+}
+
+// probeAllWANs runs one ProbeWAN per active/draining slot. A failed probe
+// increments the slot's ConsecutiveFails (a successful one resets it); once
+// the count reaches WAN_FAIL_THRESHOLD the slot is marked draining so the
+// next runCycle replaces it.
+func probeAllWANs(cfg *Config, pool *WANPool) {
+	timeout := time.Duration(cfg.TestTimeout) * time.Second
+	for _, idx := range pool.GetSlotsByState(StateActive, StateDraining) {
+		socksAddr := fmt.Sprintf("127.0.0.1:%d", pool.Slots[idx].ServicePort)
+		if err := ProbeWAN(socksAddr, timeout); err != nil {
+			pool.RecordFailure(idx)
+			fails := pool.SlotConsecutiveFails(idx)
+			slog.Warn("keepalive: probe failed", "index", idx, "fails", fails, "error", err)
+			if cfg.WanFailThreshold > 0 && fails >= int64(cfg.WanFailThreshold) && pool.GetState(idx) == StateActive {
+				if err := pool.MarkDraining(idx); err != nil {
+					slog.Warn("keepalive: failed to mark draining", "index", idx, "error", err)
+				} else {
+					slog.Warn("keepalive: wan unhealthy, marked draining", "index", idx, "fails", fails)
+				}
+			}
+			continue
+		}
+		pool.RecordSuccess(idx)
+		slog.Info("keepalive: probe ok", "index", idx)
 	}
 }
 

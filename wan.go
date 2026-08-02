@@ -11,7 +11,7 @@ import (
 type WANState int
 
 const (
-	StateEmpty    WANState = iota
+	StateEmpty WANState = iota
 	StateTesting
 	StateActive
 	StateDraining
@@ -229,6 +229,15 @@ func (p *WANPool) RecordSuccess(index int) {
 	atomic.StoreInt64(&p.Slots[index].ConsecutiveFails, 0)
 }
 
+// SlotConsecutiveFails returns the current consecutive-failure count for a
+// slot (0 for out-of-range indices).
+func (p *WANPool) SlotConsecutiveFails(index int) int64 {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	return atomic.LoadInt64(&p.Slots[index].ConsecutiveFails)
+}
+
 // SlotSpeedMbps returns the last measured speed for a slot (0 if unknown).
 func (p *WANPool) SlotSpeedMbps(index int) float64 {
 	if index < 0 || index >= len(p.Slots) {
@@ -251,15 +260,32 @@ func (p *WANPool) SetSlotSpeedMbps(index int, speed float64) {
 	slot.SpeedMbps = speed
 }
 
-func (p *WANPool) GetLeastLoaded() int {
+// DefaultFailThreshold is the number of consecutive failures after which a
+// WAN slot is considered unhealthy: GetLeastLoaded excludes it from load
+// balancing and the keepalive loop marks it draining for replacement.
+const DefaultFailThreshold = 2
+
+// GetLeastLoaded returns the index of the active/draining slot with the
+// fewest connections. Slots whose ConsecutiveFails has reached the given
+// threshold are skipped as unhealthy; with no argument the default
+// DefaultFailThreshold (2) applies.
+func (p *WANPool) GetLeastLoaded(thresholds ...int) int {
+	threshold := DefaultFailThreshold
+	if len(thresholds) > 0 {
+		threshold = thresholds[0]
+	}
 	best := -1
 	var bestCount int64 = -1
 	for i, slot := range p.Slots {
 		slot.mu.Lock()
 		s := slot.State
 		c := atomic.LoadInt64(&slot.ConnCount)
+		fails := atomic.LoadInt64(&slot.ConsecutiveFails)
 		slot.mu.Unlock()
 		if s == StateActive || s == StateDraining {
+			if fails >= int64(threshold) {
+				continue
+			}
 			if best == -1 || c < bestCount {
 				best = i
 				bestCount = c
