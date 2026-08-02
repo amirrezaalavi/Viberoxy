@@ -1,6 +1,6 @@
 # Viberoxy
 
-A zero-dependency Go daemon that aggregates proxy subscriptions into a pool of reliable xray WANs and exposes them through a single HTTPS proxy.
+A zero-dependency Go daemon that aggregates proxy subscriptions into a pool of reliable xray WANs and exposes them through HTTPS CONNECT and SOCKS5 front-ends.
 
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-success)](go.mod)
@@ -17,7 +17,7 @@ Subscription URL → Fetch → Speed test → Sort → WAN pool (xray) → Load 
 2. **Speed-tests** each config by downloading a file through a temporary xray instance
 3. **Keeps** the top N configs running as persistent xray WANs on fixed ports
 4. **Rotates** slow configs one at a time (graceful drain, no mid-session breaks)
-5. **Exposes** all WANs behind a single HTTPS CONNECT proxy with least-connections load balancing
+5. **Exposes** all WANs behind a health-aware least-connections load balancer with both an HTTPS CONNECT proxy (`PROXY_PORT`) and a SOCKS5 listener (`SOCKS_PORT`)
 
 ---
 
