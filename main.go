@@ -25,6 +25,7 @@ type Config struct {
 	WanBasePort       int
 	TestBasePort      int
 	ProxyPort         int
+	SocksPort         int
 	MetricsPort       int
 	MinimumSpeed      float64
 	MaxTestPerCycle   int
@@ -160,6 +161,20 @@ func parseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: PROXY_PORT=%q: must be between 1 and 65535", v)
 		}
 		cfg.ProxyPort = n
+	}
+
+	// SOCKS_PORT: 0 disables the SOCKS5 front-end listener. Any value in
+	// 1..65535 starts it on that port.
+	cfg.SocksPort = 0
+	if v := os.Getenv("SOCKS_PORT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: SOCKS_PORT=%q: must be a valid integer", v)
+		}
+		if n < 0 || n > 65535 {
+			return nil, fmt.Errorf("error: SOCKS_PORT=%q: must be between 0 and 65535", v)
+		}
+		cfg.SocksPort = n
 	}
 
 	cfg.MinimumSpeed = 5.0
@@ -360,6 +375,20 @@ func startup(cfg *Config, ctx context.Context) {
 				slog.Error("proxy server error", "error", err)
 			}
 		}()
+
+		if cfg.SocksPort > 0 {
+			socks := NewSocksServer(cfg.SocksPort, pool)
+			socks.AccessLog = cfg.AccessLog
+			if cfg.WanFailThreshold > 0 {
+				socks.WanFailThreshold = cfg.WanFailThreshold
+			}
+			go func() {
+				if err := socks.Listen(ctx); err != nil {
+					slog.Error("socks5 server error", "error", err)
+				}
+			}()
+			slog.Info("socks5 server started", "port", cfg.SocksPort)
+		}
 
 		if cfg.MetricsPort > 0 {
 			obsSrv = &http.Server{

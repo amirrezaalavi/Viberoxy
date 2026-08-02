@@ -53,6 +53,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"WAN_BASE_PORT",
 		"TEST_BASE_PORT",
 		"PROXY_PORT",
+		"SOCKS_PORT",
 		"MINIMUM_SPEED",
 		"METRICS_PORT",
 		"ACCESS_LOG",
@@ -99,6 +100,9 @@ func TestParseConfig_Defaults(t *testing.T) {
 	}
 	if cfg.ProxyPort != 1080 {
 		t.Errorf("ProxyPort = %d, want %d", cfg.ProxyPort, 1080)
+	}
+	if cfg.SocksPort != 0 {
+		t.Errorf("SocksPort = %d, want 0 (off)", cfg.SocksPort)
 	}
 	if cfg.MinimumSpeed != 5.0 {
 		t.Errorf("MinimumSpeed = %f, want %f", cfg.MinimumSpeed, 5.0)
@@ -253,6 +257,45 @@ func TestParseConfig_InvalidWanCount(t *testing.T) {
 	_, err := parseConfig()
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestParseConfig_SocksPortValid(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "SOCKS_PORT", "1081")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.SocksPort != 1081 {
+		t.Errorf("SocksPort = %d, want 1081", cfg.SocksPort)
+	}
+}
+
+func TestParseConfig_SocksPortZero(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "SOCKS_PORT", "0")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.SocksPort != 0 {
+		t.Errorf("SocksPort = %d, want 0 (disabled)", cfg.SocksPort)
+	}
+}
+
+func TestParseConfig_InvalidSocksPort(t *testing.T) {
+	for _, v := range []string{"abc", "65536", "-1", "1.5"} {
+		t.Run(v, func(t *testing.T) {
+			setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+			setenv(t, "SOCKS_PORT", v)
+
+			if _, err := parseConfig(); err == nil {
+				t.Fatalf("expected error for SOCKS_PORT=%q, got nil", v)
+			}
+		})
 	}
 }
 

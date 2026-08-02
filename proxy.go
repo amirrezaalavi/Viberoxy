@@ -3,29 +3,25 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
 type ProxyServer struct {
-	port             int
-	pool             *WANPool
-	server           *http.Server
-	AccessLog        bool
-	WanFailThreshold int
+	port   int
+	server *http.Server
+	wanRelay
 }
 
 func NewProxyServer(port int, pool *WANPool) *ProxyServer {
 	return &ProxyServer{
-		port:             port,
-		pool:             pool,
-		AccessLog:        true,
-		WanFailThreshold: DefaultFailThreshold,
+		port: port,
+		wanRelay: wanRelay{
+			pool:             pool,
+			AccessLog:        true,
+			WanFailThreshold: DefaultFailThreshold,
+		},
 	}
 }
 
@@ -85,19 +81,11 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.pool.IncConnCount(wanIndex)
-	defer p.pool.DecConnCount(wanIndex)
+	p.beginWAN(wanIndex, "connect")
+	defer p.endWAN(wanIndex)
 
-	metricProxyConnections.Inc(strconv.Itoa(wanIndex), "connect")
-
-	servicePort := p.pool.Slots[wanIndex].ServicePort
-	socksAddr := fmt.Sprintf("127.0.0.1:%d", servicePort)
-
-	conn, err := socks5Dial(r.Context(), socksAddr, targetHost)
+	conn, err := p.dialWAN(r.Context(), wanIndex, targetHost, start, "connect")
 	if err != nil {
-		p.pool.RecordFailure(wanIndex)
-		slog.Warn("socks5 dial failed", "wan", wanIndex, "target", targetHost, "error", err)
-		p.logAccess(targetHost, wanIndex, 0, 0, start, "err")
 		http.Error(w, "Bad Gateway", 502)
 		return
 	}
@@ -119,45 +107,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	var wg sync.WaitGroup
-	var upBytes, downBytes int64
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(conn, clientConn)
-		atomic.AddInt64(&upBytes, n)
-		conn.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(clientConn, conn)
-		atomic.AddInt64(&downBytes, n)
-		clientConn.Close()
-	}()
-	wg.Wait()
-
-	up := atomic.LoadInt64(&upBytes)
-	down := atomic.LoadInt64(&downBytes)
-	metricProxyBytes.Add(float64(up), strconv.Itoa(wanIndex), "up")
-	metricProxyBytes.Add(float64(down), strconv.Itoa(wanIndex), "down")
-	metricProxyLatency.Observe(time.Since(start).Seconds())
-	p.pool.RecordSuccess(wanIndex)
-	p.logAccess(targetHost, wanIndex, up, down, start, "ok")
-}
-
-// logAccess emits one structured access-log line per proxied connection.
-func (p *ProxyServer) logAccess(target string, wan int, up, down int64, start time.Time, status string) {
-	if !p.AccessLog {
-		return
-	}
-	slog.Info("proxy access",
-		"target", target,
-		"wan", wan,
-		"bytes_up", up,
-		"bytes_down", down,
-		"latency_ms", time.Since(start).Milliseconds(),
-		"status", status,
-	)
+	p.relayThroughWAN(wanIndex, targetHost, start, "connect", clientConn, conn)
 }
 
 func (p *ProxyServer) handleDefault(w http.ResponseWriter, r *http.Request) {

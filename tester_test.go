@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -349,6 +351,79 @@ func TestProbeWAN_SocksUnreachable(t *testing.T) {
 
 	if err := ProbeWAN(addr, 500*time.Millisecond); err == nil {
 		t.Fatal("expected error for unreachable socks listener, got nil")
+	}
+}
+
+// TestProbeWAN_HTTPS_TLS is a regression test for keepalive probes against
+// https probe URLs (the production default is https://api.ipify.org/).
+// Before the TLS wrap was added, ProbeWAN wrote plaintext HTTP to the
+// endpoint's port 443, and healthy WANs failed with "400 Bad Request" from
+// Cloudflare. The probe must TLS-wrap the SOCKS connection before speaking
+// HTTP, and verify the server certificate (no InsecureSkipVerify) — here
+// against the httptest TLS server's own self-signed cert, injected via
+// probeTLSConfigFn so the test stays hermetic.
+func TestProbeWAN_HTTPS_TLS(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			t.Error("probe request arrived over plaintext, want TLS")
+		}
+		w.Write([]byte("9.9.9.9"))
+	}))
+	defer tlsServer.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(tlsServer.Certificate())
+
+	origFn := probeTLSConfigFn
+	probeTLSConfigFn = func(hostname string) *tls.Config {
+		return &tls.Config{
+			ServerName: hostname,
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    pool,
+		}
+	}
+	t.Cleanup(func() { probeTLSConfigFn = origFn })
+
+	origURL := ProbeWANURL
+	ProbeWANURL = tlsServer.URL
+	t.Cleanup(func() { ProbeWANURL = origURL })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err != nil {
+		t.Fatalf("ProbeWAN over https failed: %v", err)
+	}
+
+	// probeExitIP shares the same TLS-aware round trip.
+	ip, err := probeExitIP(socksAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("probeExitIP over https failed: %v", err)
+	}
+	if ip != "9.9.9.9" {
+		t.Errorf("probeExitIP over https = %q, want %q", ip, "9.9.9.9")
+	}
+}
+
+// TestProbeWAN_HTTPS_BadCert verifies the probe refuses a TLS server with an
+// untrusted certificate (i.e. the fix did not sneak in InsecureSkipVerify).
+func TestProbeWAN_HTTPS_BadCert(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	// Leave probeTLSConfigFn at its default (system roots): the httptest
+	// server's self-signed cert must be rejected.
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("1.2.3.4"))
+	}))
+	defer tlsServer.Close()
+
+	origURL := ProbeWANURL
+	ProbeWANURL = tlsServer.URL
+	t.Cleanup(func() { ProbeWANURL = origURL })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err == nil {
+		t.Fatal("expected TLS cert verification error, got nil")
 	}
 }
 

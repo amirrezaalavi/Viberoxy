@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -150,15 +151,27 @@ func probeDialTarget(u *url.URL) string {
 	return net.JoinHostPort(u.Host, port)
 }
 
-// ProbeWAN checks a WAN slot end-to-end with a lightweight HTTP GET through
-// its SOCKS5 listener. Unlike DownloadMeasurer it transfers no meaningful
-// payload — just enough to prove the dial + HTTP round trip both work. Any
-// failure (dial, write, response parse, non-2xx status, body read) is
-// returned as an error.
-func ProbeWAN(socksAddr string, timeout time.Duration) error {
-	u, err := url.Parse(ProbeWANURL)
+// probeTLSConfigFn builds the TLS client config used when a probe URL uses
+// https. It is a variable so tests can inject the root CA pool of a local
+// httptest TLS server (the default config verifies against the system
+// roots, which is correct for real endpoints like api.ipify.org).
+var probeTLSConfigFn = func(hostname string) *tls.Config {
+	return &tls.Config{
+		ServerName: hostname,
+		MinVersion: tls.VersionTLS12,
+	}
+}
+
+// probeRoundTrip dials through the SOCKS5 listener at socksAddr and speaks
+// one HTTP GET to probeURL. For https probe URLs the raw SOCKS connection is
+// wrapped in a TLS client before any HTTP bytes are written — the dial
+// target stays the same (the endpoint's 443), only the transport changes.
+// The caller owns both the returned response and connection and must close
+// resp.Body and conn. On error the connection is closed here.
+func probeRoundTrip(socksAddr, probeURL string, timeout time.Duration) (*http.Response, net.Conn, error) {
+	u, err := url.Parse(probeURL)
 	if err != nil {
-		return fmt.Errorf("parse probe url: %w", err)
+		return nil, nil, fmt.Errorf("parse probe url: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -166,28 +179,57 @@ func ProbeWAN(socksAddr string, timeout time.Duration) error {
 
 	conn, err := socks5Dial(ctx, socksAddr, probeDialTarget(u))
 	if err != nil {
-		return fmt.Errorf("socks dial: %w", err)
+		return nil, nil, fmt.Errorf("socks dial: %w", err)
 	}
-	defer conn.Close()
 
 	// The raw conn does not honor the request context, so bound the whole
-	// probe with an explicit deadline.
+	// probe with an explicit deadline. Set it BEFORE the TLS wrap so the
+	// handshake is bounded too.
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("set probe deadline: %w", err)
+		conn.Close()
+		return nil, nil, fmt.Errorf("set probe deadline: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ProbeWANURL, nil)
+	if u.Scheme == "https" {
+		tlsConn := tls.Client(conn, probeTLSConfigFn(u.Hostname()))
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("tls handshake: %w", err)
+		}
+		conn = tlsConn
+	}
+
+	// The request is written with the ORIGINAL URL so the request line and
+	// Host header are correct; only the transport (TLS wrap) changed.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		return fmt.Errorf("create probe request: %w", err)
+		conn.Close()
+		return nil, nil, fmt.Errorf("create probe request: %w", err)
 	}
 	if err := req.Write(conn); err != nil {
-		return fmt.Errorf("write probe request: %w", err)
+		conn.Close()
+		return nil, nil, fmt.Errorf("write probe request: %w", err)
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
-		return fmt.Errorf("read probe response: %w", err)
+		conn.Close()
+		return nil, nil, fmt.Errorf("read probe response: %w", err)
 	}
+	return resp, conn, nil
+}
+
+// ProbeWAN checks a WAN slot end-to-end with a lightweight HTTP GET through
+// its SOCKS5 listener. Unlike DownloadMeasurer it transfers no meaningful
+// payload — just enough to prove the dial + HTTP round trip both work. Any
+// failure (dial, TLS handshake, write, response parse, non-2xx status, body
+// read) is returned as an error.
+func ProbeWAN(socksAddr string, timeout time.Duration) error {
+	resp, conn, err := probeRoundTrip(socksAddr, ProbeWANURL, timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -203,42 +245,15 @@ func ProbeWAN(socksAddr string, timeout time.Duration) error {
 
 // probeExitIP returns the exit IP observed by an HTTP GET through the given
 // SOCKS5 listener: the probe endpoint's response body (expected to be a
-// bare IP, e.g. api.ipify.org). It reuses ProbeWAN's dial/request pattern
-// (including probeDialTarget for portless URLs) but returns the body
+// bare IP, e.g. api.ipify.org). It reuses probeRoundTrip (including
+// probeDialTarget for portless URLs and TLS for https) but returns the body
 // instead of discarding it.
 func probeExitIP(socksAddr string, timeout time.Duration) (string, error) {
-	u, err := url.Parse(ProbeWANURL)
+	resp, conn, err := probeRoundTrip(socksAddr, ProbeWANURL, timeout)
 	if err != nil {
-		return "", fmt.Errorf("parse probe url: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	conn, err := socks5Dial(ctx, socksAddr, probeDialTarget(u))
-	if err != nil {
-		return "", fmt.Errorf("socks dial: %w", err)
+		return "", err
 	}
 	defer conn.Close()
-
-	// The raw conn does not honor the request context, so bound the whole
-	// probe with an explicit deadline.
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return "", fmt.Errorf("set probe deadline: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ProbeWANURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("create probe request: %w", err)
-	}
-	if err := req.Write(conn); err != nil {
-		return "", fmt.Errorf("write probe request: %w", err)
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
-	if err != nil {
-		return "", fmt.Errorf("read probe response: %w", err)
-	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
