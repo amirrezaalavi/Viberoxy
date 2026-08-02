@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,7 +12,7 @@ import (
 type WANState int
 
 const (
-	StateEmpty    WANState = iota
+	StateEmpty WANState = iota
 	StateTesting
 	StateActive
 	StateDraining
@@ -33,14 +34,20 @@ func (s WANState) String() string {
 }
 
 type WANSlot struct {
-	Index       int
-	State       WANState
-	Config      *ProxyConfig
-	Cmd         *exec.Cmd
-	ConfigPath  string
-	ServicePort int
-	ConnCount   int64
-	DrainAt     time.Time
+	Index            int
+	State            WANState
+	Config           *ProxyConfig
+	Cmd              *exec.Cmd
+	ConfigPath       string
+	ServicePort      int
+	ConnCount        int64
+	ConsecutiveFails int64
+	SpeedMbps        float64
+	// StabilityScore ranks upstream exit churn (distinct exit IPs minus
+	// 1; 0 = stable or never probed). Used for replacement preference
+	// only — a churny slot is never rejected on this alone.
+	StabilityScore int
+	DrainAt        time.Time
 
 	mu sync.Mutex
 }
@@ -128,6 +135,9 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.Cmd = nil
 	slot.ConfigPath = ""
 	slot.ConnCount = 0
+	slot.ConsecutiveFails = 0
+	slot.SpeedMbps = 0
+	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
 	slot.mu.Unlock()
 	return nil
@@ -172,7 +182,46 @@ func (p *WANPool) ActiveCount() int {
 	return count
 }
 
-func (p *WANPool) HealthyActiveCount() int {
+// HasServerPort reports whether any active or draining slot already serves
+// the given upstream server:port. Used to avoid promoting the same endpoint
+// into two WAN slots (WAN dedupe). Testing and empty slots are ignored.
+func (p *WANPool) HasServerPort(server string, port int) bool {
+	for _, slot := range p.Slots {
+		slot.mu.Lock()
+		s := slot.State
+		cfg := slot.Config
+		slot.mu.Unlock()
+		if s == StateActive || s == StateDraining {
+			if cfg != nil && cfg.Server == server && cfg.Port == port {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// HealthyActiveCount returns the number of active/draining slots considered
+// healthy. Called with no arguments it health-checks the underlying xray
+// process (legacy behavior). Called with a threshold it counts slots whose
+// ConsecutiveFails is strictly below the threshold.
+func (p *WANPool) HealthyActiveCount(thresholds ...int) int {
+	if len(thresholds) > 0 {
+		threshold := thresholds[0]
+		count := 0
+		for _, slot := range p.Slots {
+			slot.mu.Lock()
+			s := slot.State
+			fails := atomic.LoadInt64(&slot.ConsecutiveFails)
+			slot.mu.Unlock()
+			if s == StateActive || s == StateDraining {
+				if fails < int64(threshold) {
+					count++
+				}
+			}
+		}
+		return count
+	}
+
 	count := 0
 	for _, slot := range p.Slots {
 		slot.mu.Lock()
@@ -188,15 +237,123 @@ func (p *WANPool) HealthyActiveCount() int {
 	return count
 }
 
-func (p *WANPool) GetLeastLoaded() int {
+// RecordFailure atomically increments a slot's consecutive-failure counter.
+func (p *WANPool) RecordFailure(index int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	atomic.AddInt64(&p.Slots[index].ConsecutiveFails, 1)
+}
+
+// RecordSuccess atomically resets a slot's consecutive-failure counter.
+func (p *WANPool) RecordSuccess(index int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	atomic.StoreInt64(&p.Slots[index].ConsecutiveFails, 0)
+}
+
+// SlotConsecutiveFails returns the current consecutive-failure count for a
+// slot (0 for out-of-range indices).
+func (p *WANPool) SlotConsecutiveFails(index int) int64 {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	return atomic.LoadInt64(&p.Slots[index].ConsecutiveFails)
+}
+
+// SlotSpeedMbps returns the last measured speed for a slot (0 if unknown).
+func (p *WANPool) SlotSpeedMbps(index int) float64 {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.SpeedMbps
+}
+
+// SetSlotSpeedMbps records the measured speed for a slot.
+func (p *WANPool) SetSlotSpeedMbps(index int, speed float64) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	slot.SpeedMbps = speed
+}
+
+// SlotStabilityScore returns the last measured stability score for a slot
+// (0 = unknown/stable when never probed).
+func (p *WANPool) SlotStabilityScore(index int) int {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.StabilityScore
+}
+
+// SetSlotStability records the measured stability score for a slot and
+// exposes it as the viberoxy_wan_stability gauge.
+func (p *WANPool) SetSlotStability(index int, score int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	slot.StabilityScore = score
+	slot.mu.Unlock()
+	metricWanStability.Set(float64(score), strconv.Itoa(index))
+}
+
+// PickReplacementSlot returns the index of the active slot to prefer when
+// replacing a WAN: the one with the highest stability score (least stable
+// exit IP, i.e. most churn). Equal scores resolve to the lowest index, so
+// with stability probing disabled (all scores 0/unknown) it returns the
+// first active slot — the historical behavior. Returns -1 for an empty
+// slice.
+func (p *WANPool) PickReplacementSlot(activeSlots []int) int {
+	if len(activeSlots) == 0 {
+		return -1
+	}
+	best := activeSlots[0]
+	for _, idx := range activeSlots[1:] {
+		if p.SlotStabilityScore(idx) > p.SlotStabilityScore(best) {
+			best = idx
+		}
+	}
+	return best
+}
+
+// DefaultFailThreshold is the number of consecutive failures after which a
+// WAN slot is considered unhealthy: GetLeastLoaded excludes it from load
+// balancing and the keepalive loop marks it draining for replacement.
+const DefaultFailThreshold = 2
+
+// GetLeastLoaded returns the index of the active/draining slot with the
+// fewest connections. Slots whose ConsecutiveFails has reached the given
+// threshold are skipped as unhealthy; with no argument the default
+// DefaultFailThreshold (2) applies.
+func (p *WANPool) GetLeastLoaded(thresholds ...int) int {
+	threshold := DefaultFailThreshold
+	if len(thresholds) > 0 {
+		threshold = thresholds[0]
+	}
 	best := -1
 	var bestCount int64 = -1
 	for i, slot := range p.Slots {
 		slot.mu.Lock()
 		s := slot.State
 		c := atomic.LoadInt64(&slot.ConnCount)
+		fails := atomic.LoadInt64(&slot.ConsecutiveFails)
 		slot.mu.Unlock()
 		if s == StateActive || s == StateDraining {
+			if fails >= int64(threshold) {
+				continue
+			}
 			if best == -1 || c < bestCount {
 				best = i
 				bestCount = c

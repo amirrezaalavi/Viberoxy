@@ -226,6 +226,69 @@ func TestActiveCount(t *testing.T) {
 	}
 }
 
+func TestHasServerPort(t *testing.T) {
+	pool := NewWANPool(3, 10700)
+
+	// Empty pool: never a match.
+	if pool.HasServerPort("1.2.3.4", 443) {
+		t.Error("HasServerPort on empty pool = true, want false")
+	}
+
+	// Active slot matches its own server:port.
+	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})
+	cmd := exec.Command("sleep", "9999")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start cmd: %v", err)
+	}
+	defer cmd.Process.Kill()
+	if err := pool.SetActive(0, cmd, "/tmp/cfg.json"); err != nil {
+		t.Fatalf("SetActive error: %v", err)
+	}
+
+	if !pool.HasServerPort("1.2.3.4", 443) {
+		t.Error("HasServerPort(active match) = false, want true")
+	}
+	if pool.HasServerPort("1.2.3.4", 8443) {
+		t.Error("HasServerPort(same server, different port) = true, want false")
+	}
+	if pool.HasServerPort("5.6.7.8", 443) {
+		t.Error("HasServerPort(different server) = true, want false")
+	}
+
+	// Draining slots still count as occupied (they serve traffic until the
+	// drain grace period expires).
+	if err := pool.MarkDraining(0); err != nil {
+		t.Fatalf("MarkDraining error: %v", err)
+	}
+	if !pool.HasServerPort("1.2.3.4", 443) {
+		t.Error("HasServerPort(draining match) = false, want true")
+	}
+
+	// A testing slot is NOT a match: the config may fail to activate.
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty error: %v", err)
+	}
+	pool.StartTesting(0, &ProxyConfig{Server: "9.9.9.9", Port: 9999})
+	if pool.HasServerPort("9.9.9.9", 9999) {
+		t.Error("HasServerPort(testing slot) = true, want false")
+	}
+
+	// Reset clears the config, so no stale match remains.
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty error: %v", err)
+	}
+	if pool.HasServerPort("9.9.9.9", 9999) {
+		t.Error("HasServerPort(after reset) = true, want false")
+	}
+
+	// Empty slots with a leftover config pointer are ignored.
+	pool.Slots[1].State = StateEmpty
+	pool.Slots[1].Config = &ProxyConfig{Server: "1.1.1.1", Port: 80}
+	if pool.HasServerPort("1.1.1.1", 80) {
+		t.Error("HasServerPort(empty slot with stale config) = true, want false")
+	}
+}
+
 func TestGetLeastLoaded(t *testing.T) {
 	pool := NewWANPool(3, 10700)
 
@@ -251,6 +314,80 @@ func TestGetLeastLoaded_AllEmpty(t *testing.T) {
 	idx := pool.GetLeastLoaded()
 	if idx != -1 {
 		t.Errorf("expected -1, got %d", idx)
+	}
+}
+
+func TestGetLeastLoaded_SkipsUnhealthy(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	for i := 0; i < 2; i++ {
+		pool.StartTesting(i, &ProxyConfig{})
+		cmd := exec.Command("sleep", "9999")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start cmd: %v", err)
+		}
+		defer cmd.Process.Kill()
+		pool.SetActive(i, cmd, "/tmp/cfg.json")
+	}
+
+	// Slot 0 is unhealthy (2 fails >= threshold 2) despite fewer connections.
+	atomic.StoreInt64(&pool.Slots[0].ConnCount, 1)
+	atomic.StoreInt64(&pool.Slots[1].ConnCount, 5)
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+
+	if idx := pool.GetLeastLoaded(2); idx != 1 {
+		t.Errorf("GetLeastLoaded(2) = %d, want 1 (skip unhealthy slot 0)", idx)
+	}
+
+	// The default threshold (2) behaves identically.
+	if idx := pool.GetLeastLoaded(); idx != 1 {
+		t.Errorf("GetLeastLoaded() = %d, want 1 (default threshold)", idx)
+	}
+
+	// A successful probe clears slot 0, which then wins on connection count.
+	pool.RecordSuccess(0)
+	if idx := pool.GetLeastLoaded(2); idx != 0 {
+		t.Errorf("GetLeastLoaded(2) after recovery = %d, want 0", idx)
+	}
+}
+
+func TestGetLeastLoaded_AllUnhealthy(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	for i := 0; i < 2; i++ {
+		pool.StartTesting(i, &ProxyConfig{})
+		cmd := exec.Command("sleep", "9999")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start cmd: %v", err)
+		}
+		defer cmd.Process.Kill()
+		pool.SetActive(i, cmd, "/tmp/cfg.json")
+	}
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	pool.RecordFailure(1)
+	pool.RecordFailure(1)
+
+	if idx := pool.GetLeastLoaded(2); idx != -1 {
+		t.Errorf("GetLeastLoaded(2) = %d, want -1 (all slots unhealthy)", idx)
+	}
+}
+
+func TestGetLeastLoaded_ThresholdOne(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	for i := 0; i < 2; i++ {
+		pool.StartTesting(i, &ProxyConfig{})
+		cmd := exec.Command("sleep", "9999")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start cmd: %v", err)
+		}
+		defer cmd.Process.Kill()
+		pool.SetActive(i, cmd, "/tmp/cfg.json")
+	}
+
+	// With threshold 1, a single failure excludes a slot.
+	pool.RecordFailure(0)
+	if idx := pool.GetLeastLoaded(1); idx != 1 {
+		t.Errorf("GetLeastLoaded(1) = %d, want 1", idx)
 	}
 }
 
@@ -415,6 +552,157 @@ func TestHealthyActiveCount(t *testing.T) {
 
 	if c := pool.HealthyActiveCount(); c != 1 {
 		t.Errorf("expected 1, got %d", c)
+	}
+}
+
+func TestRecordFailureSuccess(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	if f := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); f != 2 {
+		t.Errorf("ConsecutiveFails = %d, want 2", f)
+	}
+
+	pool.RecordSuccess(0)
+	if f := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); f != 0 {
+		t.Errorf("ConsecutiveFails after success = %d, want 0", f)
+	}
+
+	// Out-of-range indices must be no-ops.
+	pool.RecordFailure(99)
+	pool.RecordSuccess(-1)
+	if f := atomic.LoadInt64(&pool.Slots[1].ConsecutiveFails); f != 0 {
+		t.Errorf("slot 1 ConsecutiveFails = %d, want 0", f)
+	}
+}
+
+func TestSlotConsecutiveFails(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	if f := pool.SlotConsecutiveFails(0); f != 0 {
+		t.Errorf("initial fails = %d, want 0", f)
+	}
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	pool.RecordFailure(0)
+	if f := pool.SlotConsecutiveFails(0); f != 3 {
+		t.Errorf("fails = %d, want 3", f)
+	}
+	if f := pool.SlotConsecutiveFails(99); f != 0 {
+		t.Errorf("out-of-range fails = %d, want 0", f)
+	}
+}
+
+func TestHealthyActiveCount_Threshold(t *testing.T) {
+	pool := NewWANPool(3, 10700)
+	pool.Slots[0].State = StateActive
+	pool.Slots[1].State = StateActive
+	pool.Slots[2].State = StateActive
+
+	pool.RecordFailure(1)
+	pool.RecordFailure(1)
+	pool.RecordFailure(1)
+	pool.RecordFailure(2)
+
+	// Threshold 3: healthy means ConsecutiveFails < 3 → slots 0 and 2.
+	if c := pool.HealthyActiveCount(3); c != 2 {
+		t.Errorf("HealthyActiveCount(3) = %d, want 2", c)
+	}
+	// Threshold 1: only slots with zero consecutive failures → slot 0.
+	if c := pool.HealthyActiveCount(1); c != 1 {
+		t.Errorf("HealthyActiveCount(1) = %d, want 1", c)
+	}
+	// Threshold 0: no slot has fails < 0.
+	if c := pool.HealthyActiveCount(0); c != 0 {
+		t.Errorf("HealthyActiveCount(0) = %d, want 0", c)
+	}
+	// Draining slots participate too.
+	pool.Slots[1].State = StateDraining
+	if c := pool.HealthyActiveCount(3); c != 2 {
+		t.Errorf("HealthyActiveCount(3) with draining = %d, want 2", c)
+	}
+}
+
+func TestSlotSpeedMbps(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	if s := pool.SlotSpeedMbps(0); s != 0 {
+		t.Errorf("initial speed = %v, want 0", s)
+	}
+	pool.SetSlotSpeedMbps(0, 42.5)
+	if s := pool.SlotSpeedMbps(0); s != 42.5 {
+		t.Errorf("speed = %v, want 42.5", s)
+	}
+	if s := pool.SlotSpeedMbps(99); s != 0 {
+		t.Errorf("out-of-range speed = %v, want 0", s)
+	}
+}
+
+func TestSlotStabilityScore(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	if s := pool.SlotStabilityScore(0); s != 0 {
+		t.Errorf("initial stability = %d, want 0 (unknown/stable)", s)
+	}
+	pool.SetSlotStability(0, 3)
+	if s := pool.SlotStabilityScore(0); s != 3 {
+		t.Errorf("stability = %d, want 3", s)
+	}
+	if s := pool.SlotStabilityScore(99); s != 0 {
+		t.Errorf("out-of-range stability = %d, want 0", s)
+	}
+
+	// Out-of-range writes are no-ops.
+	pool.SetSlotStability(99, 7)
+	pool.SetSlotStability(-1, 7)
+	if s := pool.SlotStabilityScore(1); s != 0 {
+		t.Errorf("slot 1 stability = %d, want 0 (untouched)", s)
+	}
+
+	// ResetEmpty clears the score.
+	pool.SetSlotStability(0, 2)
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty error: %v", err)
+	}
+	if s := pool.SlotStabilityScore(0); s != 0 {
+		t.Errorf("stability after reset = %d, want 0", s)
+	}
+}
+
+func TestPickReplacementSlot(t *testing.T) {
+	pool := NewWANPool(4, 10700)
+
+	// Empty list -> -1.
+	if idx := pool.PickReplacementSlot(nil); idx != -1 {
+		t.Errorf("PickReplacementSlot(nil) = %d, want -1", idx)
+	}
+
+	// All scores unknown (0): historical behavior — first active slot.
+	slots := []int{0, 1, 2}
+	if idx := pool.PickReplacementSlot(slots); idx != 0 {
+		t.Errorf("PickReplacementSlot(all unknown) = %d, want 0", idx)
+	}
+
+	// The least stable slot (highest score) wins.
+	pool.SetSlotStability(0, 2)
+	pool.SetSlotStability(1, 4)
+	pool.SetSlotStability(2, 1)
+	if idx := pool.PickReplacementSlot(slots); idx != 1 {
+		t.Errorf("PickReplacementSlot = %d, want 1 (highest stability score)", idx)
+	}
+
+	// Ties resolve to the lowest index in the given order.
+	pool.SetSlotStability(2, 4)
+	if idx := pool.PickReplacementSlot(slots); idx != 1 {
+		t.Errorf("PickReplacementSlot(tie) = %d, want 1 (first of tied)", idx)
+	}
+	if idx := pool.PickReplacementSlot([]int{2, 1, 0}); idx != 2 {
+		t.Errorf("PickReplacementSlot(ordered [2 1 0]) = %d, want 2", idx)
+	}
+
+	// A single active slot is always itself.
+	if idx := pool.PickReplacementSlot([]int{3}); idx != 3 {
+		t.Errorf("PickReplacementSlot([3]) = %d, want 3", idx)
 	}
 }
 

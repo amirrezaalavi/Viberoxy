@@ -53,8 +53,16 @@ All config via environment variables:
 | `WAN_COUNT` | No | `4` | Max concurrent WANs (1–5) |
 | `WAN_BASE_PORT` | No | `10700` | First xray service port |
 | `TEST_BASE_PORT` | No | `10800` | First xray test port |
-| `PROXY_PORT` | No | `1080` | User-facing HTTPS proxy port |
+| `PROXY_PORT` | No | `1080` | User-facing HTTPS CONNECT proxy port |
+| `SOCKS_PORT` | No | `0` (off) | User-facing SOCKS5 listener (TCP CONNECT only; UDP ASSOCIATE/BIND rejected with REP 0x07). No auth (RFC 1929 not implemented) |
+| `METRICS_PORT` | No | `0` (off) | Prometheus-format `/metrics` + `/healthz` + `/readyz` endpoint port |
 | `MINIMUM_SPEED` | No | `5.0` | Mbps threshold — don't replace WANs above this |
+| `MAX_TEST_PER_CYCLE` | No | `20` | Max configs speed-tested per runCycle (subscription is latency-sorted, so testing beyond this is wasted) |
+| `KEEPALIVE_INTERVAL` | No | `300` | Seconds between end-to-end WAN health probes (min 10) |
+| `WAN_FAIL_THRESHOLD` | No | `2` | Consecutive probe/dial failures before a WAN is excluded from load balancing and marked draining |
+| `STABILITY_PROBES` | No | `0` (off) | Exit-IP probes per passed speed test (0-5). When >0, WANs are ranked by exit-IP stability (lower = more stable) and replacement prefers the least-stable active WAN. Ranking only — churny configs are never rejected |
+| `ACCESS_LOG` | No | `true` | One structured log line per proxied connection |
+| `ALLOW_DEGRADED_BOOT` | No | `true` | Start the proxy as soon as the first WAN is active (vs waiting for full WAN_COUNT) |
 
 ### Quick start
 
@@ -69,24 +77,25 @@ Or with custom WAN count and port:
 SUBSCRIBER_URL="https://example.com/sub" WAN_COUNT=3 PROXY_PORT=8888 go run .
 ```
 
-The proxy will start only when `WAN_COUNT` configs pass the `MINIMUM_SPEED` threshold. Debug output is written to `sorted.txt` each cycle.
+The proxy starts as soon as the first WAN passes the `MINIMUM_SPEED` threshold (degraded boot, disable with `ALLOW_DEGRADED_BOOT=false`) and keeps filling slots until `WAN_COUNT` is reached. Debug output is written to `sorted.txt` each cycle.
 
 ---
 
 ## Architecture
 
 ```
-User → HTTPS CONNECT (PROXY_PORT)
-                ↓
-         Load Balancer (least-connections)
-                ↓
+User → HTTPS CONNECT (PROXY_PORT) ─┐
+User → SOCKS5          (SOCKS_PORT) ─┤
+                                     ↓
+                        Load Balancer (least-connections, health-aware)
+                                     ↓
     ┌──────┬──────┬──────┬──────┐
     │WAN 0 │WAN 1 │WAN 2 │WAN 3 │  (xray: 10700-10703)
     └──────┴──────┴──────┴──────┘
                 ↑
-          Speed Tester (10800+)
+          Speed Tester (10800+) + stability probes (optional)
                 ↑
-          Fetcher ← SUBSCRIBER_URL
+          Fetcher ← SUBSCRIBER_URL (latency-sorted)
 ```
 
 ### WAN Lifecycle

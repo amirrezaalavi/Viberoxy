@@ -6,6 +6,46 @@ import (
 	"testing"
 )
 
+// TestIsXraySupported verifies the leak guard: protocols that buildOutbound
+// maps to a freedom (direct egress) outbound must never be promoted.
+func TestIsXraySupported(t *testing.T) {
+	supported := []string{
+		"ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#S",
+		"vmess://" + base64.StdEncoding.EncodeToString(mustMarshal(map[string]interface{}{"add": "1.2.3.4", "port": 443, "ps": "V"})),
+		"vless://109d47e4-4efe-45f8-9f63-52af26e1a5e2@1.2.3.4:12345?encryption=none#V",
+		"trojan://password123@1.2.3.4:443#T",
+		"socks5://user:pass@1.2.3.4:1080#S5",
+	}
+	for _, raw := range supported {
+		cfg := ParseSingle(raw)
+		if cfg == nil {
+			t.Fatalf("ParseSingle(%q) = nil, want config", raw)
+		}
+		if !IsXraySupported(cfg) {
+			t.Errorf("IsXraySupported(%q) = false, want true", cfg.Protocol)
+		}
+	}
+
+	unsupported := []string{
+		"hysteria2://auth123@1.2.3.4:443#H",
+		"tuic://uuid:pass@1.2.3.4:443#U",
+		"wireguard://key@1.2.3.4:51820#W",
+	}
+	for _, raw := range unsupported {
+		cfg := ParseSingle(raw)
+		if cfg == nil {
+			t.Fatalf("ParseSingle(%q) = nil, want config", raw)
+		}
+		if IsXraySupported(cfg) {
+			t.Errorf("IsXraySupported(%q) = true, want false", cfg.Protocol)
+		}
+	}
+
+	if IsXraySupported(nil) {
+		t.Error("IsXraySupported(nil) = true, want false")
+	}
+}
+
 func TestParseShadowsocks(t *testing.T) {
 	raw := "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#MySS"
 	cfg := ParseSingle(raw)

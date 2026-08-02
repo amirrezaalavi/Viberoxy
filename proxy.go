@@ -3,23 +3,25 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"sync"
 	"time"
 )
 
 type ProxyServer struct {
 	port   int
-	pool   *WANPool
 	server *http.Server
+	wanRelay
 }
 
 func NewProxyServer(port int, pool *WANPool) *ProxyServer {
 	return &ProxyServer{
 		port: port,
-		pool: pool,
+		wanRelay: wanRelay{
+			pool:             pool,
+			AccessLog:        true,
+			WanFailThreshold: DefaultFailThreshold,
+		},
 	}
 }
 
@@ -66,27 +68,24 @@ func (p *ProxyServer) Stop(ctx context.Context) error {
 }
 
 func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	targetHost := r.Host
 	if targetHost == "" {
 		http.Error(w, "Bad Request", 400)
 		return
 	}
 
-	wanIndex := p.pool.GetLeastLoaded()
+	wanIndex := p.pool.GetLeastLoaded(p.WanFailThreshold)
 	if wanIndex < 0 {
 		http.Error(w, "No WAN Available", 503)
 		return
 	}
 
-	p.pool.IncConnCount(wanIndex)
-	defer p.pool.DecConnCount(wanIndex)
+	p.beginWAN(wanIndex, "connect")
+	defer p.endWAN(wanIndex)
 
-	servicePort := p.pool.Slots[wanIndex].ServicePort
-	socksAddr := fmt.Sprintf("127.0.0.1:%d", servicePort)
-
-	conn, err := socks5Dial(r.Context(), socksAddr, targetHost)
+	conn, err := p.dialWAN(r.Context(), wanIndex, targetHost, start, "connect")
 	if err != nil {
-		slog.Warn("socks5 dial failed", "wan", wanIndex, "target", targetHost, "error", err)
 		http.Error(w, "Bad Gateway", 502)
 		return
 	}
@@ -108,19 +107,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(conn, clientConn)
-		conn.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(clientConn, conn)
-		clientConn.Close()
-	}()
-	wg.Wait()
+	p.relayThroughWAN(wanIndex, targetHost, start, "connect", clientConn, conn)
 }
 
 func (p *ProxyServer) handleDefault(w http.ResponseWriter, r *http.Request) {

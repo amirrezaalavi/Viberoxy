@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -270,6 +274,177 @@ func TestSOCKS5Dial_InvalidAddr(t *testing.T) {
 	}
 }
 
+func TestProbeWAN(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("1.2.3.4"))
+	}))
+	defer probeServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = probeServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err != nil {
+		t.Fatalf("ProbeWAN error: %v", err)
+	}
+}
+
+// TestProbeWAN_PortlessURL is a regression test for the keepalive probe
+// failing on URLs without an explicit port (e.g. https://api.ipify.org/):
+// socks5Dial requires host:port, so the dial target must get the default
+// port appended.
+func TestProbeWAN_PortlessURL(t *testing.T) {
+	orig := ProbeWANURL
+	defer func() { ProbeWANURL = orig }()
+
+	ProbeWANURL = "https://api.ipify.org/"
+	u, err := url.Parse(ProbeWANURL)
+	if err != nil {
+		t.Fatalf("parse probe url: %v", err)
+	}
+	if got := probeDialTarget(u); got != "api.ipify.org:443" {
+		t.Errorf("probeDialTarget(https portless) = %q, want %q", got, "api.ipify.org:443")
+	}
+
+	ProbeWANURL = "http://example.com/speed"
+	u, _ = url.Parse(ProbeWANURL)
+	if got := probeDialTarget(u); got != "example.com:80" {
+		t.Errorf("probeDialTarget(http portless) = %q, want %q", got, "example.com:80")
+	}
+
+	ProbeWANURL = "https://127.0.0.1:8443/"
+	u, _ = url.Parse(ProbeWANURL)
+	if got := probeDialTarget(u); got != "127.0.0.1:8443" {
+		t.Errorf("probeDialTarget(explicit port) = %q, want %q", got, "127.0.0.1:8443")
+	}
+}
+
+func TestProbeWAN_Timeout(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.Write([]byte("done"))
+	}))
+	defer slowServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = slowServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if err := ProbeWAN(socksAddr, 100*time.Millisecond); err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestProbeWAN_SocksUnreachable(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	if err := ProbeWAN(addr, 500*time.Millisecond); err == nil {
+		t.Fatal("expected error for unreachable socks listener, got nil")
+	}
+}
+
+// TestProbeWAN_HTTPS_TLS is a regression test for keepalive probes against
+// https probe URLs (the production default is https://api.ipify.org/).
+// Before the TLS wrap was added, ProbeWAN wrote plaintext HTTP to the
+// endpoint's port 443, and healthy WANs failed with "400 Bad Request" from
+// Cloudflare. The probe must TLS-wrap the SOCKS connection before speaking
+// HTTP, and verify the server certificate (no InsecureSkipVerify) — here
+// against the httptest TLS server's own self-signed cert, injected via
+// probeTLSConfigFn so the test stays hermetic.
+func TestProbeWAN_HTTPS_TLS(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			t.Error("probe request arrived over plaintext, want TLS")
+		}
+		w.Write([]byte("9.9.9.9"))
+	}))
+	defer tlsServer.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(tlsServer.Certificate())
+
+	origFn := probeTLSConfigFn
+	probeTLSConfigFn = func(hostname string) *tls.Config {
+		return &tls.Config{
+			ServerName: hostname,
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    pool,
+		}
+	}
+	t.Cleanup(func() { probeTLSConfigFn = origFn })
+
+	origURL := ProbeWANURL
+	ProbeWANURL = tlsServer.URL
+	t.Cleanup(func() { ProbeWANURL = origURL })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err != nil {
+		t.Fatalf("ProbeWAN over https failed: %v", err)
+	}
+
+	// probeExitIP shares the same TLS-aware round trip.
+	ip, err := probeExitIP(socksAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("probeExitIP over https failed: %v", err)
+	}
+	if ip != "9.9.9.9" {
+		t.Errorf("probeExitIP over https = %q, want %q", ip, "9.9.9.9")
+	}
+}
+
+// TestProbeWAN_HTTPS_BadCert verifies the probe refuses a TLS server with an
+// untrusted certificate (i.e. the fix did not sneak in InsecureSkipVerify).
+func TestProbeWAN_HTTPS_BadCert(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	// Leave probeTLSConfigFn at its default (system roots): the httptest
+	// server's self-signed cert must be rejected.
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("1.2.3.4"))
+	}))
+	defer tlsServer.Close()
+
+	origURL := ProbeWANURL
+	ProbeWANURL = tlsServer.URL
+	t.Cleanup(func() { ProbeWANURL = origURL })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err == nil {
+		t.Fatal("expected TLS cert verification error, got nil")
+	}
+}
+
+func TestProbeWAN_BadStatus(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	errServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer errServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = errServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if err := ProbeWAN(socksAddr, 5*time.Second); err == nil {
+		t.Fatal("expected error for non-2xx probe status, got nil")
+	}
+}
+
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -442,5 +617,279 @@ func TestTestAll_SortsResults(t *testing.T) {
 		if r.Error == nil && r.Speed > 0 {
 			prevSpeed = r.Speed
 		}
+	}
+}
+
+func TestProbeExitIP(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	ipServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("1.2.3.4"))
+	}))
+	defer ipServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = ipServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	ip, err := probeExitIP(socksAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("probeExitIP error: %v", err)
+	}
+	if ip != "1.2.3.4" {
+		t.Errorf("probeExitIP = %q, want %q", ip, "1.2.3.4")
+	}
+}
+
+func TestProbeExitIP_TrimsBody(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	ipServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("  203.0.113.9\n"))
+	}))
+	defer ipServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = ipServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	ip, err := probeExitIP(socksAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("probeExitIP error: %v", err)
+	}
+	if ip != "203.0.113.9" {
+		t.Errorf("probeExitIP = %q, want %q", ip, "203.0.113.9")
+	}
+}
+
+func TestProbeExitIP_SocksUnreachable(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	if _, err := probeExitIP(addr, 500*time.Millisecond); err == nil {
+		t.Fatal("expected error for unreachable socks listener, got nil")
+	}
+}
+
+func TestProbeExitIP_BadStatus(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	errServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer errServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = errServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if _, err := probeExitIP(socksAddr, 5*time.Second); err == nil {
+		t.Fatal("expected error for non-2xx probe status, got nil")
+	}
+}
+
+func TestProbeExitIP_EmptyBody(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	emptyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer emptyServer.Close()
+
+	orig := ProbeWANURL
+	ProbeWANURL = emptyServer.URL
+	t.Cleanup(func() { ProbeWANURL = orig })
+
+	if _, err := probeExitIP(socksAddr, 5*time.Second); err == nil {
+		t.Fatal("expected error for empty probe body, got nil")
+	}
+}
+
+func TestStabilityScoreFromIPs(t *testing.T) {
+	tests := []struct {
+		name string
+		ips  []string
+		want int
+	}{
+		{"single ip", []string{"1.1.1.1"}, 0},
+		{"stable repeated", []string{"1.1.1.1", "1.1.1.1", "1.1.1.1"}, 0},
+		{"two distinct", []string{"1.1.1.1", "2.2.2.2", "1.1.1.1"}, 1},
+		{"three distinct", []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, 2},
+		{"no observations", nil, 0},
+		{"empty strings ignored", []string{"", ""}, 0},
+		{"mixed empty and real", []string{"", "1.1.1.1", "1.1.1.1"}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stabilityScoreFromIPs(tt.ips); got != tt.want {
+				t.Errorf("stabilityScoreFromIPs(%v) = %d, want %d", tt.ips, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMeasureStability exercises the full probe loop: distinct exit IPs
+// observed through the mock SOCKS server become the stability score.
+func TestMeasureStability(t *testing.T) {
+	orig := stabilityProbeInterval
+	stabilityProbeInterval = 0
+	t.Cleanup(func() { stabilityProbeInterval = orig })
+
+	t.Run("stable single ip scores zero", func(t *testing.T) {
+		socksListener, socksAddr := startTestSocksServer(t)
+		defer socksListener.Close()
+
+		ipServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("1.2.3.4"))
+		}))
+		defer ipServer.Close()
+
+		origURL := ProbeWANURL
+		ProbeWANURL = ipServer.URL
+		t.Cleanup(func() { ProbeWANURL = origURL })
+
+		if got := measureStability(socksAddr, 3, 5*time.Second); got != 0 {
+			t.Errorf("measureStability = %d, want 0 (stable)", got)
+		}
+	})
+
+	t.Run("rotating exit ip scores distinct minus one", func(t *testing.T) {
+		socksListener, socksAddr := startTestSocksServer(t)
+		defer socksListener.Close()
+
+		var mu sync.Mutex
+		rotating := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+		ipServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			ip := rotating[0]
+			rotating = rotating[1:]
+			mu.Unlock()
+			w.Write([]byte(ip))
+		}))
+		defer ipServer.Close()
+
+		origURL := ProbeWANURL
+		ProbeWANURL = ipServer.URL
+		t.Cleanup(func() { ProbeWANURL = origURL })
+
+		if got := measureStability(socksAddr, 3, 5*time.Second); got != 2 {
+			t.Errorf("measureStability = %d, want 2 (3 distinct IPs)", got)
+		}
+	})
+
+	t.Run("all probes failing scores zero", func(t *testing.T) {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		addr := l.Addr().String()
+		l.Close()
+
+		if got := measureStability(addr, 3, 200*time.Millisecond); got != 0 {
+			t.Errorf("measureStability = %d, want 0 (all probes failed)", got)
+		}
+	})
+}
+
+func TestBestNewCandidate(t *testing.T) {
+	neverActive := func(*ProxyConfig) bool { return false }
+
+	tests := []struct {
+		name    string
+		results []*TestResult
+		min     float64
+		active  func(*ProxyConfig) bool
+		want    int // index into results, or -1 for nil
+	}{
+		{
+			name: "nil without candidates",
+			min:  5.0, want: -1,
+		},
+		{
+			name: "picks first passing",
+			results: []*TestResult{
+				{Speed: 10},
+				{Speed: 1},
+				{Speed: 30},
+			},
+			min: 5.0, want: 2,
+		},
+		{
+			name: "filters below minimum speed",
+			results: []*TestResult{
+				{Speed: 4.9},
+				{Speed: 6},
+			},
+			min: 5.0, want: 1,
+		},
+		{
+			name: "filters errors",
+			results: []*TestResult{
+				{Speed: 50, Error: fmt.Errorf("fail")},
+				{Speed: 7},
+			},
+			min: 5.0, want: 1,
+		},
+		{
+			name: "filters already active",
+			results: []*TestResult{
+				{Config: &ProxyConfig{Server: "a", Port: 1}, Speed: 50},
+				{Config: &ProxyConfig{Server: "b", Port: 2}, Speed: 7},
+			},
+			min: 5.0,
+			active: func(c *ProxyConfig) bool {
+				return c.Server == "a"
+			},
+			want: 1,
+		},
+		{
+			name: "speed tie broken by lower stability",
+			results: []*TestResult{
+				{Speed: 10, StabilityScore: 4},
+				{Speed: 10.0004, StabilityScore: 4},
+				{Speed: 10.0001, StabilityScore: 1},
+			},
+			min: 5.0, want: 2,
+		},
+		{
+			name: "slower but more stable loses",
+			results: []*TestResult{
+				{Speed: 50, StabilityScore: 5},
+				{Speed: 20, StabilityScore: 0},
+			},
+			min: 5.0, want: 0,
+		},
+		{
+			name: "strictly faster wins regardless of stability",
+			results: []*TestResult{
+				{Speed: 10, StabilityScore: 0},
+				{Speed: 55, StabilityScore: 4},
+			},
+			min: 5.0, want: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			active := tt.active
+			if active == nil {
+				active = neverActive
+			}
+			got := bestNewCandidate(tt.results, tt.min, active)
+			if tt.want == -1 {
+				if got != nil {
+					t.Errorf("bestNewCandidate = %+v, want nil", got)
+				}
+				return
+			}
+			if got != tt.results[tt.want] {
+				t.Errorf("bestNewCandidate = %+v, want results[%d] = %+v", got, tt.want, tt.results[tt.want])
+			}
+		})
 	}
 }
