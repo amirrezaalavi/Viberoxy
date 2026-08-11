@@ -38,7 +38,8 @@ type OutboundConfig struct {
 }
 
 type MuxConfig struct {
-	Enabled bool `json:"enabled"`
+	Enabled     bool `json:"enabled"`
+	Concurrency int  `json:"concurrency,omitempty"`
 }
 
 type StreamSettings struct {
@@ -91,7 +92,17 @@ type RealitySettings struct {
 	SpiderX     string `json:"spiderX,omitempty"`
 }
 
-func BuildXrayConfig(cfg *ProxyConfig, inboundPort int) ([]byte, error) {
+// BuildXrayConfig renders the xray JSON for one proxy config. When
+// muxEnabled is omitted it defaults to true: client connections to this
+// xray instance then share a single multiplexed upstream connection,
+// amortizing the TLS/protocol handshake per connection. Mux is only emitted
+// on proxied outbounds (never on the freedom fallback).
+func BuildXrayConfig(cfg *ProxyConfig, inboundPort int, muxEnabled ...bool) ([]byte, error) {
+	mux := true
+	if len(muxEnabled) > 0 {
+		mux = muxEnabled[0]
+	}
+
 	inboundSettings, err := json.Marshal(map[string]interface{}{
 		"udp": false,
 	})
@@ -109,13 +120,18 @@ func BuildXrayConfig(cfg *ProxyConfig, inboundPort int) ([]byte, error) {
 				Settings: inboundSettings,
 			},
 		},
-		Outbounds: buildOutbound(cfg),
+		Outbounds: buildOutbound(cfg, mux),
 	}
 
 	return json.MarshalIndent(conf, "", "  ")
 }
 
-func buildOutbound(cfg *ProxyConfig) []OutboundConfig {
+func buildOutbound(cfg *ProxyConfig, muxEnabled bool) []OutboundConfig {
+	mux := (*MuxConfig)(nil)
+	if muxEnabled {
+		mux = &MuxConfig{Enabled: true, Concurrency: 8}
+	}
+
 	var settings map[string]interface{}
 	var streamSettings *StreamSettings
 
@@ -139,7 +155,7 @@ func buildOutbound(cfg *ProxyConfig) []OutboundConfig {
 			{
 				Protocol: "shadowsocks",
 				Settings: marshalRaw(settings),
-				Mux:      &MuxConfig{Enabled: false},
+				Mux:      mux,
 			},
 		}
 
@@ -286,7 +302,7 @@ func buildOutbound(cfg *ProxyConfig) []OutboundConfig {
 		Protocol:       getXrayProtocol(cfg.Protocol),
 		Settings:       marshalRaw(settings),
 		StreamSettings: streamSettings,
-		Mux:            &MuxConfig{Enabled: false},
+		Mux:            mux,
 	}
 	return []OutboundConfig{ob}
 }
@@ -503,8 +519,8 @@ func getInt(v map[string]interface{}, key string) int {
 	return 0
 }
 
-func StartXray(cfg *ProxyConfig, inboundPort int) (*exec.Cmd, string, error) {
-	configBytes, err := BuildXrayConfig(cfg, inboundPort)
+func StartXray(cfg *ProxyConfig, inboundPort int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+	configBytes, err := BuildXrayConfig(cfg, inboundPort, muxEnabled...)
 	if err != nil {
 		return nil, "", fmt.Errorf("build xray config: %w", err)
 	}
