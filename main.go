@@ -34,6 +34,7 @@ type Config struct {
 	StabilityProbes   int
 	AccessLog         bool
 	AllowDegradedBoot bool
+	Router            *Router
 }
 
 // MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
@@ -282,6 +283,41 @@ func parseConfig() (*Config, error) {
 		cfg.AllowDegradedBoot = b
 	}
 
+	// Split routing: ROUTE_MODE picks the policy, DIRECT_DOMAINS /
+	// PROXY_DOMAINS / *_LIST_FILE provide suffix lists. Default all-proxy
+	// preserves the historical behavior (everything via the WAN pool); a
+	// Router is built only when a non-default mode or any list is set.
+	mode := RouteAllProxy
+	if v := os.Getenv("ROUTE_MODE"); v != "" {
+		m, err := ParseRouteMode(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: %w", err)
+		}
+		mode = m
+	}
+
+	direct := parseSuffixList(os.Getenv("DIRECT_DOMAINS"))
+	proxy := parseSuffixList(os.Getenv("PROXY_DOMAINS"))
+
+	if v := os.Getenv("DIRECT_LIST_FILE"); v != "" {
+		fromFile, err := loadSuffixFile(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: DIRECT_LIST_FILE=%q: %w", v, err)
+		}
+		direct = append(direct, fromFile...)
+	}
+	if v := os.Getenv("PROXY_LIST_FILE"); v != "" {
+		fromFile, err := loadSuffixFile(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: PROXY_LIST_FILE=%q: %w", v, err)
+		}
+		proxy = append(proxy, fromFile...)
+	}
+
+	if mode != RouteAllProxy || len(direct) > 0 || len(proxy) > 0 {
+		cfg.Router = NewRouter(mode, direct, proxy)
+	}
+
 	return cfg, nil
 }
 
@@ -365,7 +401,7 @@ func startup(cfg *Config, ctx context.Context) {
 		}
 		proxyStarted = true
 
-		proxy = NewProxyServer(cfg.ProxyPort, pool)
+		proxy = NewProxyServer(cfg.ProxyPort, pool, cfg.Router)
 		proxy.AccessLog = cfg.AccessLog
 		if cfg.WanFailThreshold > 0 {
 			proxy.WanFailThreshold = cfg.WanFailThreshold
@@ -377,7 +413,7 @@ func startup(cfg *Config, ctx context.Context) {
 		}()
 
 		if cfg.SocksPort > 0 {
-			socks := NewSocksServer(cfg.SocksPort, pool)
+			socks := NewSocksServer(cfg.SocksPort, pool, cfg.Router)
 			socks.AccessLog = cfg.AccessLog
 			if cfg.WanFailThreshold > 0 {
 				socks.WanFailThreshold = cfg.WanFailThreshold

@@ -14,8 +14,8 @@ type ProxyServer struct {
 	wanRelay
 }
 
-func NewProxyServer(port int, pool *WANPool) *ProxyServer {
-	return &ProxyServer{
+func NewProxyServer(port int, pool *WANPool, router ...*Router) *ProxyServer {
+	p := &ProxyServer{
 		port: port,
 		wanRelay: wanRelay{
 			pool:             pool,
@@ -23,6 +23,10 @@ func NewProxyServer(port int, pool *WANPool) *ProxyServer {
 			WanFailThreshold: DefaultFailThreshold,
 		},
 	}
+	if len(router) > 0 {
+		p.router = router[0]
+	}
+	return p
 }
 
 func (p *ProxyServer) Start(ctx context.Context) error {
@@ -72,6 +76,33 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	targetHost := r.Host
 	if targetHost == "" {
 		http.Error(w, "Bad Request", 400)
+		return
+	}
+
+	// Split routing: a direct-route target bypasses the WAN pool entirely.
+	if p.decideRoute(targetHost) == RouteDirect {
+		conn, err := p.directDial(r.Context(), targetHost, start, "connect")
+		if err != nil {
+			http.Error(w, "Bad Gateway", 502)
+			return
+		}
+		defer conn.Close()
+
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "Hijacking not supported", 500)
+			return
+		}
+		clientConn, _, err := hijacker.Hijack()
+		if err != nil {
+			slog.Warn("hijack failed", "error", err)
+			http.Error(w, "Internal Server Error", 500)
+			return
+		}
+		defer clientConn.Close()
+
+		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		p.directRelay(targetHost, start, "connect", clientConn, conn)
 		return
 	}
 

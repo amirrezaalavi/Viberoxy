@@ -321,3 +321,55 @@ func TestSocks_DialFailureCounted(t *testing.T) {
 		t.Errorf("ConsecutiveFails = %d, want 1", fails)
 	}
 }
+
+func TestSocksConnect_DirectRoute(t *testing.T) {
+	// WAN pool with NO active slots: only the direct route can succeed.
+	pool := NewWANPool(1, 0)
+	router := NewRouter(RouteProxyDefault, []string{".127.0.0.1"}, nil)
+
+	port := freePort(t)
+	srv := NewSocksServer(port, pool, router)
+	srv.AccessLog = false
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := srv.Listen(ctx); err != nil {
+			t.Errorf("socks server error: %v", err)
+		}
+	}()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	if err := waitForPort(addr, 2*time.Second); err != nil {
+		t.Fatalf("socks server did not start: %v", err)
+	}
+
+	echoAddr := startEchoServer(t)
+	echoHost, echoPortStr, err := net.SplitHostPort(echoAddr)
+	if err != nil {
+		t.Fatalf("split echo addr: %v", err)
+	}
+	echoPort, _ := strconv.Atoi(echoPortStr)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial socks: %v", err)
+	}
+	defer conn.Close()
+
+	socksGreet(t, conn)
+	reply := socksSendRequest(t, conn, 0x01, 0x01, echoHost, echoPort)
+	if reply[1] != 0x00 {
+		t.Fatalf("expected success reply, got rep=%d", reply[1])
+	}
+
+	testMsg := []byte("hello socks direct!")
+	if _, err := conn.Write(testMsg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	response := make([]byte, len(testMsg))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(response) != string(testMsg) {
+		t.Errorf("got %q, want %q", string(response), string(testMsg))
+	}
+}

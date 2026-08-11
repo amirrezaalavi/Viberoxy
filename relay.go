@@ -19,6 +19,7 @@ import (
 // bidirectional pipe -> metrics -> access log.
 type wanRelay struct {
 	pool             *WANPool
+	router           *Router
 	AccessLog        bool
 	WanFailThreshold int
 }
@@ -46,10 +47,98 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanIndex int, targetHost string,
 	if err != nil {
 		r.pool.RecordFailure(wanIndex)
 		slog.Warn("socks5 dial failed", "wan", wanIndex, "target", targetHost, "error", err)
-		r.logAccess(targetHost, wanIndex, 0, 0, start, "err", proto)
+		r.logAccess(targetHost, wanIndex, 0, 0, start, "err", proto, "wan")
 		return nil, err
 	}
 	return conn, nil
+}
+
+// decideRoute returns the egress route for a target host. With no router
+// configured (or an all-proxy router) everything goes through the WAN pool.
+func (r *wanRelay) decideRoute(targetHost string) Route {
+	if r.router == nil {
+		return RouteWAN
+	}
+	return r.router.Decide(targetHost)
+}
+
+// tuneTCPConn disables Nagle and enables keepalive on a TCP connection so
+// small interactive writes (TLS handshakes, HTTP requests, chat messages)
+// are not artificially delayed. Non-TCP conns are left untouched.
+func tuneTCPConn(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tcp.SetNoDelay(true)
+	tcp.SetKeepAlive(true)
+	tcp.SetKeepAlivePeriod(30 * time.Second)
+}
+
+// directDial connects straight to targetHost from the local machine,
+// bypassing the WAN pool (split-routing direct route). The connection is
+// tuned (TCP_NODELAY + keepalive) before returning.
+func (r *wanRelay) directDial(ctx context.Context, targetHost string, start time.Time, proto string) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, socksDialTimeout)
+	defer cancel()
+
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", targetHost)
+	if err != nil {
+		slog.Warn("direct dial failed", "target", targetHost, "error", err)
+		r.logAccess(targetHost, -1, 0, 0, start, "err", proto, "direct")
+		return nil, err
+	}
+	tuneTCPConn(conn)
+	return conn, nil
+}
+
+// directRelay pipes clientConn and the direct upstream connection
+// bidirectionally (same shape as relayThroughWAN, without WAN slot metrics)
+// and writes a direct-route access-log line. Blocking; caller owns conns.
+func (r *wanRelay) directRelay(targetHost string, start time.Time, proto string, clientConn, upstream net.Conn) {
+	tuneTCPConn(clientConn)
+	tuneTCPConn(upstream)
+
+	var wg sync.WaitGroup
+	var upBytes, downBytes int64
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(upstream, clientConn)
+		atomic.AddInt64(&upBytes, n)
+		upstream.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(clientConn, upstream)
+		atomic.AddInt64(&downBytes, n)
+		clientConn.Close()
+	}()
+	wg.Wait()
+
+	up := atomic.LoadInt64(&upBytes)
+	down := atomic.LoadInt64(&downBytes)
+	metricProxyBytes.Add(float64(up), "direct", "up")
+	metricProxyBytes.Add(float64(down), "direct", "down")
+	metricProxyLatency.Observe(time.Since(start).Seconds())
+	r.logAccess(targetHost, -1, up, down, start, "ok", proto, "direct")
+}
+
+// logAccess emits one structured access-log line per proxied connection.
+func (r *wanRelay) logAccess(target string, wan int, up, down int64, start time.Time, status, proto, route string) {
+	if !r.AccessLog {
+		return
+	}
+	slog.Info("proxy access",
+		"target", target,
+		"wan", wan,
+		"proto", proto,
+		"route", route,
+		"bytes_up", up,
+		"bytes_down", down,
+		"latency_ms", time.Since(start).Milliseconds(),
+		"status", status,
+	)
 }
 
 // relayThroughWAN pipes clientConn and the upstream connection
@@ -80,21 +169,5 @@ func (r *wanRelay) relayThroughWAN(wanIndex int, targetHost string, start time.T
 	metricProxyBytes.Add(float64(down), strconv.Itoa(wanIndex), "down")
 	metricProxyLatency.Observe(time.Since(start).Seconds())
 	r.pool.RecordSuccess(wanIndex)
-	r.logAccess(targetHost, wanIndex, up, down, start, "ok", proto)
-}
-
-// logAccess emits one structured access-log line per proxied connection.
-func (r *wanRelay) logAccess(target string, wan int, up, down int64, start time.Time, status, proto string) {
-	if !r.AccessLog {
-		return
-	}
-	slog.Info("proxy access",
-		"target", target,
-		"wan", wan,
-		"proto", proto,
-		"bytes_up", up,
-		"bytes_down", down,
-		"latency_ms", time.Since(start).Milliseconds(),
-		"status", status,
-	)
+	r.logAccess(targetHost, wanIndex, up, down, start, "ok", proto, "wan")
 }

@@ -63,6 +63,11 @@ All config via environment variables:
 | `STABILITY_PROBES` | No | `0` (off) | Exit-IP probes per passed speed test (0-5). When >0, WANs are ranked by exit-IP stability (lower = more stable) and replacement prefers the least-stable active WAN. Ranking only — churny configs are never rejected |
 | `ACCESS_LOG` | No | `true` | One structured log line per proxied connection |
 | `ALLOW_DEGRADED_BOOT` | No | `true` | Start the proxy as soon as the first WAN is active (vs waiting for full WAN_COUNT) |
+| `ROUTE_MODE` | No | `all-proxy` | Split-routing policy: `all-proxy` (everything via WAN pool — historical behavior), `proxy-default` (everything via WAN except direct-list hosts), `direct-default` (everything direct except proxy-list hosts) |
+| `DIRECT_DOMAINS` | No | — | Comma-separated domain suffixes routed direct in `proxy-default` mode (e.g. `.ir` for country-local domains). `.example.com` matches `example.com` and subdomains |
+| `PROXY_DOMAINS` | No | — | Comma-separated domain suffixes routed via WAN in `direct-default` mode |
+| `DIRECT_LIST_FILE` | No | — | Path to a newline-separated domain list file (same semantics as `DIRECT_DOMAINS`, `#` comments allowed) |
+| `PROXY_LIST_FILE` | No | — | Path to a newline-separated domain list file (same semantics as `PROXY_DOMAINS`) |
 
 ### Quick start
 
@@ -111,6 +116,36 @@ Each slot transitions through: `empty → testing → active → draining → em
 - Only **one WAN replaced per cycle** (prevents mass disconnects)
 - WANs running above `MINIMUM_SPEED` are never replaced
 - Service ports are fixed per slot — the load balancer never needs to update its routing
+
+---
+
+## Split Routing
+
+By default everything goes through the WAN pool (`ROUTE_MODE=all-proxy`, the historical behavior). When a router is configured, each CONNECT/SOCKS5 target is classified before the WAN is selected:
+
+| Mode | Default | Override list |
+|---|---|---|
+| `all-proxy` | WAN | none |
+| `proxy-default` | WAN | `DIRECT_DOMAINS` / `DIRECT_LIST_FILE` → **direct** |
+| `direct-default` | direct | `PROXY_DOMAINS` / `PROXY_LIST_FILE` → **WAN** |
+
+- Suffix matching is case-insensitive; `.example.com` matches `example.com` and all subdomains; a single-label entry (`localhost`) matches exactly.
+- Direct connections bypass the WAN pool entirely (no load balancing, no WAN health accounting) and are tuned like proxied ones (`TCP_NODELAY`, keepalive).
+- Access log and metrics tag every connection with `route=direct|wan` so split behavior is observable (`viberoxy_proxy_bytes_total{route="direct"}` etc.).
+
+Example — route Iranian country-local domains straight, proxy everything else:
+
+```bash
+ROUTE_MODE=proxy-default DIRECT_DOMAINS=".ir" go run .
+```
+
+Example — proxy only geo-blocked domains, go straight for the rest:
+
+```bash
+ROUTE_MODE=direct-default PROXY_DOMAINS=".google.com,.youtube.com,.instagram.com" go run .
+```
+
+Note: DNS resolution stays with the client in v1 (TCP routing only). If a proxied domain's DNS is poisoned locally, the client should use DNS-over-HTTPS for it.
 
 ---
 

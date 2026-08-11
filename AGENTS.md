@@ -14,6 +14,7 @@
 | Change WAN lifecycle logic | `wan.go` — state machine, drain, health |
 | Change xray config generation | `xray.go` — `BuildXrayConfig`, `buildOutbound` |
 | Modify the HTTPS proxy | `proxy.go` — `handleConnect`, load balancing |
+| Change split-routing rules | `router.go` — `Router.Decide`, suffix lists |
 
 ---
 
