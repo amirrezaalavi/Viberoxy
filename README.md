@@ -68,6 +68,7 @@ All config via environment variables:
 | `PROXY_DOMAINS` | No | — | Comma-separated domain suffixes routed via WAN in `direct-default` mode |
 | `DIRECT_LIST_FILE` | No | — | Path to a newline-separated domain list file (same semantics as `DIRECT_DOMAINS`, `#` comments allowed) |
 | `PROXY_LIST_FILE` | No | — | Path to a newline-separated domain list file (same semantics as `PROXY_DOMAINS`) |
+| `XRAY_MUX` | No | `true` | Multiplex client connections over one upstream xray connection per WAN (mux concurrency 8). Amortizes the TLS/protocol handshake that otherwise runs per connection — the biggest lever on per-connection setup latency. Disable for workloads dominated by very large single transfers |
 
 ### Quick start
 

@@ -61,6 +61,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"WAN_FAIL_THRESHOLD",
 		"STABILITY_PROBES",
 		"ALLOW_DEGRADED_BOOT",
+		"XRAY_MUX",
 	} {
 		unsetenv(t, key)
 	}
@@ -124,6 +125,40 @@ func TestParseConfig_Defaults(t *testing.T) {
 	}
 	if !cfg.AllowDegradedBoot {
 		t.Error("AllowDegradedBoot = false, want true (default)")
+	}
+	if !cfg.XrayMux {
+		t.Error("XrayMux = false, want true (default)")
+	}
+}
+
+func TestParseConfig_MuxOverrides(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	setenv(t, "XRAY_MUX", "false")
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.XrayMux {
+		t.Error("XrayMux = true, want false (XRAY_MUX=false)")
+	}
+
+	setenv(t, "XRAY_MUX", "true")
+	cfg, err = parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if !cfg.XrayMux {
+		t.Error("XrayMux = false, want true (XRAY_MUX=true)")
+	}
+}
+
+func TestParseConfig_InvalidMux(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "XRAY_MUX", "not-a-bool")
+
+	if _, err := parseConfig(); err == nil {
+		t.Error("expected error for invalid XRAY_MUX value")
 	}
 }
 
