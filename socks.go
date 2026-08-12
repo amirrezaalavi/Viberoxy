@@ -28,8 +28,8 @@ type SocksServer struct {
 }
 
 // NewSocksServer creates a SOCKS5 front-end listener on the given port.
-func NewSocksServer(port int, pool *WANPool) *SocksServer {
-	return &SocksServer{
+func NewSocksServer(port int, pool *WANPool, router ...*Router) *SocksServer {
+	s := &SocksServer{
 		port: port,
 		wanRelay: wanRelay{
 			pool:             pool,
@@ -37,6 +37,10 @@ func NewSocksServer(port int, pool *WANPool) *SocksServer {
 			WanFailThreshold: DefaultFailThreshold,
 		},
 	}
+	if len(router) > 0 {
+		s.router = router[0]
+	}
+	return s
 }
 
 // Listen binds the SOCKS5 listener and serves one goroutine per accepted
@@ -112,6 +116,27 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	targetHost, err := parseSocksTarget(clientConn, req[3])
 	if err != nil {
 		writeSocksReply(clientConn, 0x08) // address type not supported
+		return
+	}
+
+	// Split routing: a direct-route target bypasses the WAN pool entirely.
+	if s.decideRoute(targetHost) == RouteDirect {
+		dialCtx, cancel := context.WithTimeout(context.Background(), socksDialTimeout)
+		defer cancel()
+		upstream, err := s.directDial(dialCtx, targetHost, start, "socks5")
+		if err != nil {
+			writeSocksReply(clientConn, 0x01) // general failure
+			return
+		}
+		defer upstream.Close()
+
+		// Success: REP 0x00, RSV 0x00, ATYP 0x01 (IPv4), BND.ADDR 0.0.0.0,
+		// BND.PORT 0.
+		if _, err := clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); err != nil {
+			return
+		}
+		clientConn.SetReadDeadline(time.Time{})
+		s.directRelay(targetHost, start, "socks5", clientConn, upstream)
 		return
 	}
 

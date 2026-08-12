@@ -1046,3 +1046,83 @@ func TestBuildDownloadURL_EmptyEndpoint(t *testing.T) {
 		t.Errorf("buildDownloadURL = %q, want empty", url)
 	}
 }
+
+func TestParseConfig_RouterDefaultNil(t *testing.T) {
+	for _, key := range []string{"ROUTE_MODE", "DIRECT_DOMAINS", "PROXY_DOMAINS", "DIRECT_LIST_FILE", "PROXY_LIST_FILE"} {
+		unsetenv(t, key)
+	}
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.Router != nil {
+		t.Error("Router = non-nil, want nil (all-proxy default)")
+	}
+}
+
+func TestParseConfig_RouterProxyDefault(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ROUTE_MODE", "proxy-default")
+	setenv(t, "DIRECT_DOMAINS", ".ir, example.com")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.Router == nil {
+		t.Fatal("Router = nil, want non-nil")
+	}
+	if cfg.Router.Mode != RouteProxyDefault {
+		t.Errorf("Mode = %q, want proxy-default", cfg.Router.Mode)
+	}
+	if got := cfg.Router.Decide("somedomain.ir"); got != RouteDirect {
+		t.Errorf("Decide(.ir) = %v, want direct", got)
+	}
+	if got := cfg.Router.Decide("google.com"); got != RouteWAN {
+		t.Errorf("Decide(google.com) = %v, want wan", got)
+	}
+}
+
+func TestParseConfig_RouterDirectDefault(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ROUTE_MODE", "direct-default")
+	setenv(t, "PROXY_DOMAINS", ".google.com")
+
+	cfg, err := parseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.Router == nil {
+		t.Fatal("Router = nil, want non-nil")
+	}
+	if cfg.Router.Mode != RouteDirectDefault {
+		t.Errorf("Mode = %q, want direct-default", cfg.Router.Mode)
+	}
+	if got := cfg.Router.Decide("www.google.com"); got != RouteWAN {
+		t.Errorf("Decide(www.google.com) = %v, want wan", got)
+	}
+	if got := cfg.Router.Decide("github.com"); got != RouteDirect {
+		t.Errorf("Decide(github.com) = %v, want direct", got)
+	}
+}
+
+func TestParseConfig_RouterInvalidMode(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ROUTE_MODE", "bogus-mode")
+
+	if _, err := parseConfig(); err == nil {
+		t.Error("expected error for invalid ROUTE_MODE")
+	}
+}
+
+func TestParseConfig_RouterMissingListFile(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ROUTE_MODE", "proxy-default")
+	setenv(t, "DIRECT_LIST_FILE", "/nonexistent/direct.txt")
+
+	if _, err := parseConfig(); err == nil {
+		t.Error("expected error for missing DIRECT_LIST_FILE")
+	}
+}

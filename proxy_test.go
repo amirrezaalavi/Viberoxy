@@ -163,6 +163,101 @@ func TestHandleConnect_Success(t *testing.T) {
 	}
 }
 
+func TestHandleConnect_DirectRoute(t *testing.T) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	// The WAN pool has NO active slots — the WAN path would fail with
+	// 503. The direct route must bypass it entirely.
+	pool := NewWANPool(1, 0)
+
+	router := NewRouter(RouteProxyDefault, []string{".127.0.0.1"}, nil)
+	proxyPort := freePort(t)
+	proxy := NewProxyServer(proxyPort, pool, router)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go proxy.Start(ctx)
+
+	waitForPort(fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	echoAddr := echoLn.Addr().String()
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echoAddr, echoAddr)
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	testMsg := []byte("hello direct tunnel!")
+	if _, err := conn.Write(testMsg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	response := make([]byte, len(testMsg))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(response) != string(testMsg) {
+		t.Errorf("got %q, want %q", string(response), string(testMsg))
+	}
+}
+
+func TestHandleConnect_DirectRouteOnlyMatchingHosts(t *testing.T) {
+	// Non-matching host still goes to the WAN path (no active slot -> 503),
+	// proving the router actually gates the decision.
+	pool := NewWANPool(1, 0)
+	router := NewRouter(RouteProxyDefault, []string{".direct.example"}, nil)
+	proxyPort := freePort(t)
+	proxy := NewProxyServer(proxyPort, pool, router)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go proxy.Start(ctx)
+
+	waitForPort(fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != 503 {
+		t.Fatalf("expected 503 (no WAN), got %d", resp.StatusCode)
+	}
+}
+
 func TestHandleConnect_ConnectionCount(t *testing.T) {
 	socksLn, socksAddr := startTestSocksServer(t)
 	defer socksLn.Close()
