@@ -15,6 +15,7 @@
 | Change xray config generation | `xray.go` — `BuildXrayConfig`, `buildOutbound` |
 | Modify the HTTPS proxy | `proxy.go` — `handleConnect`, load balancing |
 | Tune connection latency | `xray.go` (mux), `relay.go` — `tuneTCPConn` (TCP_NODELAY + keepalive) |
+| Change split-routing rules | `router.go` — `Router.Decide`, suffix lists |
 
 ---
 
