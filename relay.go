@@ -96,11 +96,6 @@ func (r *wanRelay) directDial(ctx context.Context, targetHost string, start time
 // bidirectionally (same shape as relayThroughWAN, without WAN slot metrics)
 // and writes a direct-route access-log line. Blocking; caller owns conns.
 func (r *wanRelay) directRelay(targetHost string, start time.Time, proto string, clientConn, upstream net.Conn) {
-// relayThroughWAN pipes clientConn and the upstream connection
-// bidirectionally until both directions close, then records byte/latency
-// metrics, resets the slot's failure counter and writes the access-log line.
-// Blocking; the caller owns both conns.
-func (r *wanRelay) relayThroughWAN(wanIndex int, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn) {
 	tuneTCPConn(clientConn)
 	tuneTCPConn(upstream)
 

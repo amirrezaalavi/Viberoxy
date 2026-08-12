@@ -317,6 +317,8 @@ func parseConfig() (*Config, error) {
 
 	if mode != RouteAllProxy || len(direct) > 0 || len(proxy) > 0 {
 		cfg.Router = NewRouter(mode, direct, proxy)
+	}
+
 	// XRAY_MUX enables xray outbound connection multiplexing (mux). With mux
 	// on (default), many client connections share one upstream connection to
 	// the proxy server, amortizing the TLS/protocol handshake that otherwise
