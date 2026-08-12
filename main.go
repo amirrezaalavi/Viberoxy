@@ -34,6 +34,7 @@ type Config struct {
 	StabilityProbes   int
 	AccessLog         bool
 	AllowDegradedBoot bool
+	XrayMux           bool
 }
 
 // MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
@@ -282,6 +283,20 @@ func parseConfig() (*Config, error) {
 		cfg.AllowDegradedBoot = b
 	}
 
+	// XRAY_MUX enables xray outbound connection multiplexing (mux). With mux
+	// on (default), many client connections share one upstream connection to
+	// the proxy server, amortizing the TLS/protocol handshake that otherwise
+	// runs per connection — the single biggest lever on per-connection setup
+	// latency. Turn it off for workloads dominated by very large transfers.
+	cfg.XrayMux = true
+	if v := os.Getenv("XRAY_MUX"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: XRAY_MUX=%q: must be a boolean (true/false)", v)
+		}
+		cfg.XrayMux = b
+	}
+
 	return cfg, nil
 }
 
@@ -449,7 +464,7 @@ func startup(cfg *Config, ctx context.Context) {
 			}
 			slotIdx := emptySlots[0]
 			pool.StartTesting(slotIdx, c)
-			cmd, path, err := StartXray(c, cfg.WanBasePort+slotIdx)
+			cmd, path, err := StartXray(c, cfg.WanBasePort+slotIdx, cfg.XrayMux)
 			if err != nil {
 				slog.Error("startup: xray failed", "error", err)
 				pool.ResetEmpty(slotIdx)
@@ -624,7 +639,7 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 		}
 		slotIdx := emptySlots[0]
 		pool.StartTesting(slotIdx, result.Config)
-		cmd, path, err := StartXray(result.Config, cfg.WanBasePort+slotIdx)
+		cmd, path, err := StartXray(result.Config, cfg.WanBasePort+slotIdx, cfg.XrayMux)
 		if err != nil {
 			slog.Warn("cycle: xray start failed", "error", err)
 			pool.ResetEmpty(slotIdx)

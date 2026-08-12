@@ -357,6 +357,7 @@ func socks5Dial(ctx context.Context, socksAddr, targetAddr string) (net.Conn, er
 	if err != nil {
 		return nil, fmt.Errorf("connect to socks: %w", err)
 	}
+	tuneTCPConn(conn)
 
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		conn.Close()

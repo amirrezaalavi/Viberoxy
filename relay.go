@@ -52,11 +52,27 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanIndex int, targetHost string,
 	return conn, nil
 }
 
+// tuneTCPConn disables Nagle and enables keepalive on a TCP connection so
+// small interactive writes (TLS handshakes, HTTP requests, chat messages)
+// are not artificially delayed. Non-TCP conns are left untouched.
+func tuneTCPConn(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tcp.SetNoDelay(true)
+	tcp.SetKeepAlive(true)
+	tcp.SetKeepAlivePeriod(30 * time.Second)
+}
+
 // relayThroughWAN pipes clientConn and the upstream connection
 // bidirectionally until both directions close, then records byte/latency
 // metrics, resets the slot's failure counter and writes the access-log line.
 // Blocking; the caller owns both conns.
 func (r *wanRelay) relayThroughWAN(wanIndex int, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn) {
+	tuneTCPConn(clientConn)
+	tuneTCPConn(upstream)
+
 	var wg sync.WaitGroup
 	var upBytes, downBytes int64
 	wg.Add(2)

@@ -63,6 +63,7 @@ All config via environment variables:
 | `STABILITY_PROBES` | No | `0` (off) | Exit-IP probes per passed speed test (0-5). When >0, WANs are ranked by exit-IP stability (lower = more stable) and replacement prefers the least-stable active WAN. Ranking only — churny configs are never rejected |
 | `ACCESS_LOG` | No | `true` | One structured log line per proxied connection |
 | `ALLOW_DEGRADED_BOOT` | No | `true` | Start the proxy as soon as the first WAN is active (vs waiting for full WAN_COUNT) |
+| `XRAY_MUX` | No | `true` | Multiplex client connections over one upstream xray connection per WAN (mux concurrency 8). Amortizes the TLS/protocol handshake that otherwise runs per connection — the biggest lever on per-connection setup latency. Disable for workloads dominated by very large single transfers |
 
 ### Quick start
 

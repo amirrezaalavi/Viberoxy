@@ -75,8 +75,58 @@ func TestBuildXrayConfig_Shadowsocks(t *testing.T) {
 		t.Errorf("password = %q, want password", settings.Servers[0].Password)
 	}
 
-	if xc.Outbounds[0].Mux == nil || xc.Outbounds[0].Mux.Enabled {
-		t.Error("expected mux with enabled=false")
+	if xc.Outbounds[0].Mux == nil || !xc.Outbounds[0].Mux.Enabled {
+		t.Error("expected mux with enabled=true by default")
+	}
+	if xc.Outbounds[0].Mux.Concurrency != 8 {
+		t.Errorf("mux concurrency = %d, want 8", xc.Outbounds[0].Mux.Concurrency)
+	}
+}
+
+func TestBuildXrayConfig_MuxDisabled(t *testing.T) {
+	raw := "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#MySS"
+	cfg := ParseSingle(raw)
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+
+	data, err := BuildXrayConfig(cfg, 10801, false)
+	if err != nil {
+		t.Fatalf("BuildXrayConfig error: %v", err)
+	}
+
+	var xc XrayConfig
+	if err := json.Unmarshal(data, &xc); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if xc.Outbounds[0].Mux != nil && xc.Outbounds[0].Mux.Enabled {
+		t.Error("expected mux disabled when explicitly requested")
+	}
+}
+
+func TestBuildXrayConfig_FreedomFallbackNoMux(t *testing.T) {
+	// hysteria2 is a freedom fallback: mux must never be emitted there,
+	// even when the caller requests mux on.
+	raw := "hysteria2://auth@1.2.3.4:443"
+	cfg := ParseSingle(raw)
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+
+	data, err := BuildXrayConfig(cfg, 10802, true)
+	if err != nil {
+		t.Fatalf("BuildXrayConfig error: %v", err)
+	}
+
+	var xc XrayConfig
+	if err := json.Unmarshal(data, &xc); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if xc.Outbounds[0].Protocol != "freedom" {
+		t.Fatalf("outbound protocol = %q, want freedom", xc.Outbounds[0].Protocol)
+	}
+	if xc.Outbounds[0].Mux != nil {
+		t.Error("expected no mux on freedom fallback outbound")
 	}
 }
 
