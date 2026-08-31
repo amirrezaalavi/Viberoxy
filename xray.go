@@ -194,8 +194,11 @@ func buildOutbound(cfg *ProxyConfig, muxEnabled bool) []OutboundConfig {
 		if sec, ok := v["security"].(string); ok && sec != "" {
 			tlsVal = sec
 		}
+		pbk, _ := v["pbk"].(string)
+		sid, _ := v["sid"].(string)
+		spx, _ := v["spx"].(string)
 
-		streamSettings = buildStreamSettings(net, headerType, path, host, tlsVal, sni, fp, alpn)
+		streamSettings = buildStreamSettings(net, headerType, path, host, tlsVal, sni, fp, alpn, pbk, sid, spx)
 
 	case "vless":
 		uuid, encryption, flow, params := extractVLessParams(cfg.Raw)
@@ -228,6 +231,9 @@ func buildOutbound(cfg *ProxyConfig, muxEnabled bool) []OutboundConfig {
 			params["sni"],
 			params["fp"],
 			params["alpn"],
+			params["pbk"],
+			params["sid"],
+			params["spx"],
 		)
 
 	case "trojan":
@@ -253,6 +259,9 @@ func buildOutbound(cfg *ProxyConfig, muxEnabled bool) []OutboundConfig {
 			params["sni"],
 			params["fp"],
 			params["alpn"],
+			params["pbk"],
+			params["sid"],
+			params["spx"],
 		)
 
 	case "socks5":
@@ -324,7 +333,7 @@ func getXrayProtocol(proto string) string {
 	}
 }
 
-func buildStreamSettings(network, headerType, path, host, security, sni, fp, alpn string) *StreamSettings {
+func buildStreamSettings(network, headerType, path, host, security, sni, fp, alpn, pbk, sid, spx string) *StreamSettings {
 	ss := &StreamSettings{}
 
 	switch network {
@@ -341,6 +350,8 @@ func buildStreamSettings(network, headerType, path, host, security, sni, fp, alp
 	case "grpc", "gun":
 		ss.Network = "grpc"
 		ss.GRPCSettings = &GRPCSettings{ServiceName: path}
+	case "xhttp":
+		ss.Network = "xhttp"
 	case "tcp", "http", "":
 		ss.Network = "tcp"
 		if headerType == "http" && host != "" {
@@ -381,6 +392,9 @@ func buildStreamSettings(network, headerType, path, host, security, sni, fp, alp
 		ss.RealitySettings = &RealitySettings{
 			ServerName:  sni,
 			Fingerprint: fp,
+			PublicKey:   pbk,
+			ShortID:     sid,
+			SpiderX:     spx,
 		}
 	}
 
@@ -459,6 +473,9 @@ func extractVLessParams(raw string) (uuid, encryption, flow string, params map[s
 		"sni":      q.Get("sni"),
 		"fp":       q.Get("fp"),
 		"alpn":     q.Get("alpn"),
+		"pbk":      q.Get("pbk"),
+		"sid":      q.Get("sid"),
+		"spx":      q.Get("spx"),
 	}
 	return
 }
@@ -484,6 +501,9 @@ func extractTrojanParams(raw string) (password, flow string, params map[string]s
 		"sni":      q.Get("sni"),
 		"fp":       q.Get("fp"),
 		"alpn":     q.Get("alpn"),
+		"pbk":      q.Get("pbk"),
+		"sid":      q.Get("sid"),
+		"spx":      q.Get("spx"),
 	}
 	return
 }
