@@ -769,3 +769,61 @@ func TestRoutableWANConcept(t *testing.T) {
 		t.Errorf("GetLeastLoaded(2) = %d, want 2 (healthy slot)", idx)
 	}
 }
+
+// TestOrphanedProcessReap verifies that HealthCheckAll resets a slot to
+// StateActive when its xray process has already exited, ensuring no orphaned
+// processes linger. This is the TDD RED test for the orphan-reap fix.
+func TestOrphanedProcessReap(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	// Put slot 0 into StateActive with a long-running command.
+	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})
+	cmd := exec.Command("sleep", "3600")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start cmd: %v", err)
+	}
+	if err := pool.SetActive(0, cmd, "/tmp/test-config.json"); err != nil {
+		t.Fatalf("SetActive error: %v", err)
+	}
+
+	// Simulate the process exiting: kill it and reap the zombie.
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill cmd: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Logf("cmd.Wait() returned (expected for killed process): %v", err)
+	}
+
+	// Confirm the process is truly gone (reaped via Wait).
+	if cmd.ProcessState == nil {
+		t.Fatal("ProcessState should be non-nil after Wait")
+	}
+	// A signal-killed process has Exited()==false but is still reaped.
+	// The key property: Success() is false (it did not exit cleanly).
+	if cmd.ProcessState.Success() {
+		t.Fatal("process should not have exited cleanly")
+	}
+
+	// Run the health check — it should detect the dead process and reap
+	// the slot, resetting it to StateEmpty.
+	dead := pool.HealthCheckAll()
+	if len(dead) != 1 || dead[0] != 0 {
+		t.Fatalf("HealthCheckAll = %v, want [0]", dead)
+	}
+
+	// The critical assertion: after detecting the dead process, the slot
+	// must be reset to StateEmpty so no orphan remains and the slot can
+	// be reused.
+	if pool.GetState(0) != StateEmpty {
+		t.Errorf("slot state after reap = %v, want empty", pool.GetState(0))
+	}
+	if pool.Slots[0].Cmd != nil {
+		t.Error("slot.Cmd should be nil after reap")
+	}
+	if pool.Slots[0].Config != nil {
+		t.Error("slot.Config should be nil after reap")
+	}
+	if pool.Slots[0].ConfigPath != "" {
+		t.Error("slot.ConfigPath should be empty after reap")
+	}
+}
