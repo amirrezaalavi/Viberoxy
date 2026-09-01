@@ -44,7 +44,7 @@ Fetch subscription (HTTP GET)
   → writeSortedTxt
   → Fill empty WAN slots (best configs passing minimum speed)
   → Replace one low-performing WAN (drain old → spawn new on same port)
-  → Health-check active xray processes (restart dead ones)
+  → Health-check active xray processes (reap dead/orphaned slots)
 ```
 
 ---
@@ -73,9 +73,46 @@ empty → testing → active → draining → (kill after max(60, 2×FETCH_INTER
 | `TestAll(configs, ...)` | `tester.go` | Test all configs, return sorted results |
 | `DownloadMeasurer(addr, url, size, timeout)` | `tester.go` | SOCKS5 dial + HTTP GET + Mbps measurement |
 | `NewWANPool(count, basePort)` | `wan.go` | Create N WAN slots |
-| `GetLeastLoaded()` | `wan.go` | Pick WAN with fewest connections |
+| `RoutableCount(threshold)` | `wan.go` | Count routable WANs (active, under fail threshold, with running xray) |
+| `GetLeastLoaded(thresholds...)` | `wan.go` | Pick least-loaded routable WAN; falls back to degraded if none routable |
+| `HealthCheckAll()` | `wan.go` | Check all active/draining slots; reap orphaned (dead xray) processes |
 | `NewProxyServer(port, pool)` | `proxy.go` | Create HTTPS CONNECT proxy |
 | `handleConnect(w, r)` | `proxy.go` | CONNECT handler: pick WAN, SOCKS5 dial, pipe bytes |
+
+---
+
+## Routable WANs
+
+A WAN slot is **routable** when all three conditions hold:
+
+1. Its state is `StateActive` or `StateDraining`.
+2. Its `ConsecutiveFails` counter is strictly below the threshold (`DefaultFailThreshold = 2`).
+3. Its `Cmd` (xray process handle) is non-nil and the process is alive.
+
+Only routable WANs receive new connections from the load balancer. This prevents blackholing traffic on degraded or dead slots.
+
+### Readiness
+
+`/readyz` returns 200 only when `RoutableCount(DefaultFailThreshold) >= 1`. If every active slot is over the fail threshold or has a dead xray process, readiness returns `503 not ready: no routable WANs`.
+
+### Load-balancer fallback
+
+`GetLeastLoaded` first picks the least-loaded among **routable** slots. If no routable slot exists (all active/draining slots are over the fail threshold), it falls back to the least-loaded among all active/draining slots and logs a warning. This avoids total blackhole when every WAN is degraded but at least one is still alive.
+
+### Orphan reaping
+
+`HealthCheckAll` runs periodically (every `KEEPALIVE_INTERVAL`). It detects active/draining slots whose xray process has died (defunct) and resets them to `StateEmpty` so `StopXray` cleans them up and the slot can be reused.
+
+---
+
+## viber-console Supervisor
+
+The supervisor (`viber-console/internal/supervisor`) now auto-restarts crashed child processes:
+
+- Each `Service` has an `AutoRestart` flag (default: `true` for new services).
+- When the reaper goroutine observes an unexpected exit and `AutoRestart` is `true`, it waits with exponential backoff (starting at 1s, capped at 30s) then restarts the child.
+- `Status()` exposes `restarts`, `auto_restart`, `last_restart_at`, and `last_error` so the API and logs reflect restart activity.
+- Restart loops are prevented by the backoff; a fundamentally broken binary will settle into 30s-interval restarts with logged errors.
 
 ---
 

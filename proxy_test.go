@@ -463,11 +463,11 @@ func TestHandleConnect_DialFailureCounted(t *testing.T) {
 	}
 }
 
-func TestHandleConnect_SkipsUnhealthyWAN(t *testing.T) {
+func TestHandleConnect_DegradedWANAttemptsDial(t *testing.T) {
 	pool := NewWANPool(1, 0)
 	pool.Slots[0].ServicePort = freePort(t) // nothing listening there
 	pool.Slots[0].State = StateActive
-	// 2 fails >= default threshold 2 → slot excluded from load balancing.
+	// 2 fails >= default threshold 2 → slot is degraded but still active.
 	pool.RecordFailure(0)
 	pool.RecordFailure(0)
 
@@ -492,10 +492,11 @@ func TestHandleConnect_SkipsUnhealthyWAN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read response: %v", err)
 	}
-	// With the only slot unhealthy, the proxy must answer 503 instead of
-	// attempting (and failing) the SOCKS5 dial with 502.
-	if resp.StatusCode != 503 {
-		t.Errorf("expected 503 (no healthy WAN), got %d", resp.StatusCode)
+	// With the new fallback semantics, the proxy attempts the dial even
+	// through a degraded WAN (returning 502 on failure) instead of
+	// blackholing with 503.
+	if resp.StatusCode != 502 {
+		t.Errorf("expected 502 (degraded WAN attempted), got %d", resp.StatusCode)
 	}
 }
 
