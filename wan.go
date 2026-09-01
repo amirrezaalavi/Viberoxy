@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"log/slog"
 	"os/exec"
 	"strconv"
 	"sync"
@@ -333,27 +334,77 @@ func (p *WANPool) PickReplacementSlot(activeSlots []int) int {
 // balancing and the keepalive loop marks it draining for replacement.
 const DefaultFailThreshold = 2
 
+// RoutableCount returns the number of active/draining slots that are
+// routable: their ConsecutiveFails is strictly below the given threshold
+// and their Cmd (xray process handle) is non-nil. A slot with a nil Cmd
+// cannot serve traffic even if its state is active.
+func (p *WANPool) RoutableCount(threshold int) int {
+	count := 0
+	for _, slot := range p.Slots {
+		slot.mu.Lock()
+		s := slot.State
+		cmd := slot.Cmd
+		slot.mu.Unlock()
+		fails := atomic.LoadInt64(&slot.ConsecutiveFails)
+		if s == StateActive || s == StateDraining {
+			if fails < int64(threshold) && cmd != nil {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 // GetLeastLoaded returns the index of the active/draining slot with the
 // fewest connections. Slots whose ConsecutiveFails has reached the given
 // threshold are skipped as unhealthy; with no argument the default
 // DefaultFailThreshold (2) applies.
+//
+// If no routable slot exists (all active/draining slots are over the
+// threshold), it falls back to the least-loaded among all active/draining
+// slots and logs a warning so the degradation is visible. This prevents
+// the proxy from blackholing traffic when every WAN is degraded but at
+// least one is still alive.
 func (p *WANPool) GetLeastLoaded(thresholds ...int) int {
 	threshold := DefaultFailThreshold
 	if len(thresholds) > 0 {
 		threshold = thresholds[0]
 	}
+
 	best := -1
 	var bestCount int64 = -1
+
+	// First pass: pick the least-loaded among routable slots.
 	for i, slot := range p.Slots {
 		slot.mu.Lock()
 		s := slot.State
 		c := atomic.LoadInt64(&slot.ConnCount)
+		cmd := slot.Cmd
+		slot.mu.Unlock()
 		fails := atomic.LoadInt64(&slot.ConsecutiveFails)
+		if s == StateActive || s == StateDraining {
+			if fails < int64(threshold) && cmd != nil {
+				if best == -1 || c < bestCount {
+					best = i
+					bestCount = c
+				}
+			}
+		}
+	}
+
+	if best != -1 {
+		return best
+	}
+
+	// Fallback: no routable slot. Pick the least-loaded among ALL
+	// active/draining slots (even over threshold) to avoid blackhole.
+	slog.Warn("no routable WAN: falling back to degraded slots", "threshold", threshold)
+	for i, slot := range p.Slots {
+		slot.mu.Lock()
+		s := slot.State
+		c := atomic.LoadInt64(&slot.ConnCount)
 		slot.mu.Unlock()
 		if s == StateActive || s == StateDraining {
-			if fails >= int64(threshold) {
-				continue
-			}
 			if best == -1 || c < bestCount {
 				best = i
 				bestCount = c
