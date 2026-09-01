@@ -634,6 +634,15 @@ func TestBuildXrayConfig_RealityStream(t *testing.T) {
 	if ss.RealitySettings.Fingerprint != "chrome" {
 		t.Errorf("fingerprint = %q, want chrome", ss.RealitySettings.Fingerprint)
 	}
+	if ss.RealitySettings.PublicKey != "publickey" {
+		t.Errorf("publicKey = %q, want publickey", ss.RealitySettings.PublicKey)
+	}
+	if ss.RealitySettings.ShortID != "1234" {
+		t.Errorf("shortId = %q, want 1234", ss.RealitySettings.ShortID)
+	}
+	if ss.RealitySettings.SpiderX != "spiderx" {
+		t.Errorf("spiderX = %q, want spiderx", ss.RealitySettings.SpiderX)
+	}
 }
 
 func TestBuildXrayConfig_TCPHTTPHeader(t *testing.T) {
@@ -842,7 +851,7 @@ func TestExtractSocksParams(t *testing.T) {
 }
 
 func TestStreamSettings_TCPOnly(t *testing.T) {
-	ss := buildStreamSettings("tcp", "", "", "", "", "", "", "")
+	ss := buildStreamSettings("tcp", "", "", "", "", "", "", "", "", "", "")
 	if ss == nil {
 		t.Fatal("expected stream settings")
 	}
@@ -851,6 +860,51 @@ func TestStreamSettings_TCPOnly(t *testing.T) {
 	}
 	if ss.TCPSettings != nil {
 		t.Error("expected no tcp settings for plain tcp")
+	}
+}
+
+func TestBuildXrayConfig_RealityTrojanAuth(t *testing.T) {
+	raw := "trojan://password@1.2.3.4:443?security=reality&type=tcp&sni=example.com&fp=chrome&pbk=pubkey&sid=abcd&spx=spid#RealityTrojan"
+	cfg := ParseSingle(raw)
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+	data, err := BuildXrayConfig(cfg, 10820)
+	if err != nil {
+		t.Fatalf("BuildXrayConfig error: %v", err)
+	}
+	var xc XrayConfig
+	if err := json.Unmarshal(data, &xc); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	ss := xc.Outbounds[0].StreamSettings
+	if ss == nil {
+		t.Fatal("expected stream settings")
+	}
+	if ss.Security != "reality" {
+		t.Errorf("security = %q, want reality", ss.Security)
+	}
+	if ss.RealitySettings == nil {
+		t.Fatal("expected reality settings")
+	}
+	if ss.RealitySettings.PublicKey != "pubkey" {
+		t.Errorf("publicKey = %q, want pubkey", ss.RealitySettings.PublicKey)
+	}
+	if ss.RealitySettings.ShortID != "abcd" {
+		t.Errorf("shortId = %q, want abcd", ss.RealitySettings.ShortID)
+	}
+	if ss.RealitySettings.SpiderX != "spid" {
+		t.Errorf("spiderX = %q, want spid", ss.RealitySettings.SpiderX)
+	}
+}
+
+func TestStreamSettings_XHTTP(t *testing.T) {
+	ss := buildStreamSettings("xhttp", "", "", "", "", "", "", "", "", "", "")
+	if ss == nil {
+		t.Fatal("expected stream settings")
+	}
+	if ss.Network != "xhttp" {
+		t.Errorf("network = %q, want xhttp", ss.Network)
 	}
 }
 
