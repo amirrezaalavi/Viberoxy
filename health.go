@@ -24,13 +24,13 @@ func NewObservabilityHandler(pool *WANPool) http.Handler {
 	}))
 
 	mux.Handle("/readyz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if pool != nil && pool.ActiveCount() >= 1 {
+		if pool != nil && pool.RoutableCount(DefaultFailThreshold) >= 1 {
 			w.WriteHeader(http.StatusOK)
 			io.WriteString(w, "ready\n")
 			return
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
-		io.WriteString(w, "not ready: no active WANs\n")
+		io.WriteString(w, "not ready: no routable WANs\n")
 	}))
 
 	return mux
