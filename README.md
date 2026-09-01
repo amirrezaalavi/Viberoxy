@@ -55,7 +55,7 @@ All config via environment variables:
 | `TEST_BASE_PORT` | No | `10800` | First xray test port |
 | `PROXY_PORT` | No | `1080` | User-facing HTTPS CONNECT proxy port |
 | `SOCKS_PORT` | No | `0` (off) | User-facing SOCKS5 listener (TCP CONNECT only; UDP ASSOCIATE/BIND rejected with REP 0x07). No auth (RFC 1929 not implemented) |
-| `METRICS_PORT` | No | `0` (off) | Prometheus-format `/metrics` + `/healthz` + `/readyz` endpoint port |
+| `METRICS_PORT` | No | `0` (off) | Prometheus-format `/metrics` + `/healthz` + `/readyz` endpoint port. `/readyz` returns 200 only when at least one **routable** WAN exists (active, under fail threshold, with a live xray process); otherwise returns `503 not ready` |
 | `MINIMUM_SPEED` | No | `5.0` | Mbps threshold — don't replace WANs above this |
 | `MAX_TEST_PER_CYCLE` | No | `20` | Max configs speed-tested per runCycle (subscription is latency-sorted, so testing beyond this is wasted) |
 | `KEEPALIVE_INTERVAL` | No | `300` | Seconds between end-to-end WAN health probes (min 10) |
