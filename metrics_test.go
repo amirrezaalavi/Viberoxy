@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"net/http/httptest"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -170,8 +171,13 @@ func TestObservabilityHandler(t *testing.T) {
 		t.Errorf("readyz (no wans) = %d, want 503", rec.Code)
 	}
 
-	// /readyz is 200 with an active WAN.
+	// /readyz is 200 with an active WAN that has a non-nil Cmd (routable).
 	pool.Slots[0].State = StateActive
+	pool.Slots[0].Cmd = exec.Command("sleep", "9999")
+	if err := pool.Slots[0].Cmd.Start(); err != nil {
+		t.Fatalf("start cmd: %v", err)
+	}
+	defer pool.Slots[0].Cmd.Process.Kill()
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
 	if rec.Code != 200 {
