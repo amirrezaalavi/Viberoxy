@@ -351,7 +351,7 @@ func TestGetLeastLoaded_SkipsUnhealthy(t *testing.T) {
 	}
 }
 
-func TestGetLeastLoaded_AllUnhealthy(t *testing.T) {
+func TestGetLeastLoaded_AllUnhealthy_FallsBack(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	for i := 0; i < 2; i++ {
 		pool.StartTesting(i, &ProxyConfig{})
@@ -367,8 +367,12 @@ func TestGetLeastLoaded_AllUnhealthy(t *testing.T) {
 	pool.RecordFailure(1)
 	pool.RecordFailure(1)
 
-	if idx := pool.GetLeastLoaded(2); idx != -1 {
-		t.Errorf("GetLeastLoaded(2) = %d, want -1 (all slots unhealthy)", idx)
+	// With the new fallback semantics, GetLeastLoaded never returns -1
+	// when active slots exist — it picks the least-loaded among all
+	// active/draining slots even if all are over the threshold.
+	idx := pool.GetLeastLoaded(2)
+	if idx != 0 {
+		t.Errorf("GetLeastLoaded(2) = %d, want 0 (fallback to least-loaded)", idx)
 	}
 }
 
@@ -733,5 +737,35 @@ func TestResetEmpty_FromDraining(t *testing.T) {
 	}
 	if pool.Slots[0].State != StateEmpty {
 		t.Error("expected empty state")
+	}
+}
+
+func TestRoutableWANConcept(t *testing.T) {
+	pool := NewWANPool(3, 10700)
+
+	// Slot 0: active but over fail threshold (3 >= 2).
+	pool.Slots[0].State = StateActive
+	pool.Slots[0].Cmd = exec.Command("sleep", "9999")
+	atomic.StoreInt64(&pool.Slots[0].ConsecutiveFails, 3)
+
+	// Slot 1: active but over fail threshold (3 >= 2).
+	pool.Slots[1].State = StateActive
+	pool.Slots[1].Cmd = exec.Command("sleep", "9999")
+	atomic.StoreInt64(&pool.Slots[1].ConsecutiveFails, 3)
+
+	// Slot 2: active, healthy (0 < 2), with running xray.
+	pool.Slots[2].State = StateActive
+	pool.Slots[2].Cmd = exec.Command("sleep", "9999")
+	atomic.StoreInt64(&pool.Slots[2].ConsecutiveFails, 0)
+
+	// Only slot 2 is routable.
+	if c := pool.RoutableCount(DefaultFailThreshold); c != 1 {
+		t.Errorf("RoutableCount(2) = %d, want 1", c)
+	}
+
+	// GetLeastLoaded must return the healthy slot, never -1.
+	idx := pool.GetLeastLoaded(DefaultFailThreshold)
+	if idx != 2 {
+		t.Errorf("GetLeastLoaded(2) = %d, want 2 (healthy slot)", idx)
 	}
 }
