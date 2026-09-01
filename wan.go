@@ -453,6 +453,9 @@ func (p *WANPool) HealthCheckAll() []int {
 		if s == StateActive || s == StateDraining {
 			if !HealthCheckXray(cmd) {
 				result = append(result, i)
+				// Reap the orphaned slot: reset it to StateEmpty so the
+				// process is stopped and the slot can be reused.
+				p.ResetEmpty(i)
 			}
 		}
 	}
