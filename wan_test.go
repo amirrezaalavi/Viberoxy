@@ -710,6 +710,41 @@ func TestPickReplacementSlot(t *testing.T) {
 	}
 }
 
+func TestExitIPAndLastProbe(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+
+	// Initially empty.
+	if pool.Slots[0].ExitIP != "" {
+		t.Errorf("initial ExitIP = %q, want empty", pool.Slots[0].ExitIP)
+	}
+	if !pool.Slots[0].LastProbe.IsZero() {
+		t.Error("initial LastProbe should be zero")
+	}
+
+	// Set values.
+	pool.Slots[0].ExitIP = "203.0.113.1"
+	pool.Slots[0].LastProbe = time.Now()
+
+	if pool.Slots[0].ExitIP != "203.0.113.1" {
+		t.Errorf("ExitIP = %q, want 203.0.113.1", pool.Slots[0].ExitIP)
+	}
+	if pool.Slots[0].LastProbe.IsZero() {
+		t.Error("LastProbe should be set")
+	}
+
+	// ResetEmpty clears them.
+	pool.Slots[0].State = StateActive
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty error: %v", err)
+	}
+	if pool.Slots[0].ExitIP != "" {
+		t.Errorf("ExitIP after reset = %q, want empty", pool.Slots[0].ExitIP)
+	}
+	if !pool.Slots[0].LastProbe.IsZero() {
+		t.Error("LastProbe should be zero after reset")
+	}
+}
+
 func TestResetEmpty_FromTesting(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})

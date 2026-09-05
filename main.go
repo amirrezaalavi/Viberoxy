@@ -10,9 +10,44 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
+
+var (
+	cycleTimingMu sync.RWMutex
+	lastCycle     time.Time
+	nextCycle     time.Time
+	triggerCycle  = make(chan struct{}, 1)
+	candidatePool *CandidatePool
+)
+
+func resetCycleTiming() {
+	cycleTimingMu.Lock()
+	lastCycle = time.Time{}
+	nextCycle = time.Time{}
+	cycleTimingMu.Unlock()
+}
+
+func cycleTimingSnapshot() (time.Time, time.Time) {
+	cycleTimingMu.RLock()
+	defer cycleTimingMu.RUnlock()
+	return lastCycle, nextCycle
+}
+
+func markCycleStarted(now time.Time) {
+	cycleTimingMu.Lock()
+	lastCycle = now
+	nextCycle = time.Time{}
+	cycleTimingMu.Unlock()
+}
+
+func markCycleComplete(now time.Time, interval time.Duration) {
+	cycleTimingMu.Lock()
+	nextCycle = now.Add(interval)
+	cycleTimingMu.Unlock()
+}
 
 type Config struct {
 	SubscriberURL     string
@@ -398,6 +433,7 @@ func startup(cfg *Config, ctx context.Context) {
 	slog.Info("starting viberoxy...")
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
+	candidatePool = NewCandidatePool(50)
 
 	var (
 		proxy        *ProxyServer
@@ -453,6 +489,25 @@ func startup(cfg *Config, ctx context.Context) {
 			}()
 			slog.Info("metrics server started", "port", cfg.MetricsPort)
 		}
+
+		// API server for per-slot state + exit IP exposure. Runs on its own
+		// port (default 1980) alongside the proxy / observability listeners.
+		apiPort := 1980
+		if v := os.Getenv("API_PORT"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+				apiPort = n
+			}
+		}
+		apiSrv := &http.Server{
+			Addr:    fmt.Sprintf(":%d", apiPort),
+			Handler: NewAPIHandler(pool, cfg),
+		}
+		go func() {
+			if err := apiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("api server error", "error", err)
+			}
+		}()
+		slog.Info("api server started", "port", apiPort)
 
 		if cfg.KeepaliveInterval > 0 {
 			go keepaliveLoop(cfg, pool, ctx)
@@ -541,7 +596,7 @@ func startup(cfg *Config, ctx context.Context) {
 	startServices()
 	slog.Info("viberoxy started", "wans", pool.ActiveCount(), "proxy_port", cfg.ProxyPort)
 
-	runLoop(cfg, pool, proxy, ctx)
+	runLoop(cfg, pool, candidatePool, proxy, ctx)
 
 	slog.Info("shutting down...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -556,13 +611,22 @@ func startup(cfg *Config, ctx context.Context) {
 	slog.Info("viberoxy stopped")
 }
 
-func runLoop(cfg *Config, pool *WANPool, proxy *ProxyServer, ctx context.Context) {
-	ticker := time.NewTicker(time.Duration(cfg.FetchInterval) * time.Second)
+func runLoop(cfg *Config, pool *WANPool, candidatePool *CandidatePool, proxy *ProxyServer, ctx context.Context) {
+	interval := time.Duration(cfg.FetchInterval) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	markCycleComplete(time.Now(), interval)
 
-	gracePeriod := 2 * time.Duration(cfg.FetchInterval) * time.Second
+	gracePeriod := 2 * interval
 	if gracePeriod < 60*time.Second {
 		gracePeriod = 60 * time.Second
+	}
+
+	run := func() {
+		runCycle(cfg, pool, candidatePool, gracePeriod)
+		// A manual cycle restarts the interval so the exposed next-cycle time
+		// matches the ticker's actual schedule.
+		ticker.Reset(interval)
 	}
 
 	for {
@@ -570,7 +634,9 @@ func runLoop(cfg *Config, pool *WANPool, proxy *ProxyServer, ctx context.Context
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runCycle(cfg, pool, gracePeriod)
+			run()
+		case <-triggerCycle:
+			run()
 		}
 	}
 }
@@ -613,11 +679,29 @@ func probeAllWANs(cfg *Config, pool *WANPool) {
 			continue
 		}
 		pool.RecordSuccess(idx)
-		slog.Info("keepalive: probe ok", "index", idx)
+
+		// Resolve exit IP after a successful probe: a lightweight HTTP GET
+		// to api.ipify.org through the slot's SOCKS5 listener. Failures are
+		// non-fatal — the slot is already proven healthy by ProbeWAN above.
+		if ip, err := probeExitIP(socksAddr, timeout); err == nil {
+			slot := pool.Slots[idx]
+			slot.mu.Lock()
+			slot.ExitIP = ip
+			slot.LastProbe = time.Now()
+			slot.mu.Unlock()
+			slog.Info("keepalive: probe ok", "index", idx, "exit_ip", ip)
+		} else {
+			slog.Info("keepalive: probe ok", "index", idx)
+		}
 	}
 }
 
-func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
+func runCycle(cfg *Config, pool *WANPool, candidatePool *CandidatePool, gracePeriod time.Duration) {
+	markCycleStarted(time.Now())
+	defer func() {
+		markCycleComplete(time.Now(), time.Duration(cfg.FetchInterval)*time.Second)
+	}()
+
 	slog.Info("cycle: started")
 
 	for _, idx := range pool.DrainExpired(gracePeriod) {
@@ -688,6 +772,12 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 	}
 
 	writeSortedTxt(results)
+
+	// Populate the candidate pool with tested configs for use by the
+	// drop-and-replace API and future cycles.
+	if candidatePool != nil {
+		candidatePool.Update(results)
+	}
 
 	// Replacement: only consider candidates tested this cycle, and only when
 	// the pool is already full — replace a WAN with the best new config we

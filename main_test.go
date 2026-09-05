@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -814,6 +815,47 @@ func TestStartup_Shutdown(t *testing.T) {
 	}
 }
 
+func TestRunCycle_PopulatesCandidatePool(t *testing.T) {
+	dir := t.TempDir()
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	lines := []string{
+		"ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#TestSS",
+	}
+	rawData := strings.Join(lines, "\n")
+	encoded := base64.StdEncoding.EncodeToString([]byte(rawData))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(encoded))
+	}))
+	defer server.Close()
+
+	cfg := &Config{
+		SubscriberURL:    server.URL,
+		FetchInterval:    300,
+		TestTimeout:      3,
+		DownloadSize:     10000000,
+		DownloadEndpoint: server.URL + "?bytes=",
+		DownloadFallback: server.URL,
+		WanCount:         1,
+		WanBasePort:      20700,
+		TestBasePort:     20800,
+		ProxyPort:        0,
+		MinimumSpeed:     1e9,
+	}
+
+	pool := NewWANPool(1, 20700)
+	candidatePool := NewCandidatePool(50)
+
+	runCycle(cfg, pool, candidatePool, 60*time.Second)
+
+	if candidatePool.Len() == 0 {
+		t.Error("candidate pool should be populated after runCycle, but is empty")
+	}
+}
+
 func TestRunCycle(t *testing.T) {
 	dir := t.TempDir()
 	origDir, _ := os.Getwd()
@@ -847,7 +889,7 @@ func TestRunCycle(t *testing.T) {
 
 	pool := NewWANPool(1, 20700)
 
-	runCycle(cfg, pool, 60*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
 
 	if _, err := os.Stat("sorted.txt"); err != nil {
 		t.Errorf("sorted.txt should exist: %v", err)
@@ -894,10 +936,220 @@ func TestRunCycle_WithActiveSlot(t *testing.T) {
 		Raw:      "socks5://127.0.0.1:1080",
 	}
 
-	runCycle(cfg, pool, 60*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
 
 	if _, err := os.Stat("sorted.txt"); err != nil {
 		t.Errorf("sorted.txt should exist: %v", err)
+	}
+}
+
+func TestRunCycle_UpdatesCycleTiming(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := &Config{
+		SubscriberURL: server.URL,
+		FetchInterval: 300,
+		WanCount:      1,
+	}
+	pool := NewWANPool(1, 20700)
+	resetCycleTiming()
+
+	before := time.Now()
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
+	after := time.Now()
+
+	last, next := cycleTimingSnapshot()
+	if last.Before(before) || last.After(after) {
+		t.Errorf("last cycle = %v, want between %v and %v", last, before, after)
+	}
+	wantNext := after.Add(time.Duration(cfg.FetchInterval) * time.Second)
+	if next.Before(wantNext.Add(-20*time.Millisecond)) || next.After(wantNext.Add(time.Second)) {
+		t.Errorf("next cycle = %v, want near %v", next, wantNext)
+	}
+}
+
+func TestHandleGetCycleTiming(t *testing.T) {
+	last := time.Now().Add(-time.Minute).Round(0)
+	nextBase := time.Now().Round(0)
+	markCycleStarted(last)
+	markCycleComplete(nextBase, 90*time.Second)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/viberoxy/cycle", nil)
+	handleGetCycleTiming().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+
+	var info CycleTimingInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &info); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if info.LastCycle != last.Format(time.RFC3339Nano) {
+		t.Errorf("last_cycle = %q, want %q", info.LastCycle, last.Format(time.RFC3339Nano))
+	}
+	wantNext := nextBase.Add(90 * time.Second).Format(time.RFC3339Nano)
+	if info.NextCycle != wantNext {
+		t.Errorf("next_cycle = %q, want %q", info.NextCycle, wantNext)
+	}
+	if info.SecondsUntilNext < 89 || info.SecondsUntilNext > 90 {
+		t.Errorf("seconds_until_next = %d, want 89 or 90", info.SecondsUntilNext)
+	}
+}
+
+func TestHandleTriggerCycle_NonBlocking(t *testing.T) {
+	triggerCycle = make(chan struct{}, 1)
+	handler := handleTriggerCycle()
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/viberoxy/cycle/trigger", nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("request %d status = %d, want %d", i+1, rec.Code, http.StatusAccepted)
+		}
+	}
+
+	if got := len(triggerCycle); got != 1 {
+		t.Errorf("queued triggers = %d, want 1", got)
+	}
+}
+
+func TestHandleTriggerCycle_RejectsOtherMethods(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/viberoxy/cycle/trigger", nil)
+	handleTriggerCycle().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	if got := rec.Header().Get("Allow"); got != http.MethodPost {
+		t.Errorf("Allow = %q, want %q", got, http.MethodPost)
+	}
+}
+
+func TestHandleGetCandidates_EmptyPool(t *testing.T) {
+	candidatePool = nil
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/viberoxy/candidates", nil)
+	handleGetCandidates().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if rec.Body.String() != "[]" {
+		t.Errorf("body = %q, want \"[]\"", rec.Body.String())
+	}
+}
+
+func TestHandleGetCandidates_ReturnsPool(t *testing.T) {
+	p := NewCandidatePool(10)
+	p.Update([]*TestResult{
+		{Config: &ProxyConfig{Protocol: "ss", Server: "1.2.3.4", Port: 12345, Raw: "ss://test"}, Speed: 50.0},
+	})
+	candidatePool = p
+	defer func() { candidatePool = nil }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/viberoxy/candidates", nil)
+	handleGetCandidates().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var list []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(list))
+	}
+	if list[0]["server"] != "1.2.3.4" {
+		t.Errorf("server = %v, want 1.2.3.4", list[0]["server"])
+	}
+}
+
+func TestHandleGetCandidates_RejectsNonGet(t *testing.T) {
+	candidatePool = NewCandidatePool(5)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/viberoxy/candidates", nil)
+	handleGetCandidates().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestAPIHandler_RegistersCycleEndpoints(t *testing.T) {
+	triggerCycle = make(chan struct{}, 1)
+	handler := NewAPIHandler(NewWANPool(0, 10700))
+
+	getRec := httptest.NewRecorder()
+	handler.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "/api/viberoxy/cycle", nil))
+	if getRec.Code != http.StatusOK {
+		t.Errorf("GET cycle status = %d, want %d", getRec.Code, http.StatusOK)
+	}
+
+	postRec := httptest.NewRecorder()
+	handler.ServeHTTP(postRec, httptest.NewRequest(http.MethodPost, "/api/viberoxy/cycle/trigger", nil))
+	if postRec.Code != http.StatusAccepted {
+		t.Errorf("POST trigger status = %d, want %d", postRec.Code, http.StatusAccepted)
+	}
+}
+
+func TestRunLoop_ManualTriggerRunsCycle(t *testing.T) {
+	fetched := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case fetched <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := &Config{
+		SubscriberURL: server.URL,
+		FetchInterval: 3600,
+		WanCount:      1,
+	}
+	pool := NewWANPool(1, 20700)
+	triggerCycle = make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runLoop(cfg, pool, NewCandidatePool(50), nil, ctx)
+		close(done)
+	}()
+
+	triggerCycle <- struct{}{}
+	select {
+	case <-fetched:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("manual trigger did not run a cycle")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runLoop did not stop after cancellation")
 	}
 }
 
@@ -928,7 +1180,7 @@ func TestRunCycle_EmptyPool(t *testing.T) {
 
 	pool := NewWANPool(1, 20700)
 
-	runCycle(cfg, pool, 60*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
 }
 
 func TestRunCycle_DrainExpired(t *testing.T) {
@@ -960,7 +1212,7 @@ func TestRunCycle_DrainExpired(t *testing.T) {
 	pool.Slots[0].State = StateDraining
 	pool.Slots[0].DrainAt = time.Now().Add(-2 * time.Minute)
 
-	runCycle(cfg, pool, 10*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 10*time.Second)
 }
 
 func TestStartup_Shutdown_WithProxy(t *testing.T) {
