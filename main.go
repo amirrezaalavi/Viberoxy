@@ -20,6 +20,7 @@ var (
 	lastCycle     time.Time
 	nextCycle     time.Time
 	triggerCycle  = make(chan struct{}, 1)
+	candidatePool *CandidatePool
 )
 
 func resetCycleTiming() {
@@ -432,6 +433,7 @@ func startup(cfg *Config, ctx context.Context) {
 	slog.Info("starting viberoxy...")
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
+	candidatePool = NewCandidatePool(50)
 
 	var (
 		proxy        *ProxyServer
@@ -594,7 +596,7 @@ func startup(cfg *Config, ctx context.Context) {
 	startServices()
 	slog.Info("viberoxy started", "wans", pool.ActiveCount(), "proxy_port", cfg.ProxyPort)
 
-	runLoop(cfg, pool, proxy, ctx)
+	runLoop(cfg, pool, candidatePool, proxy, ctx)
 
 	slog.Info("shutting down...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -609,7 +611,7 @@ func startup(cfg *Config, ctx context.Context) {
 	slog.Info("viberoxy stopped")
 }
 
-func runLoop(cfg *Config, pool *WANPool, proxy *ProxyServer, ctx context.Context) {
+func runLoop(cfg *Config, pool *WANPool, candidatePool *CandidatePool, proxy *ProxyServer, ctx context.Context) {
 	interval := time.Duration(cfg.FetchInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -621,7 +623,7 @@ func runLoop(cfg *Config, pool *WANPool, proxy *ProxyServer, ctx context.Context
 	}
 
 	run := func() {
-		runCycle(cfg, pool, gracePeriod)
+		runCycle(cfg, pool, candidatePool, gracePeriod)
 		// A manual cycle restarts the interval so the exposed next-cycle time
 		// matches the ticker's actual schedule.
 		ticker.Reset(interval)
@@ -694,7 +696,7 @@ func probeAllWANs(cfg *Config, pool *WANPool) {
 	}
 }
 
-func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
+func runCycle(cfg *Config, pool *WANPool, candidatePool *CandidatePool, gracePeriod time.Duration) {
 	markCycleStarted(time.Now())
 	defer func() {
 		markCycleComplete(time.Now(), time.Duration(cfg.FetchInterval)*time.Second)
@@ -770,6 +772,12 @@ func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
 	}
 
 	writeSortedTxt(results)
+
+	// Populate the candidate pool with tested configs for use by the
+	// drop-and-replace API and future cycles.
+	if candidatePool != nil {
+		candidatePool.Update(results)
+	}
 
 	// Replacement: only consider candidates tested this cycle, and only when
 	// the pool is already full — replace a WAN with the best new config we

@@ -90,13 +90,61 @@ func handleTriggerCycle() http.HandlerFunc {
 }
 
 // NewAPIHandler returns the viberoxy control API, including WAN state,
-// cycle timing, and the manual cycle trigger.
+// cycle timing, the manual cycle trigger, and the candidate pool.
 func NewAPIHandler(pool *WANPool) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/api/viberoxy/wans", handleGetWANSlots(pool))
 	mux.Handle("/api/viberoxy/cycle", handleGetCycleTiming())
 	mux.Handle("/api/viberoxy/cycle/trigger", handleTriggerCycle())
+	mux.Handle("/api/viberoxy/candidates", handleGetCandidates())
 	return mux
+}
+
+// handleGetCandidates returns the current candidate pool as a JSON array.
+// Each entry carries the config identity and measured speed/error so the
+// UI can surface replacement candidates.
+func handleGetCandidates() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if candidatePool == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("[]"))
+			return
+		}
+		type candidateView struct {
+			Name     string  `json:"name"`
+			Server   string  `json:"server"`
+			Port     int     `json:"port"`
+			Protocol string  `json:"protocol"`
+			Raw      string  `json:"raw"`
+			Speed    float64 `json:"speed_mbps"`
+			Error    string  `json:"error,omitempty"`
+		}
+		list := candidatePool.List()
+		view := make([]candidateView, 0, len(list))
+		for _, c := range list {
+			cv := candidateView{
+				Server:   c.Config.Server,
+				Port:     c.Config.Port,
+				Protocol: c.Config.Protocol,
+				Raw:      c.Config.Raw,
+				Speed:    c.Speed,
+			}
+			if c.Config.Name != "" {
+				cv.Name = c.Config.Name
+			}
+			if c.Error != nil {
+				cv.Error = c.Error.Error()
+			}
+			view = append(view, cv)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(view)
+	}
 }
 
 // handleGetWANSlots returns a JSON array of WANSlotInfo for every slot

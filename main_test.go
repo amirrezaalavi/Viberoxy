@@ -815,6 +815,47 @@ func TestStartup_Shutdown(t *testing.T) {
 	}
 }
 
+func TestRunCycle_PopulatesCandidatePool(t *testing.T) {
+	dir := t.TempDir()
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	lines := []string{
+		"ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#TestSS",
+	}
+	rawData := strings.Join(lines, "\n")
+	encoded := base64.StdEncoding.EncodeToString([]byte(rawData))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(encoded))
+	}))
+	defer server.Close()
+
+	cfg := &Config{
+		SubscriberURL:    server.URL,
+		FetchInterval:    300,
+		TestTimeout:      3,
+		DownloadSize:     10000000,
+		DownloadEndpoint: server.URL + "?bytes=",
+		DownloadFallback: server.URL,
+		WanCount:         1,
+		WanBasePort:      20700,
+		TestBasePort:     20800,
+		ProxyPort:        0,
+		MinimumSpeed:     1e9,
+	}
+
+	pool := NewWANPool(1, 20700)
+	candidatePool := NewCandidatePool(50)
+
+	runCycle(cfg, pool, candidatePool, 60*time.Second)
+
+	if candidatePool.Len() == 0 {
+		t.Error("candidate pool should be populated after runCycle, but is empty")
+	}
+}
+
 func TestRunCycle(t *testing.T) {
 	dir := t.TempDir()
 	origDir, _ := os.Getwd()
@@ -848,7 +889,7 @@ func TestRunCycle(t *testing.T) {
 
 	pool := NewWANPool(1, 20700)
 
-	runCycle(cfg, pool, 60*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
 
 	if _, err := os.Stat("sorted.txt"); err != nil {
 		t.Errorf("sorted.txt should exist: %v", err)
@@ -895,7 +936,7 @@ func TestRunCycle_WithActiveSlot(t *testing.T) {
 		Raw:      "socks5://127.0.0.1:1080",
 	}
 
-	runCycle(cfg, pool, 60*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
 
 	if _, err := os.Stat("sorted.txt"); err != nil {
 		t.Errorf("sorted.txt should exist: %v", err)
@@ -918,7 +959,7 @@ func TestRunCycle_UpdatesCycleTiming(t *testing.T) {
 	resetCycleTiming()
 
 	before := time.Now()
-	runCycle(cfg, pool, 60*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
 	after := time.Now()
 
 	last, next := cycleTimingSnapshot()
@@ -1033,7 +1074,7 @@ func TestRunLoop_ManualTriggerRunsCycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runLoop(cfg, pool, nil, ctx)
+		runLoop(cfg, pool, NewCandidatePool(50), nil, ctx)
 		close(done)
 	}()
 
@@ -1081,7 +1122,7 @@ func TestRunCycle_EmptyPool(t *testing.T) {
 
 	pool := NewWANPool(1, 20700)
 
-	runCycle(cfg, pool, 60*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
 }
 
 func TestRunCycle_DrainExpired(t *testing.T) {
@@ -1113,7 +1154,7 @@ func TestRunCycle_DrainExpired(t *testing.T) {
 	pool.Slots[0].State = StateDraining
 	pool.Slots[0].DrainAt = time.Now().Add(-2 * time.Minute)
 
-	runCycle(cfg, pool, 10*time.Second)
+	runCycle(cfg, pool, NewCandidatePool(50), 10*time.Second)
 }
 
 func TestStartup_Shutdown_WithProxy(t *testing.T) {
