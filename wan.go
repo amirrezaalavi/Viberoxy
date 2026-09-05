@@ -49,6 +49,12 @@ type WANSlot struct {
 	// only — a churny slot is never rejected on this alone.
 	StabilityScore int
 	DrainAt        time.Time
+	// ExitIP is the last observed exit IP from a keepalive probe through
+	// this slot's SOCKS5 listener. Empty when never probed.
+	ExitIP string
+	// LastProbe is the timestamp of the last successful keepalive probe.
+	// Zero when never probed.
+	LastProbe time.Time
 
 	mu sync.Mutex
 }
@@ -140,6 +146,8 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.SpeedMbps = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
+	slot.ExitIP = ""
+	slot.LastProbe = time.Time{}
 	slot.mu.Unlock()
 	return nil
 }

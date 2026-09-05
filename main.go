@@ -454,6 +454,23 @@ func startup(cfg *Config, ctx context.Context) {
 			slog.Info("metrics server started", "port", cfg.MetricsPort)
 		}
 
+		// API server for per-slot state + exit IP exposure. Runs on its own
+		// port (default 1980) alongside the proxy / observability listeners.
+		apiPort := 1980
+		if v := os.Getenv("API_PORT"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+				apiPort = n
+			}
+		}
+		apiMux := http.NewServeMux()
+		apiMux.Handle("/api/viberoxy/wans", handleGetWANSlots(pool))
+		go func() {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", apiPort), apiMux); err != nil && err != http.ErrServerClosed {
+				slog.Error("api server error", "error", err)
+			}
+		}()
+		slog.Info("api server started", "port", apiPort)
+
 		if cfg.KeepaliveInterval > 0 {
 			go keepaliveLoop(cfg, pool, ctx)
 		}
@@ -613,7 +630,20 @@ func probeAllWANs(cfg *Config, pool *WANPool) {
 			continue
 		}
 		pool.RecordSuccess(idx)
-		slog.Info("keepalive: probe ok", "index", idx)
+
+		// Resolve exit IP after a successful probe: a lightweight HTTP GET
+		// to api.ipify.org through the slot's SOCKS5 listener. Failures are
+		// non-fatal — the slot is already proven healthy by ProbeWAN above.
+		if ip, err := probeExitIP(socksAddr, timeout); err == nil {
+			slot := pool.Slots[idx]
+			slot.mu.Lock()
+			slot.ExitIP = ip
+			slot.LastProbe = time.Now()
+			slot.mu.Unlock()
+			slog.Info("keepalive: probe ok", "index", idx, "exit_ip", ip)
+		} else {
+			slog.Info("keepalive: probe ok", "index", idx)
+		}
 	}
 }
 
