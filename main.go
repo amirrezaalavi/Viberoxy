@@ -10,9 +10,43 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
+
+var (
+	cycleTimingMu sync.RWMutex
+	lastCycle     time.Time
+	nextCycle     time.Time
+	triggerCycle  = make(chan struct{}, 1)
+)
+
+func resetCycleTiming() {
+	cycleTimingMu.Lock()
+	lastCycle = time.Time{}
+	nextCycle = time.Time{}
+	cycleTimingMu.Unlock()
+}
+
+func cycleTimingSnapshot() (time.Time, time.Time) {
+	cycleTimingMu.RLock()
+	defer cycleTimingMu.RUnlock()
+	return lastCycle, nextCycle
+}
+
+func markCycleStarted(now time.Time) {
+	cycleTimingMu.Lock()
+	lastCycle = now
+	nextCycle = time.Time{}
+	cycleTimingMu.Unlock()
+}
+
+func markCycleComplete(now time.Time, interval time.Duration) {
+	cycleTimingMu.Lock()
+	nextCycle = now.Add(interval)
+	cycleTimingMu.Unlock()
+}
 
 type Config struct {
 	SubscriberURL     string
@@ -462,10 +496,12 @@ func startup(cfg *Config, ctx context.Context) {
 				apiPort = n
 			}
 		}
-		apiMux := http.NewServeMux()
-		apiMux.Handle("/api/viberoxy/wans", handleGetWANSlots(pool))
+		apiSrv := &http.Server{
+			Addr:    fmt.Sprintf(":%d", apiPort),
+			Handler: NewAPIHandler(pool),
+		}
 		go func() {
-			if err := http.ListenAndServe(fmt.Sprintf(":%d", apiPort), apiMux); err != nil && err != http.ErrServerClosed {
+			if err := apiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("api server error", "error", err)
 			}
 		}()
@@ -574,12 +610,21 @@ func startup(cfg *Config, ctx context.Context) {
 }
 
 func runLoop(cfg *Config, pool *WANPool, proxy *ProxyServer, ctx context.Context) {
-	ticker := time.NewTicker(time.Duration(cfg.FetchInterval) * time.Second)
+	interval := time.Duration(cfg.FetchInterval) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	markCycleComplete(time.Now(), interval)
 
-	gracePeriod := 2 * time.Duration(cfg.FetchInterval) * time.Second
+	gracePeriod := 2 * interval
 	if gracePeriod < 60*time.Second {
 		gracePeriod = 60 * time.Second
+	}
+
+	run := func() {
+		runCycle(cfg, pool, gracePeriod)
+		// A manual cycle restarts the interval so the exposed next-cycle time
+		// matches the ticker's actual schedule.
+		ticker.Reset(interval)
 	}
 
 	for {
@@ -587,7 +632,9 @@ func runLoop(cfg *Config, pool *WANPool, proxy *ProxyServer, ctx context.Context
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runCycle(cfg, pool, gracePeriod)
+			run()
+		case <-triggerCycle:
+			run()
 		}
 	}
 }
@@ -648,6 +695,11 @@ func probeAllWANs(cfg *Config, pool *WANPool) {
 }
 
 func runCycle(cfg *Config, pool *WANPool, gracePeriod time.Duration) {
+	markCycleStarted(time.Now())
+	defer func() {
+		markCycleComplete(time.Now(), time.Duration(cfg.FetchInterval)*time.Second)
+	}()
+
 	slog.Info("cycle: started")
 
 	for _, idx := range pool.DrainExpired(gracePeriod) {
