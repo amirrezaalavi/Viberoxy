@@ -2,7 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -90,14 +94,118 @@ func handleTriggerCycle() http.HandlerFunc {
 }
 
 // NewAPIHandler returns the viberoxy control API, including WAN state,
-// cycle timing, the manual cycle trigger, and the candidate pool.
-func NewAPIHandler(pool *WANPool) http.Handler {
+// WAN drop/replacement, cycle timing, the manual cycle trigger, and the
+// candidate pool. A Config is supplied by startup; it is variadic to preserve
+// compatibility with callers that only use the read-only endpoints.
+func NewAPIHandler(pool *WANPool, configs ...*Config) http.Handler {
+	var cfg *Config
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
+	dropOpts := DropAndReplaceOptions{Candidates: candidatePool}
+	if cfg != nil {
+		dropOpts.TestPort = cfg.TestBasePort
+		dropOpts.Timeout = time.Duration(cfg.TestTimeout) * time.Second
+		dropOpts.DownloadURL = buildDownloadURL(cfg, cfg.DownloadSize)
+		dropOpts.DownloadSize = cfg.DownloadSize
+		dropOpts.StabilityProbes = cfg.StabilityProbes
+		dropOpts.XrayMux = cfg.XrayMux
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/api/viberoxy/wans", handleGetWANSlots(pool))
+	mux.Handle("/api/viberoxy/wans/", handleDropWAN(pool, dropOpts, triggerCycle))
 	mux.Handle("/api/viberoxy/cycle", handleGetCycleTiming())
 	mux.Handle("/api/viberoxy/cycle/trigger", handleTriggerCycle())
 	mux.Handle("/api/viberoxy/candidates", handleGetCandidates())
 	return mux
+}
+
+// dropWANResponse is returned by the drop endpoint for every application-level
+// outcome. WAN is present only when a replacement was activated.
+type dropWANResponse struct {
+	Status  string       `json:"status"`
+	Message string       `json:"message,omitempty"`
+	WAN     *WANSlotInfo `json:"wan,omitempty"`
+}
+
+func writeDropWANResponse(w http.ResponseWriter, statusCode int, response dropWANResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func parseDropWANIndex(path string) (int, error) {
+	const prefix = "/api/viberoxy/wans/"
+	if !strings.HasPrefix(path, prefix) {
+		return 0, errors.New("invalid drop WAN path")
+	}
+	parts := strings.Split(strings.TrimPrefix(path, prefix), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] != "drop" {
+		return 0, errors.New("invalid drop WAN path")
+	}
+	index, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, errors.New("invalid WAN index")
+	}
+	return index, nil
+}
+
+// handleDropWAN drops one WAN and immediately promotes the best cached
+// candidate after re-testing it. When the candidate pool has no eligible
+// entries, it queues a fresh cycle and leaves the slot empty for that cycle to
+// refill.
+func handleDropWAN(pool *WANPool, opts DropAndReplaceOptions, cycleTrigger chan<- struct{}) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeDropWANResponse(w, http.StatusMethodNotAllowed, dropWANResponse{
+				Status:  "error",
+				Message: "method not allowed",
+			})
+			return
+		}
+
+		index, err := parseDropWANIndex(r.URL.Path)
+		if err != nil || index < 0 || index >= len(pool.Slots) {
+			writeDropWANResponse(w, http.StatusBadRequest, dropWANResponse{
+				Status:  "error",
+				Message: "invalid WAN index",
+			})
+			return
+		}
+
+		_, err = pool.DropAndReplace(index, opts)
+		switch {
+		case errors.Is(err, ErrNoReplacementCandidate):
+			select {
+			case cycleTrigger <- struct{}{}:
+			default:
+			}
+			writeDropWANResponse(w, http.StatusAccepted, dropWANResponse{
+				Status:  "replacing",
+				Message: "no candidates, fetching...",
+			})
+		case errors.Is(err, ErrReplacementTestFailed):
+			slog.Warn("WAN replacement candidate failed re-test", "index", index, "error", err)
+			writeDropWANResponse(w, http.StatusBadGateway, dropWANResponse{
+				Status:  "error",
+				Message: "replacement failed test",
+			})
+		case err != nil:
+			slog.Error("WAN replacement failed", "index", index, "error", err)
+			writeDropWANResponse(w, http.StatusBadGateway, dropWANResponse{
+				Status:  "error",
+				Message: "replacement failed to start",
+			})
+		default:
+			info := wanSlotInfo(pool, index)
+			writeDropWANResponse(w, http.StatusOK, dropWANResponse{
+				Status: "replaced",
+				WAN:    &info,
+			})
+		}
+	}
 }
 
 // handleGetCandidates returns the current candidate pool as a JSON array.
@@ -147,29 +255,35 @@ func handleGetCandidates() http.HandlerFunc {
 	}
 }
 
+// wanSlotInfo returns a consistent JSON view of one slot.
+func wanSlotInfo(pool *WANPool, index int) WANSlotInfo {
+	slot := pool.Slots[index]
+	slot.mu.Lock()
+	state := slot.State
+	speed := slot.SpeedMbps
+	exitIP := slot.ExitIP
+	lastProbe := slot.LastProbe
+	slot.mu.Unlock()
+
+	return WANSlotInfo{
+		Index:            index,
+		State:            state.String(),
+		SpeedMbps:        speed,
+		Conns:            atomic.LoadInt64(&slot.ConnCount),
+		ExitIP:           exitIP,
+		LastProbe:        lastProbe.Format(time.RFC3339),
+		ConsecutiveFails: atomic.LoadInt64(&slot.ConsecutiveFails),
+	}
+}
+
 // handleGetWANSlots returns a JSON array of WANSlotInfo for every slot
 // in the pool. The handler is safe for concurrent use: it reads each
 // slot under its mutex and uses atomic loads for the counters.
 func handleGetWANSlots(pool *WANPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		infos := make([]WANSlotInfo, 0, len(pool.Slots))
-		for i, slot := range pool.Slots {
-			slot.mu.Lock()
-			state := slot.State
-			speed := slot.SpeedMbps
-			exitIP := slot.ExitIP
-			lastProbe := slot.LastProbe
-			slot.mu.Unlock()
-
-			infos = append(infos, WANSlotInfo{
-				Index:            i,
-				State:            state.String(),
-				SpeedMbps:        speed,
-				Conns:            atomic.LoadInt64(&slot.ConnCount),
-				ExitIP:           exitIP,
-				LastProbe:        lastProbe.Format(time.RFC3339),
-				ConsecutiveFails: atomic.LoadInt64(&slot.ConsecutiveFails),
-			})
+		for i := range pool.Slots {
+			infos = append(infos, wanSlotInfo(pool, i))
 		}
 
 		w.Header().Set("Content-Type", "application/json")

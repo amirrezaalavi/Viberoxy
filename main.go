@@ -500,7 +500,7 @@ func startup(cfg *Config, ctx context.Context) {
 		}
 		apiSrv := &http.Server{
 			Addr:    fmt.Sprintf(":%d", apiPort),
-			Handler: NewAPIHandler(pool),
+			Handler: NewAPIHandler(pool, cfg),
 		}
 		go func() {
 			if err := apiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

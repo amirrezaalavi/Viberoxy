@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strconv"
@@ -62,6 +63,41 @@ type WANSlot struct {
 type WANPool struct {
 	Slots    []*WANSlot
 	BasePort int
+
+	// replaceMu serializes user-requested drop operations. A replacement
+	// temporarily clears a slot while testing and starting a candidate; without
+	// this guard, concurrent requests could start multiple xray processes for
+	// the same service port.
+	replaceMu sync.Mutex
+}
+
+var (
+	// ErrNoReplacementCandidate means every candidate is either failed or
+	// excluded (including the config that was just dropped).
+	ErrNoReplacementCandidate = errors.New("no replacement candidate")
+	// ErrReplacementTestFailed means a cached candidate failed its mandatory
+	// re-test and was not promoted to a WAN slot.
+	ErrReplacementTestFailed = errors.New("replacement failed test")
+)
+
+// ReplacementTester re-tests a cached candidate before it is promoted.
+type ReplacementTester func(*ProxyConfig, int, time.Duration, string, int64, int) *TestResult
+
+// ReplacementStarter starts the persistent xray process for a replacement.
+type ReplacementStarter func(*ProxyConfig, int, ...bool) (*exec.Cmd, string, error)
+
+// DropAndReplaceOptions contains the candidate source, test settings, and
+// injectable process operations used by DropAndReplace.
+type DropAndReplaceOptions struct {
+	Candidates      *CandidatePool
+	TestPort        int
+	Timeout         time.Duration
+	DownloadURL     string
+	DownloadSize    int64
+	StabilityProbes int
+	XrayMux         bool
+	TestCandidate   ReplacementTester
+	StartCandidate  ReplacementStarter
 }
 
 func NewWANPool(count int, basePort int) *WANPool {
@@ -74,6 +110,74 @@ func NewWANPool(count int, basePort int) *WANPool {
 		}
 	}
 	return &WANPool{Slots: slots, BasePort: basePort}
+}
+
+// DropAndReplace removes the current config from a WAN slot, excludes it from
+// future selection, re-tests the best remaining candidate, and starts it on
+// the slot's existing service port. The slot remains empty whenever no
+// candidate is available or promotion fails.
+func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestResult, error) {
+	if index < 0 || index >= len(p.Slots) {
+		return nil, errors.New("slot index out of range")
+	}
+
+	p.replaceMu.Lock()
+	defer p.replaceMu.Unlock()
+
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	current := slot.Config
+	servicePort := slot.ServicePort
+	slot.mu.Unlock()
+
+	if opts.Candidates != nil && current != nil && current.Raw != "" {
+		opts.Candidates.Exclude(current.Raw)
+	}
+	if err := p.ResetEmpty(index); err != nil {
+		return nil, fmt.Errorf("drop WAN: %w", err)
+	}
+
+	if opts.Candidates == nil {
+		return nil, ErrNoReplacementCandidate
+	}
+	candidate := opts.Candidates.Best()
+	if candidate == nil || candidate.Config == nil {
+		return nil, ErrNoReplacementCandidate
+	}
+
+	testCandidate := opts.TestCandidate
+	if testCandidate == nil {
+		testCandidate = TestSpeedWithStability
+	}
+	result := testCandidate(candidate.Config, opts.TestPort, opts.Timeout, opts.DownloadURL, opts.DownloadSize, opts.StabilityProbes)
+	if result == nil || result.Error != nil {
+		if result != nil && result.Error != nil {
+			return nil, fmt.Errorf("%w: %v", ErrReplacementTestFailed, result.Error)
+		}
+		return nil, ErrReplacementTestFailed
+	}
+
+	if err := p.StartTesting(index, candidate.Config); err != nil {
+		return nil, fmt.Errorf("prepare replacement slot: %w", err)
+	}
+
+	startCandidate := opts.StartCandidate
+	if startCandidate == nil {
+		startCandidate = StartXray
+	}
+	cmd, path, err := startCandidate(candidate.Config, servicePort, opts.XrayMux)
+	if err != nil {
+		_ = p.ResetEmpty(index)
+		return nil, fmt.Errorf("start replacement xray: %w", err)
+	}
+	if err := p.SetActive(index, cmd, path); err != nil {
+		_ = StopXray(cmd, path)
+		_ = p.ResetEmpty(index)
+		return nil, fmt.Errorf("activate replacement slot: %w", err)
+	}
+	p.SetSlotSpeedMbps(index, result.Speed)
+	p.SetSlotStability(index, result.StabilityScore)
+	return result, nil
 }
 
 func (p *WANPool) StartTesting(index int, cfg *ProxyConfig) error {
