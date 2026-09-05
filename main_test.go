@@ -1036,6 +1036,64 @@ func TestHandleTriggerCycle_RejectsOtherMethods(t *testing.T) {
 	}
 }
 
+func TestHandleGetCandidates_EmptyPool(t *testing.T) {
+	candidatePool = nil
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/viberoxy/candidates", nil)
+	handleGetCandidates().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if rec.Body.String() != "[]" {
+		t.Errorf("body = %q, want \"[]\"", rec.Body.String())
+	}
+}
+
+func TestHandleGetCandidates_ReturnsPool(t *testing.T) {
+	p := NewCandidatePool(10)
+	p.Update([]*TestResult{
+		{Config: &ProxyConfig{Protocol: "ss", Server: "1.2.3.4", Port: 12345, Raw: "ss://test"}, Speed: 50.0},
+	})
+	candidatePool = p
+	defer func() { candidatePool = nil }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/viberoxy/candidates", nil)
+	handleGetCandidates().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var list []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(list))
+	}
+	if list[0]["server"] != "1.2.3.4" {
+		t.Errorf("server = %v, want 1.2.3.4", list[0]["server"])
+	}
+}
+
+func TestHandleGetCandidates_RejectsNonGet(t *testing.T) {
+	candidatePool = NewCandidatePool(5)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/viberoxy/candidates", nil)
+	handleGetCandidates().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
 func TestAPIHandler_RegistersCycleEndpoints(t *testing.T) {
 	triggerCycle = make(chan struct{}, 1)
 	handler := NewAPIHandler(NewWANPool(0, 10700))
