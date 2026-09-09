@@ -49,6 +49,12 @@ func markCycleComplete(now time.Time, interval time.Duration) {
 	cycleTimingMu.Unlock()
 }
 
+func markNextCycle(next time.Time) {
+	cycleTimingMu.Lock()
+	nextCycle = next
+	cycleTimingMu.Unlock()
+}
+
 type Config struct {
 	SubscriberURL     string
 	FetchInterval     int
@@ -611,31 +617,125 @@ func startup(cfg *Config, ctx context.Context) {
 	slog.Info("viberoxy stopped")
 }
 
+const (
+	refillRetryInitial = 5 * time.Minute
+	refillRetryMaximum = 60 * time.Minute
+)
+
+type loopTicker interface {
+	Chan() <-chan time.Time
+	Stop()
+}
+
+type loopTimer interface {
+	Chan() <-chan time.Time
+	Reset(time.Duration) bool
+	Stop() bool
+}
+
+type realLoopTicker struct{ *time.Ticker }
+
+func (t realLoopTicker) Chan() <-chan time.Time { return t.C }
+
+type realLoopTimer struct{ *time.Timer }
+
+func (t realLoopTimer) Chan() <-chan time.Time { return t.C }
+
+type runLoopOptions struct {
+	newTicker func(time.Duration) loopTicker
+	newTimer  func(time.Duration) loopTimer
+	now       func() time.Time
+	trigger   <-chan struct{}
+	runCycle  func(*Config, *WANPool, *CandidatePool, time.Duration)
+}
+
+func defaultRunLoopOptions() runLoopOptions {
+	return runLoopOptions{
+		newTicker: func(delay time.Duration) loopTicker { return realLoopTicker{time.NewTicker(delay)} },
+		newTimer:  func(delay time.Duration) loopTimer { return realLoopTimer{time.NewTimer(delay)} },
+		now:       time.Now,
+		trigger:   triggerCycle,
+		runCycle:  runCycle,
+	}
+}
+
 func runLoop(cfg *Config, pool *WANPool, candidatePool *CandidatePool, proxy *ProxyServer, ctx context.Context) {
+	runLoopWithOptions(cfg, pool, candidatePool, proxy, ctx, defaultRunLoopOptions())
+}
+
+func runLoopWithOptions(cfg *Config, pool *WANPool, candidatePool *CandidatePool, proxy *ProxyServer, ctx context.Context, opts runLoopOptions) {
 	interval := time.Duration(cfg.FetchInterval) * time.Second
-	ticker := time.NewTicker(interval)
+	ticker := opts.newTicker(interval)
 	defer ticker.Stop()
-	markCycleComplete(time.Now(), interval)
+	maintenanceDeadline := opts.now().Add(interval)
+	markNextCycle(maintenanceDeadline)
 
 	gracePeriod := 2 * interval
 	if gracePeriod < 60*time.Second {
 		gracePeriod = 60 * time.Second
 	}
 
+	refillDelay := refillRetryInitial
+	var retryTimer loopTimer
+	var retryC <-chan time.Time
+	var retryDeadline time.Time
+	publishNextCycle := func() {
+		deadline := maintenanceDeadline
+		if !retryDeadline.IsZero() && retryDeadline.Before(deadline) {
+			deadline = retryDeadline
+		}
+		markNextCycle(deadline)
+	}
+	defer func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+	}()
+
 	run := func() {
-		runCycle(cfg, pool, candidatePool, gracePeriod)
-		// A manual cycle restarts the interval so the exposed next-cycle time
-		// matches the ticker's actual schedule.
-		ticker.Reset(interval)
+		opts.runCycle(cfg, pool, candidatePool, gracePeriod)
+
+		if pool.ActiveCount() >= cfg.WanCount {
+			refillDelay = refillRetryInitial
+			if retryTimer != nil {
+				retryTimer.Stop()
+				retryTimer = nil
+				retryC = nil
+			}
+			retryDeadline = time.Time{}
+			publishNextCycle()
+			return
+		}
+		if len(pool.GetSlotsByState(StateEmpty)) == 0 || retryTimer != nil {
+			publishNextCycle()
+			return
+		}
+
+		delay := refillDelay
+		retryTimer = opts.newTimer(delay)
+		retryC = retryTimer.Chan()
+		retryDeadline = opts.now().Add(delay)
+		publishNextCycle()
+		slog.Info("cycle: scheduled empty-slot refill retry", "delay", delay)
+		refillDelay *= 2
+		if refillDelay > refillRetryMaximum {
+			refillDelay = refillRetryMaximum
+		}
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case tick := <-ticker.Chan():
+			maintenanceDeadline = tick.Add(interval)
 			run()
-		case <-triggerCycle:
+		case <-opts.trigger:
+			run()
+		case <-retryC:
+			retryTimer = nil
+			retryC = nil
+			retryDeadline = time.Time{}
 			run()
 		}
 	}
