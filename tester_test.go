@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -459,9 +458,7 @@ func waitForPort(addr string, timeout time.Duration) error {
 }
 
 func TestTestSpeed(t *testing.T) {
-	if _, err := exec.LookPath("xray"); err != nil {
-		t.Skip("xray not found in PATH, skipping integration test")
-	}
+	requireXrayIntegration(t)
 
 	downloadServer := startTestDownloadServer(t, 50000)
 	defer downloadServer.Close()
@@ -506,6 +503,8 @@ func TestTestSpeed(t *testing.T) {
 }
 
 func TestTestSpeed_XrayFailure(t *testing.T) {
+	requireXrayIntegration(t)
+
 	cfg := &ProxyConfig{
 		Protocol: "socks5",
 		Server:   "0.0.0.1",

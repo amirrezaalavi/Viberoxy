@@ -10,10 +10,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -450,9 +450,7 @@ func consecutiveFreePorts(t *testing.T, n int) int {
 // reachable proves degraded boot. Requires a real xray binary (like
 // TestTestSpeed); skipped otherwise.
 func TestStartup_DegradedBoot(t *testing.T) {
-	if _, err := exec.LookPath("xray"); err != nil {
-		t.Skip("xray not found in PATH, skipping degraded boot integration test")
-	}
+	requireXrayIntegration(t)
 
 	// Two distinct upstreams so both WAN slots fill without tripping the
 	// server:port dedupe.
@@ -545,9 +543,7 @@ func TestStartup_DegradedBoot(t *testing.T) {
 // WAN: while the second speed test is gated, the proxy port must stay closed.
 // Requires a real xray binary; skipped otherwise.
 func TestStartup_NoDegradedBoot_PoolMustFill(t *testing.T) {
-	if _, err := exec.LookPath("xray"); err != nil {
-		t.Skip("xray not found in PATH, skipping degraded boot integration test")
-	}
+	requireXrayIntegration(t)
 
 	socksA, addrA := startTestSocksServer(t)
 	defer socksA.Close()
@@ -1376,5 +1372,224 @@ func TestParseConfig_RouterMissingListFile(t *testing.T) {
 
 	if _, err := parseConfig(); err == nil {
 		t.Error("expected error for missing DIRECT_LIST_FILE")
+	}
+}
+
+type fakeLoopTicker struct {
+	c chan time.Time
+}
+
+func (t *fakeLoopTicker) Chan() <-chan time.Time { return t.c }
+func (t *fakeLoopTicker) Stop()                  {}
+
+type fakeLoopTimer struct {
+	c         chan time.Time
+	scheduled chan time.Duration
+	stopped   chan struct{}
+}
+
+func (t *fakeLoopTimer) Chan() <-chan time.Time { return t.c }
+func (t *fakeLoopTimer) Reset(delay time.Duration) bool {
+	t.scheduled <- delay
+	return true
+}
+func (t *fakeLoopTimer) Stop() bool {
+	select {
+	case t.stopped <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func TestRunLoop_ManualTriggerPreservesMaintenanceAndPublishesEarlierRetry(t *testing.T) {
+	base := time.Date(2026, time.September, 7, 12, 0, 0, 0, time.UTC)
+	cfg := &Config{FetchInterval: 12 * 60 * 60, WanCount: 1}
+	pool := NewWANPool(1, 20700)
+	maintenance := &fakeLoopTicker{c: make(chan time.Time, 1)}
+	timer := &fakeLoopTimer{
+		c:         make(chan time.Time, 1),
+		scheduled: make(chan time.Duration, 2),
+		stopped:   make(chan struct{}, 1),
+	}
+	trigger := make(chan struct{}, 1)
+	cycleDone := make(chan struct{}, 3)
+	var now atomic.Value
+	now.Store(base)
+	var fill atomic.Bool
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runLoopWithOptions(cfg, pool, NewCandidatePool(10), nil, ctx, runLoopOptions{
+			newTicker: func(time.Duration) loopTicker { return maintenance },
+			newTimer: func(delay time.Duration) loopTimer {
+				timer.scheduled <- delay
+				return timer
+			},
+			now:     func() time.Time { return now.Load().(time.Time) },
+			trigger: trigger,
+			runCycle: func(*Config, *WANPool, *CandidatePool, time.Duration) {
+				defer func() { cycleDone <- struct{}{} }()
+				current := now.Load().(time.Time)
+				markCycleStarted(current)
+				markCycleComplete(current, 12*time.Hour)
+				if fill.Load() {
+					if err := pool.StartTesting(0, &ProxyConfig{Raw: "ss://full"}); err != nil {
+						t.Errorf("StartTesting: %v", err)
+						return
+					}
+					if err := pool.SetActive(0, nil, ""); err != nil {
+						t.Errorf("SetActive: %v", err)
+					}
+				}
+			},
+		})
+	}()
+
+	trigger <- struct{}{}
+	select {
+	case got := <-timer.scheduled:
+		if got != 5*time.Minute {
+			t.Fatalf("first refill delay = %v, want 5m", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first refill retry was not scheduled")
+	}
+	<-cycleDone
+	_, next := cycleTimingSnapshot()
+	if want := base.Add(5 * time.Minute); !next.Equal(want) {
+		t.Fatalf("next cycle after failed manual refill = %v, want earlier retry %v", next, want)
+	}
+
+	// Another manual attempt while the refill timer is pending must preserve
+	// both the pending retry deadline and the original maintenance deadline.
+	now.Store(base.Add(time.Minute))
+	trigger <- struct{}{}
+	<-cycleDone
+	_, next = cycleTimingSnapshot()
+	if want := base.Add(5 * time.Minute); !next.Equal(want) {
+		t.Fatalf("next cycle after second manual trigger = %v, want unchanged retry %v", next, want)
+	}
+	select {
+	case delay := <-timer.scheduled:
+		t.Fatalf("manual trigger rescheduled pending refill by %v", delay)
+	default:
+	}
+
+	// Once the retry fills the pool, the API must reveal the unchanged normal
+	// maintenance deadline rather than a manual-cycle-relative deadline.
+	fill.Store(true)
+	now.Store(base.Add(5 * time.Minute))
+	timer.c <- base.Add(5 * time.Minute)
+	<-cycleDone
+	_, next = cycleTimingSnapshot()
+	if want := base.Add(12 * time.Hour); !next.Equal(want) {
+		t.Fatalf("maintenance deadline after refill = %v, want unchanged %v", next, want)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("run loop did not stop")
+	}
+}
+
+func TestRunLoop_SchedulesBoundedRefillRetriesAndResetsWhenFull(t *testing.T) {
+	cfg := &Config{FetchInterval: 12 * 60 * 60, WanCount: 1}
+	pool := NewWANPool(1, 20700)
+	maintenance := &fakeLoopTicker{c: make(chan time.Time, 1)}
+	timer := &fakeLoopTimer{
+		c:         make(chan time.Time, 1),
+		scheduled: make(chan time.Duration, 10),
+		stopped:   make(chan struct{}, 1),
+	}
+	trigger := make(chan struct{}, 1)
+	cycleDone := make(chan struct{}, 10)
+	var fill atomic.Bool
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runLoopWithOptions(cfg, pool, NewCandidatePool(10), nil, ctx, runLoopOptions{
+			newTicker: func(delay time.Duration) loopTicker {
+				if delay != 12*time.Hour {
+					t.Errorf("maintenance interval = %v, want 12h", delay)
+				}
+				return maintenance
+			},
+			newTimer: func(delay time.Duration) loopTimer {
+				timer.scheduled <- delay
+				return timer
+			},
+			now:     time.Now,
+			trigger: trigger,
+			runCycle: func(*Config, *WANPool, *CandidatePool, time.Duration) {
+				defer func() { cycleDone <- struct{}{} }()
+				if fill.Load() {
+					if err := pool.StartTesting(0, &ProxyConfig{Raw: "ss://full"}); err != nil {
+						t.Errorf("StartTesting: %v", err)
+						return
+					}
+					if err := pool.SetActive(0, nil, ""); err != nil {
+						t.Errorf("SetActive: %v", err)
+					}
+				}
+			},
+		})
+	}()
+
+	wantDelays := []time.Duration{5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 60 * time.Minute, 60 * time.Minute}
+	trigger <- struct{}{}
+	for i, want := range wantDelays {
+		select {
+		case got := <-timer.scheduled:
+			if got != want {
+				t.Fatalf("retry %d delay = %v, want %v", i+1, got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("retry %d was not scheduled", i+1)
+		}
+		<-cycleDone
+		if i+1 < len(wantDelays) {
+			timer.c <- time.Time{}
+		}
+	}
+
+	fill.Store(true)
+	timer.c <- time.Time{}
+	select {
+	case <-cycleDone:
+	case <-time.After(time.Second):
+		t.Fatal("refill cycle did not complete after the pool became full")
+	}
+	select {
+	case delay := <-timer.scheduled:
+		t.Fatalf("scheduled %v retry after the pool became full", delay)
+	default:
+	}
+
+	fill.Store(false)
+	if err := pool.ResetEmpty(0); err != nil {
+		t.Fatalf("ResetEmpty: %v", err)
+	}
+	trigger <- struct{}{}
+	select {
+	case got := <-timer.scheduled:
+		if got != 5*time.Minute {
+			t.Fatalf("retry after full pool = %v, want 5m", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry after full pool was not scheduled")
+	}
+	<-cycleDone
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("run loop did not stop")
 	}
 }

@@ -262,7 +262,8 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/viberoxy/wans/0/drop", nil)
-	handleDropWAN(pool, opts, make(chan struct{}, 1)).ServeHTTP(rec, req)
+	trigger := make(chan struct{}, 1)
+	handleDropWAN(pool, opts, trigger).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadGateway, rec.Body.String())
@@ -279,6 +280,14 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 	}
 	if pool.GetState(0) != StateEmpty {
 		t.Errorf("slot state = %v, want empty", pool.GetState(0))
+	}
+	if candidate := candidates.Best(); candidate != nil {
+		t.Errorf("failed re-test candidate remained eligible: %+v", candidate)
+	}
+	select {
+	case <-trigger:
+	default:
+		t.Fatal("failed replacement did not trigger an immediate refill cycle")
 	}
 }
 
@@ -315,6 +324,54 @@ func TestHandleDropWAN_RejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestNewAPIHandler_DropOptionsUseConfiguredMinimumSpeed(t *testing.T) {
+	candidates := NewCandidatePool(1)
+	cfg := &Config{MinimumSpeed: 12.5}
+
+	opts := dropAndReplaceOptions(cfg, candidates)
+	if opts.MinimumSpeed != 12.5 {
+		t.Errorf("MinimumSpeed = %v, want 12.5", opts.MinimumSpeed)
+	}
+	if opts.Candidates != candidates {
+		t.Error("candidate pool was not forwarded")
+	}
+}
+
+func TestHandleDropWAN_BelowMinimumReturnsDistinctResponse(t *testing.T) {
+	pool := NewWANPool(1, 10700)
+	activeTestSlot(t, pool, 0, &ProxyConfig{Raw: "ss://old"})
+	replacement := &ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
+	candidates := NewCandidatePool(1)
+	candidates.Update([]*TestResult{{Config: replacement, Speed: 4.99}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/viberoxy/wans/0/drop", nil)
+	trigger := make(chan struct{}, 1)
+	handleDropWAN(pool, DropAndReplaceOptions{
+		Candidates:   candidates,
+		MinimumSpeed: 5,
+	}, trigger).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["status"] != "below_threshold" || response["message"] != "replacement below minimum speed" {
+		t.Errorf("response = %#v", response)
+	}
+	if pool.GetState(0) != StateEmpty {
+		t.Errorf("slot state = %v, want empty", pool.GetState(0))
+	}
+	select {
+	case <-trigger:
+	default:
+		t.Fatal("below-threshold replacement did not trigger an immediate refill cycle")
+	}
+}
+
 func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 	pool := NewWANPool(1, 10700)
 	activeTestSlot(t, pool, 0, &ProxyConfig{Raw: "ss://old"})
@@ -337,5 +394,130 @@ func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 	}
 	if pool.GetState(0) != StateEmpty || pool.Slots[0].Config != nil {
 		t.Error("slot should remain empty after start failure")
+	}
+}
+
+func TestWANPoolDropAndReplace_RejectsCachedCandidateBelowMinimum(t *testing.T) {
+	pool := NewWANPool(1, 10700)
+	activeTestSlot(t, pool, 0, &ProxyConfig{Raw: "ss://old"})
+	replacement := &ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
+	candidates := NewCandidatePool(1)
+	candidates.Update([]*TestResult{{Config: replacement, Speed: 4.99}})
+	tested := false
+	started := false
+
+	_, err := pool.DropAndReplace(0, DropAndReplaceOptions{
+		Candidates:   candidates,
+		MinimumSpeed: 5,
+		TestCandidate: func(cfg *ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
+			tested = true
+			return &TestResult{Config: cfg, Speed: 100}
+		},
+		StartCandidate: func(cfg *ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+			started = true
+			return nil, "", nil
+		},
+	})
+	if !errors.Is(err, ErrReplacementBelowMinimumSpeed) {
+		t.Fatalf("error = %v, want ErrReplacementBelowMinimumSpeed", err)
+	}
+	if tested {
+		t.Error("below-threshold cached candidate was re-tested")
+	}
+	if started {
+		t.Error("below-threshold cached candidate was started")
+	}
+	if pool.GetState(0) != StateEmpty || pool.Slots[0].Config != nil {
+		t.Error("slot should remain empty after below-threshold cached candidate")
+	}
+}
+
+func TestWANPoolDropAndReplace_AcceptsMinimumSpeedBoundary(t *testing.T) {
+	pool := NewWANPool(1, 10700)
+	activeTestSlot(t, pool, 0, &ProxyConfig{Raw: "ss://old"})
+	replacement := &ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
+	candidates := NewCandidatePool(1)
+	candidates.Update([]*TestResult{{Config: replacement, Speed: 5}})
+	started := false
+
+	result, err := pool.DropAndReplace(0, DropAndReplaceOptions{
+		Candidates:   candidates,
+		MinimumSpeed: 5,
+		TestCandidate: func(cfg *ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
+			return &TestResult{Config: cfg, Speed: 5}
+		},
+		StartCandidate: func(cfg *ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+			started = true
+			return nil, "", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("DropAndReplace at threshold: %v", err)
+	}
+	if result == nil || result.Speed != 5 {
+		t.Fatalf("result = %+v, want speed 5", result)
+	}
+	if !started {
+		t.Error("candidate at minimum speed was not started")
+	}
+	if pool.GetState(0) != StateActive || pool.Slots[0].Config != replacement {
+		t.Error("candidate at minimum speed was not promoted")
+	}
+}
+
+func TestWANPoolDropAndReplace_RejectsFreshResultBelowMinimumAndCleansUp(t *testing.T) {
+	pool := NewWANPool(1, 10700)
+	current := &ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
+	if err := pool.StartTesting(0, current); err != nil {
+		t.Fatalf("StartTesting: %v", err)
+	}
+	oldCmd := exec.Command("sleep", "30")
+	if err := oldCmd.Start(); err != nil {
+		t.Fatalf("start old process: %v", err)
+	}
+	t.Cleanup(func() {
+		if oldCmd.ProcessState == nil {
+			_ = oldCmd.Process.Kill()
+			_, _ = oldCmd.Process.Wait()
+		}
+	})
+	if err := pool.SetActive(0, oldCmd, ""); err != nil {
+		t.Fatalf("SetActive: %v", err)
+	}
+
+	replacement := &ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
+	candidates := NewCandidatePool(1)
+	candidates.Update([]*TestResult{{Config: replacement, Speed: 5}})
+	fresh := &TestResult{Config: replacement, Speed: 4.99}
+	started := false
+
+	result, err := pool.DropAndReplace(0, DropAndReplaceOptions{
+		Candidates:   candidates,
+		MinimumSpeed: 5,
+		TestCandidate: func(cfg *ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
+			return fresh
+		},
+		StartCandidate: func(cfg *ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+			started = true
+			return nil, "", nil
+		},
+	})
+	if !errors.Is(err, ErrReplacementBelowMinimumSpeed) {
+		t.Fatalf("error = %v, want ErrReplacementBelowMinimumSpeed", err)
+	}
+	if result != fresh {
+		t.Errorf("result = %p, want fresh result %p", result, fresh)
+	}
+	if started {
+		t.Error("StartCandidate called for fresh result below minimum")
+	}
+	if pool.GetState(0) != StateEmpty || pool.Slots[0].Config != nil {
+		t.Error("slot should remain empty after fresh result below minimum")
+	}
+	if oldCmd.ProcessState == nil {
+		t.Error("dropped xray process was not stopped and reaped")
+	}
+	if got := candidates.Best(); got != nil {
+		t.Errorf("fresh below-threshold candidate remained eligible: %+v", got)
 	}
 }

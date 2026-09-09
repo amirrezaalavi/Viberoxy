@@ -102,15 +102,7 @@ func NewAPIHandler(pool *WANPool, configs ...*Config) http.Handler {
 	if len(configs) > 0 {
 		cfg = configs[0]
 	}
-	dropOpts := DropAndReplaceOptions{Candidates: candidatePool}
-	if cfg != nil {
-		dropOpts.TestPort = cfg.TestBasePort
-		dropOpts.Timeout = time.Duration(cfg.TestTimeout) * time.Second
-		dropOpts.DownloadURL = buildDownloadURL(cfg, cfg.DownloadSize)
-		dropOpts.DownloadSize = cfg.DownloadSize
-		dropOpts.StabilityProbes = cfg.StabilityProbes
-		dropOpts.XrayMux = cfg.XrayMux
-	}
+	dropOpts := dropAndReplaceOptions(cfg, candidatePool)
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/viberoxy/wans", handleGetWANSlots(pool))
@@ -119,6 +111,20 @@ func NewAPIHandler(pool *WANPool, configs ...*Config) http.Handler {
 	mux.Handle("/api/viberoxy/cycle/trigger", handleTriggerCycle())
 	mux.Handle("/api/viberoxy/candidates", handleGetCandidates())
 	return mux
+}
+
+func dropAndReplaceOptions(cfg *Config, candidates *CandidatePool) DropAndReplaceOptions {
+	dropOpts := DropAndReplaceOptions{Candidates: candidates}
+	if cfg != nil {
+		dropOpts.TestPort = cfg.TestBasePort
+		dropOpts.Timeout = time.Duration(cfg.TestTimeout) * time.Second
+		dropOpts.DownloadURL = buildDownloadURL(cfg, cfg.DownloadSize)
+		dropOpts.DownloadSize = cfg.DownloadSize
+		dropOpts.StabilityProbes = cfg.StabilityProbes
+		dropOpts.MinimumSpeed = cfg.MinimumSpeed
+		dropOpts.XrayMux = cfg.XrayMux
+	}
+	return dropOpts
 }
 
 // dropWANResponse is returned by the drop endpoint for every application-level
@@ -157,6 +163,12 @@ func parseDropWANIndex(path string) (int, error) {
 // refill.
 func handleDropWAN(pool *WANPool, opts DropAndReplaceOptions, cycleTrigger chan<- struct{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		queueRefill := func() {
+			select {
+			case cycleTrigger <- struct{}{}:
+			default:
+			}
+		}
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			writeDropWANResponse(w, http.StatusMethodNotAllowed, dropWANResponse{
@@ -178,19 +190,24 @@ func handleDropWAN(pool *WANPool, opts DropAndReplaceOptions, cycleTrigger chan<
 		_, err = pool.DropAndReplace(index, opts)
 		switch {
 		case errors.Is(err, ErrNoReplacementCandidate):
-			select {
-			case cycleTrigger <- struct{}{}:
-			default:
-			}
+			queueRefill()
 			writeDropWANResponse(w, http.StatusAccepted, dropWANResponse{
 				Status:  "replacing",
 				Message: "no candidates, fetching...",
 			})
 		case errors.Is(err, ErrReplacementTestFailed):
+			queueRefill()
 			slog.Warn("WAN replacement candidate failed re-test", "index", index, "error", err)
 			writeDropWANResponse(w, http.StatusBadGateway, dropWANResponse{
 				Status:  "error",
 				Message: "replacement failed test",
+			})
+		case errors.Is(err, ErrReplacementBelowMinimumSpeed):
+			queueRefill()
+			slog.Warn("WAN replacement candidate below minimum speed", "index", index, "error", err)
+			writeDropWANResponse(w, http.StatusUnprocessableEntity, dropWANResponse{
+				Status:  "below_threshold",
+				Message: "replacement below minimum speed",
 			})
 		case err != nil:
 			slog.Error("WAN replacement failed", "index", index, "error", err)

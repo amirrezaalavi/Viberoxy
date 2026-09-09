@@ -78,6 +78,9 @@ var (
 	// ErrReplacementTestFailed means a cached candidate failed its mandatory
 	// re-test and was not promoted to a WAN slot.
 	ErrReplacementTestFailed = errors.New("replacement failed test")
+	// ErrReplacementBelowMinimumSpeed means either the cached measurement or
+	// mandatory fresh re-test did not meet the configured promotion threshold.
+	ErrReplacementBelowMinimumSpeed = errors.New("replacement below minimum speed")
 )
 
 // ReplacementTester re-tests a cached candidate before it is promoted.
@@ -95,6 +98,7 @@ type DropAndReplaceOptions struct {
 	DownloadURL     string
 	DownloadSize    int64
 	StabilityProbes int
+	MinimumSpeed    float64
 	XrayMux         bool
 	TestCandidate   ReplacementTester
 	StartCandidate  ReplacementStarter
@@ -144,6 +148,9 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 	if candidate == nil || candidate.Config == nil {
 		return nil, ErrNoReplacementCandidate
 	}
+	if candidate.Speed < opts.MinimumSpeed {
+		return nil, fmt.Errorf("%w: cached %.2f Mbps is below %.2f Mbps", ErrReplacementBelowMinimumSpeed, candidate.Speed, opts.MinimumSpeed)
+	}
 
 	testCandidate := opts.TestCandidate
 	if testCandidate == nil {
@@ -151,10 +158,15 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 	}
 	result := testCandidate(candidate.Config, opts.TestPort, opts.Timeout, opts.DownloadURL, opts.DownloadSize, opts.StabilityProbes)
 	if result == nil || result.Error != nil {
+		opts.Candidates.Exclude(candidate.Config.Raw)
 		if result != nil && result.Error != nil {
 			return nil, fmt.Errorf("%w: %v", ErrReplacementTestFailed, result.Error)
 		}
 		return nil, ErrReplacementTestFailed
+	}
+	if result.Speed < opts.MinimumSpeed {
+		opts.Candidates.Exclude(candidate.Config.Raw)
+		return result, fmt.Errorf("%w: fresh %.2f Mbps is below %.2f Mbps", ErrReplacementBelowMinimumSpeed, result.Speed, opts.MinimumSpeed)
 	}
 
 	if err := p.StartTesting(index, candidate.Config); err != nil {
