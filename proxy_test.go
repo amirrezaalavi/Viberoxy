@@ -9,21 +9,57 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// issuedPorts records every port freePort / consecutiveFreePorts hand out in
+// this test binary. The probe-and-release pattern alone is not safe: on
+// macOS the sequential ephemeral allocator returns the just-released
+// neighbour port to the next :0 probe, so consecutive probe runs
+// deterministic overlap (e.g. one component's base+1 landing on another
+// component's base — a speed-test xray's inbound answering on the "proxy
+// port"). Claiming ports here makes the helpers retry instead of handing
+// out the same port twice.
+var (
+	issuedPortsMu sync.Mutex
+	issuedPorts   = map[int]bool{}
+)
+
+// claimPorts atomically records ports as handed out. It returns false if any
+// of them was already issued.
+func claimPorts(ports ...int) bool {
+	issuedPortsMu.Lock()
+	defer issuedPortsMu.Unlock()
+	for _, p := range ports {
+		if issuedPorts[p] {
+			return false
+		}
+	}
+	for _, p := range ports {
+		issuedPorts[p] = true
+	}
+	return true
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freePort: %v", err)
+	for attempt := 0; attempt < 1000; attempt++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("freePort: %v", err)
+		}
+		_, portStr, _ := net.SplitHostPort(l.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+		l.Close()
+		if claimPorts(port) {
+			return port
+		}
 	}
-	_, portStr, _ := net.SplitHostPort(l.Addr().String())
-	port, _ := strconv.Atoi(portStr)
-	l.Close()
-	return port
+	t.Fatal("freePort: no unissued port found")
+	return 0
 }
 
 // TestProxyServer_ConcurrentStartStop is a regression test for the

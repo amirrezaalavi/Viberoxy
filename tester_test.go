@@ -475,7 +475,9 @@ func TestTestSpeed(t *testing.T) {
 	}
 	mockPort, _ := strconv.Atoi(mockPortStr)
 
-	port := 20800
+	// A helper-issued port, not a hardcoded one: a fixed port is an
+	// environment assumption (any ambient listener on it fails the test).
+	port := freePort(t)
 	rawURL := fmt.Sprintf("socks5://%s:%d", mockHost, mockPort)
 	cfg := &ProxyConfig{
 		Protocol: "socks5",
