@@ -132,7 +132,7 @@ func TestBuildXrayConfig_FreedomFallbackNoMux(t *testing.T) {
 
 func TestBuildXrayConfig_VMess(t *testing.T) {
 	v := map[string]interface{}{
-		"add": "1.2.3.4",
+		"add":  "1.2.3.4",
 		"port": 12345,
 		"id":   "109d47e4-4efe-45f8-9f63-52af26e1a5e2",
 		"aid":  "0",
@@ -404,8 +404,8 @@ func TestBuildXrayConfig_SOCKS5_NoAuth(t *testing.T) {
 
 	var settings struct {
 		Servers []struct {
-			Address string `json:"address"`
-			Port    int    `json:"port"`
+			Address string     `json:"address"`
+			Port    int        `json:"port"`
 			Users   []struct{} `json:"users"`
 		} `json:"servers"`
 	}
@@ -806,9 +806,9 @@ func TestStopXray_NilCmd(t *testing.T) {
 
 func TestExtractSIP002(t *testing.T) {
 	tests := []struct {
-		raw              string
-		wantMethod       string
-		wantPassword     string
+		raw          string
+		wantMethod   string
+		wantPassword string
 	}{
 		{
 			raw:          "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345",

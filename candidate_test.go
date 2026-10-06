@@ -14,7 +14,7 @@ func testCfg(name string) *ProxyConfig {
 		Server:   "example.com",
 		Port:     443,
 		Name:     name,
-		Raw:     "vmess://" + name,
+		Raw:      "vmess://" + name,
 	}
 }
 

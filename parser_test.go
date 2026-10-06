@@ -91,7 +91,7 @@ func TestParseShadowsocks_Legacy(t *testing.T) {
 
 func TestParseVMess(t *testing.T) {
 	v := map[string]interface{}{
-		"add": "1.2.3.4",
+		"add":  "1.2.3.4",
 		"port": 12345,
 		"ps":   "My VMess",
 		"id":   "109d47e4-4efe-45f8-9f63-52af26e1a5e2",

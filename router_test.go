@@ -26,22 +26,22 @@ func TestRouterAllProxyMode(t *testing.T) {
 
 func TestRouterProxyDefaultDirectList(t *testing.T) {
 	r := &Router{
-		Mode:            RouteProxyDefault,
-		directSuffixes:  []string{".ir", ".example.com", "plain.local"},
+		Mode:           RouteProxyDefault,
+		directSuffixes: []string{".ir", ".example.com", "plain.local"},
 	}
 	cases := []struct {
 		host string
 		want Route
 	}{
-		{"example.com", RouteDirect},   // exact match
-		{"sub.example.com", RouteDirect}, // suffix match
+		{"example.com", RouteDirect},         // exact match
+		{"sub.example.com", RouteDirect},     // suffix match
 		{"a.example.com.evil.com", RouteWAN}, // not a suffix match
-		{"somedomain.ir", RouteDirect}, // TLD suffix
-		{"ir", RouteDirect},            // bare suffix entry matches itself
-		{"plain.local", RouteDirect},   // no dot: exact match only
-		{"x.plain.local", RouteWAN},    // no dot entry: subdomains NOT matched
-		{"google.com", RouteWAN},       // default proxy
-		{"1.2.3.4", RouteWAN},          // IP literal not in list
+		{"somedomain.ir", RouteDirect},       // TLD suffix
+		{"ir", RouteDirect},                  // bare suffix entry matches itself
+		{"plain.local", RouteDirect},         // no dot: exact match only
+		{"x.plain.local", RouteWAN},          // no dot entry: subdomains NOT matched
+		{"google.com", RouteWAN},             // default proxy
+		{"1.2.3.4", RouteWAN},                // IP literal not in list
 	}
 	for _, c := range cases {
 		if got := r.Decide(c.host); got != c.want {
@@ -52,8 +52,8 @@ func TestRouterProxyDefaultDirectList(t *testing.T) {
 
 func TestRouterDirectDefaultProxyList(t *testing.T) {
 	r := &Router{
-		Mode:           RouteDirectDefault,
-		proxySuffixes:  []string{".google.com", ".youtube.com"},
+		Mode:          RouteDirectDefault,
+		proxySuffixes: []string{".google.com", ".youtube.com"},
 	}
 	cases := []struct {
 		host string

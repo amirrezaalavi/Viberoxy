@@ -73,8 +73,8 @@ type TCPSettings struct {
 }
 
 type TCPHeader struct {
-	Type    string        `json:"type"`
-	Request *HTTPRequest  `json:"request,omitempty"`
+	Type    string       `json:"type"`
+	Request *HTTPRequest `json:"request,omitempty"`
 }
 
 type HTTPRequest struct {
