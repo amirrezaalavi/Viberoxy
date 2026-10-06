@@ -2,7 +2,7 @@
 
 A zero-dependency Go daemon that aggregates proxy subscriptions into a pool of reliable xray WANs and exposes them through HTTPS CONNECT and SOCKS5 front-ends.
 
-[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-success)](go.mod)
 
 ---
@@ -23,7 +23,7 @@ Subscription URL → Fetch → Speed test → Sort → WAN pool (xray) → Load 
 
 ## Prerequisites
 
-- **Go 1.26+**
+- **Go 1.21+**
 - **[Xray-core](https://github.com/XTLS/Xray-core)** installed in PATH
 
 ---
@@ -160,5 +160,16 @@ viberoxy/
 ├── tester.go     — SOCKS5 dial, download measurer, speed tester
 ├── wan.go        — WAN slot state machine (empty→testing→active→draining)
 ├── proxy.go      — HTTPS CONNECT proxy + load balancer
-├── sorted.txt    — per-cycle speed test results (debug output)
+├── socks.go      — SOCKS5 front-end
+├── relay.go      — connection relay, TCP tuning, access log
+├── router.go     — split-routing (direct/proxy domain suffix lists)
+├── candidate.go  — candidate pool of tested configs
+├── health.go     — /metrics, /healthz, /readyz observability handler
+├── metrics.go    — Prometheus-format metrics registry
+├── api.go        — HTTP API: WAN slots, candidates, drop-and-replace, cycle trigger
+├── *_test.go     — tests alongside each source file
+├── README.md
+├── AGENTS.md
+├── LICENSE
+└── go.mod
 ```

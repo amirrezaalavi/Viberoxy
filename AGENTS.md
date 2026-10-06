@@ -29,20 +29,38 @@ viberoxy/
 ├── tester.go     — SOCKS5 dial, download measurer, speed tester
 ├── wan.go        — WAN slot state machine
 ├── proxy.go      — HTTPS CONNECT proxy + load balancer
-├── sorted.txt    — per-cycle speed test results (debug output)
+├── socks.go      — SOCKS5 front-end
+├── relay.go      — connection relay, TCP tuning, access log
+├── router.go     — split-routing (direct/proxy domain suffix lists)
+├── candidate.go  — candidate pool of tested configs
+├── health.go     — /metrics, /healthz, /readyz observability handler
+├── metrics.go    — Prometheus-format metrics registry
+├── api.go        — HTTP API: WAN slots, candidates, drop-and-replace, cycle trigger
+├── *_test.go     — tests alongside each source file
+├── README.md
+├── AGENTS.md
+├── LICENSE
+└── go.mod
 ```
 
 ---
 
-## Data Flow (one cycle)
+## Data Flow
+
+Startup (`startup` in `main.go`) — fetch subscription, then speed-test configs
+one by one (`TestSpeedWithStability`, temp xray per config, download & measure
+Mbps), promoting passers (≥ `MINIMUM_SPEED`) into WAN slots until the pool is
+full. With degraded boot, the front-ends start as soon as the first WAN is
+active.
+
+Every cycle (`runCycle` in `main.go`, periodic or triggered):
 
 ```
 Fetch subscription (HTTP GET)
   → ParseConfigs (base64/plain → ProxyConfigs)
-  → TestAll (temp xray per config, download & measure Mbps)
-  → SortResults (descending by speed)
-  → writeSortedTxt
-  → Fill empty WAN slots (best configs passing minimum speed)
+  → Speed-test up to MAX_TEST_PER_CYCLE configs one by one (temp xray per config, download & measure Mbps)
+  → Fill empty WAN slots (configs passing minimum speed, in subscription order)
+  → writeSortedTxt (per-cycle debug output)
   → Replace one low-performing WAN (drain old → spawn new on same port)
   → Health-check active xray processes (reap dead/orphaned slots)
 ```
@@ -63,14 +81,13 @@ empty → testing → active → draining → (kill after max(60, 2×FETCH_INTER
 |---|---|---|
 | `parseConfig()` | `main.go` | Read & validate env vars, return Config |
 | `startup(cfg, ctx)` | `main.go` | Fetch/test until WAN_COUNT active, start proxy, enter loop |
-| `runCycle(cfg, pool, grace)` | `main.go` | One fetch/test/replace cycle |
+| `runCycle(cfg, pool, candidates, grace)` | `main.go` | One fetch/test/replace cycle |
 | `ParseConfigs(body)` | `parser.go` | Parse base64/plain subscription text |
 | `ParseSingle(raw)` | `parser.go` | Parse one sharelink URI |
 | `BuildXrayConfig(cfg, port)` | `xray.go` | Generate xray JSON config for a proxy |
 | `StartXray(cfg, port)` | `xray.go` | Write config to temp file, spawn xray process |
 | `StopXray(cmd, path)` | `xray.go` | SIGTERM → wait → SIGKILL + cleanup |
 | `TestSpeed(cfg, port, timeout, url, size)` | `tester.go` | Speed-test one config through temp xray |
-| `TestAll(configs, ...)` | `tester.go` | Test all configs, return sorted results |
 | `DownloadMeasurer(addr, url, size, timeout)` | `tester.go` | SOCKS5 dial + HTTP GET + Mbps measurement |
 | `NewWANPool(count, basePort)` | `wan.go` | Create N WAN slots |
 | `RoutableCount(threshold)` | `wan.go` | Count routable WANs (active, under fail threshold, with running xray) |
@@ -102,17 +119,6 @@ Only routable WANs receive new connections from the load balancer. This prevents
 ### Orphan reaping
 
 `HealthCheckAll` runs periodically (every `KEEPALIVE_INTERVAL`). It detects active/draining slots whose xray process has died (defunct) and resets them to `StateEmpty` so `StopXray` cleans them up and the slot can be reused.
-
----
-
-## viber-console Supervisor
-
-The supervisor (`viber-console/internal/supervisor`) now auto-restarts crashed child processes:
-
-- Each `Service` has an `AutoRestart` flag (default: `true` for new services).
-- When the reaper goroutine observes an unexpected exit and `AutoRestart` is `true`, it waits with exponential backoff (starting at 1s, capped at 30s) then restarts the child.
-- `Status()` exposes `restarts`, `auto_restart`, `last_restart_at`, and `last_error` so the API and logs reflect restart activity.
-- Restart loops are prevented by the backoff; a fundamentally broken binary will settle into 30s-interval restarts with logged errors.
 
 ---
 
