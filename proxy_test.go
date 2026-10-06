@@ -9,21 +9,92 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// issuedPorts records every port freePort / consecutiveFreePorts hand out in
+// this test binary. The probe-and-release pattern alone is not safe: on
+// macOS the sequential ephemeral allocator returns the just-released
+// neighbour port to the next :0 probe, so consecutive probe runs
+// deterministic overlap (e.g. one component's base+1 landing on another
+// component's base — a speed-test xray's inbound answering on the "proxy
+// port"). Claiming ports here makes the helpers retry instead of handing
+// out the same port twice.
+var (
+	issuedPortsMu sync.Mutex
+	issuedPorts   = map[int]bool{}
+)
+
+// claimPorts atomically records ports as handed out. It returns false if any
+// of them was already issued.
+func claimPorts(ports ...int) bool {
+	issuedPortsMu.Lock()
+	defer issuedPortsMu.Unlock()
+	for _, p := range ports {
+		if issuedPorts[p] {
+			return false
+		}
+	}
+	for _, p := range ports {
+		issuedPorts[p] = true
+	}
+	return true
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freePort: %v", err)
+	for attempt := 0; attempt < 1000; attempt++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("freePort: %v", err)
+		}
+		_, portStr, _ := net.SplitHostPort(l.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+		l.Close()
+		if claimPorts(port) {
+			return port
+		}
 	}
-	_, portStr, _ := net.SplitHostPort(l.Addr().String())
-	port, _ := strconv.Atoi(portStr)
-	l.Close()
-	return port
+	t.Fatal("freePort: no unissued port found")
+	return 0
+}
+
+// TestProxyServer_ConcurrentStartStop is a regression test for the
+// ProxyServer.server field hand-off between Start and Stop. startup() can
+// shut the proxy down right after runLoop returns, racing the `go proxy.Start`
+// goroutine's initialization; before the field was synchronized this was a
+// data race on p.server (flagged by -race) and Stop could read nil and
+// no-op while Start was still bringing the server up. Run with -race.
+func TestProxyServer_ConcurrentStartStop(t *testing.T) {
+	pool := NewWANPool(1, 0)
+	for i := 0; i < 25; i++ {
+		proxy := NewProxyServer(freePort(t), pool)
+		ctx, cancel := context.WithCancel(context.Background())
+		started := make(chan error, 1)
+		go func() { started <- proxy.Start(ctx) }()
+		stopDone := make(chan error, 1)
+		go func() { stopDone <- proxy.Stop(context.Background()) }()
+		cancel()
+		select {
+		case err := <-started:
+			if err != nil {
+				t.Fatalf("iter %d: Start error: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: Start did not return after cancel", i)
+		}
+		select {
+		case err := <-stopDone:
+			if err != nil {
+				t.Fatalf("iter %d: Stop error: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: Stop did not return", i)
+		}
+	}
 }
 
 func TestNewProxyServer(t *testing.T) {

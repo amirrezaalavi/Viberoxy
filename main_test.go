@@ -423,24 +423,43 @@ func TestParseConfig_InvalidAllowDegradedBoot(t *testing.T) {
 }
 
 // consecutiveFreePorts returns a port whose next n-1 ports are also free, so
-// callers can hand it to configs that bind base+index.
+// callers can hand it to configs that bind base+index. The whole run is
+// claimed via claimPorts so no later allocation can alias any port of it.
 func consecutiveFreePorts(t *testing.T, n int) int {
 	t.Helper()
-	for {
-		base := freePort(t)
+	for attempt := 0; attempt < 1000; attempt++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("consecutiveFreePorts: %v", err)
+		}
+		_, portStr, _ := net.SplitHostPort(l.Addr().String())
+		base, _ := strconv.Atoi(portStr)
+		l.Close()
+
 		ok := true
+		var held []net.Listener
 		for i := 1; i < n; i++ {
-			l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+i))
+			hl, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+i))
 			if err != nil {
 				ok = false
 				break
 			}
-			l.Close()
+			held = append(held, hl)
 		}
-		if ok {
+		for _, hl := range held {
+			hl.Close()
+		}
+
+		ports := make([]int, n)
+		for i := range ports {
+			ports[i] = base + i
+		}
+		if ok && claimPorts(ports...) {
 			return base
 		}
 	}
+	t.Fatal("consecutiveFreePorts: no unissued consecutive run found")
+	return 0
 }
 
 // TestStartup_DegradedBoot verifies that with ALLOW_DEGRADED_BOOT the proxy
@@ -501,7 +520,7 @@ func TestStartup_DegradedBoot(t *testing.T) {
 		FetchInterval:     300,
 		TestTimeout:       10,
 		DownloadSize:      50000,
-		DownloadEndpoint:  downloadServer.URL,
+		DownloadEndpoint:  downloadServer.URL + "?bytes=",
 		DownloadFallback:  downloadServer.URL,
 		WanCount:          2,
 		WanBasePort:       consecutiveFreePorts(t, 2),
@@ -567,12 +586,15 @@ func TestStartup_NoDegradedBoot_PoolMustFill(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
 	gate := make(chan struct{})
+	secondBlocked := make(chan struct{})
+	var blockOnce sync.Once
 	downloadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		requests++
 		first := requests == 1
 		mu.Unlock()
 		if !first {
+			blockOnce.Do(func() { close(secondBlocked) })
 			<-gate
 		}
 		w.Header().Set("Content-Length", "50000")
@@ -592,7 +614,7 @@ func TestStartup_NoDegradedBoot_PoolMustFill(t *testing.T) {
 		FetchInterval:     300,
 		TestTimeout:       10,
 		DownloadSize:      50000,
-		DownloadEndpoint:  downloadServer.URL,
+		DownloadEndpoint:  downloadServer.URL + "?bytes=",
 		DownloadFallback:  downloadServer.URL,
 		WanCount:          2,
 		WanBasePort:       consecutiveFreePorts(t, 2),
@@ -610,19 +632,27 @@ func TestStartup_NoDegradedBoot_PoolMustFill(t *testing.T) {
 	}()
 
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)
-	// Give the first test + activation plenty of time; the proxy must NOT
-	// be listening while the second WAN is still gated.
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", proxyAddr, 200*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			close(gate)
-			cancel()
-			<-done
-			t.Fatalf("proxy started before pool was full (degraded boot disabled)")
-		}
-		time.Sleep(100 * time.Millisecond)
+	// Deterministic observation window: secondBlocked fires when the second
+	// speed test is parked on the gate inside the download handler. Only two
+	// configs exist and the gated test cannot finish, so at that moment the
+	// pool is provably short of WanCount — exactly the state in which the
+	// proxy must NOT be serving yet.
+	select {
+	case <-secondBlocked:
+	case <-time.After(15 * time.Second):
+		close(gate)
+		cancel()
+		<-done
+		t.Fatal("second speed test never reached the download server")
+	}
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 500*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		close(gate)
+		cancel()
+		<-done
+		t.Fatalf("proxy started before pool was full (degraded boot disabled)")
 	}
 
 	close(gate)

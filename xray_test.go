@@ -130,6 +130,49 @@ func TestBuildXrayConfig_FreedomFallbackNoMux(t *testing.T) {
 	}
 }
 
+func TestBuildXrayConfig_Socks5OutboundNoMux(t *testing.T) {
+	// A socks5 outbound tunnels raw bytes through a plain SOCKS proxy to the
+	// real target. Mux wraps streams in smux frames that only an xray/v2fly
+	// peer can demultiplex, so mux frames would reach the target un-decoded
+	// and corrupt every stream (downloads die with EOF). Mux must never be
+	// emitted on socks5 outbounds, even when the caller requests mux on.
+	raw := "socks5://user:pass@1.2.3.4:1080#MySocks"
+	cfg := ParseSingle(raw)
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+	if cfg.Protocol != "socks5" {
+		t.Fatalf("protocol = %q, want socks5", cfg.Protocol)
+	}
+
+	for _, tc := range []struct {
+		name string
+		mux  []bool
+	}{
+		{"default", nil},
+		{"explicit-on", []bool{true}},
+	} {
+		data, err := BuildXrayConfig(cfg, 10803, tc.mux...)
+		if err != nil {
+			t.Fatalf("%s: BuildXrayConfig error: %v", tc.name, err)
+		}
+		var xc XrayConfig
+		if err := json.Unmarshal(data, &xc); err != nil {
+			t.Fatalf("%s: invalid JSON: %v", tc.name, err)
+		}
+		if len(xc.Outbounds) != 1 {
+			t.Fatalf("%s: expected 1 outbound, got %d", tc.name, len(xc.Outbounds))
+		}
+		if xc.Outbounds[0].Protocol != "socks" {
+			t.Fatalf("%s: outbound protocol = %q, want socks", tc.name, xc.Outbounds[0].Protocol)
+		}
+		if xc.Outbounds[0].Mux != nil {
+			t.Errorf("%s: socks5 outbound has mux=%+v, want no mux (remote cannot demultiplex smux)",
+				tc.name, xc.Outbounds[0].Mux)
+		}
+	}
+}
+
 func TestBuildXrayConfig_VMess(t *testing.T) {
 	v := map[string]interface{}{
 		"add":  "1.2.3.4",

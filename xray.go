@@ -96,7 +96,8 @@ type RealitySettings struct {
 // muxEnabled is omitted it defaults to true: client connections to this
 // xray instance then share a single multiplexed upstream connection,
 // amortizing the TLS/protocol handshake per connection. Mux is only emitted
-// on proxied outbounds (never on the freedom fallback).
+// on proxied outbounds (never on the freedom fallback, and never on socks5
+// outbounds whose plain-proxy remote cannot demultiplex smux).
 func BuildXrayConfig(cfg *ProxyConfig, inboundPort int, muxEnabled ...bool) ([]byte, error) {
 	mux := true
 	if len(muxEnabled) > 0 {
@@ -307,11 +308,18 @@ func buildOutbound(cfg *ProxyConfig, muxEnabled bool) []OutboundConfig {
 		}
 	}
 
+	obMux := mux
+	// A socks5 outbound tunnels raw bytes through a plain SOCKS proxy to the
+	// real target: nothing at the far end decodes smux frames, so mux would
+	// corrupt every stream (mirrors the freedom-fallback no-mux rule).
+	if cfg.Protocol == "socks5" {
+		obMux = nil
+	}
 	ob := OutboundConfig{
 		Protocol:       getXrayProtocol(cfg.Protocol),
 		Settings:       marshalRaw(settings),
 		StreamSettings: streamSettings,
-		Mux:            mux,
+		Mux:            obMux,
 	}
 	return []OutboundConfig{ob}
 }
