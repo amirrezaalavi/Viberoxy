@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
 type ProxyServer struct {
-	port   int
+	port int
+	// mu guards server: Start publishes it from its own goroutine while
+	// startup()'s shutdown path may call Stop concurrently.
+	mu     sync.Mutex
 	server *http.Server
 	wanRelay
 }
@@ -38,14 +42,17 @@ func (p *ProxyServer) Start(ctx context.Context) error {
 		}
 	})
 
-	p.server = &http.Server{
+	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", p.port),
 		Handler: handler,
 	}
+	p.mu.Lock()
+	p.server = srv
+	p.mu.Unlock()
 
 	errCh := make(chan error, 1)
 	go func() {
-		err := p.server.ListenAndServe()
+		err := srv.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
 			errCh <- err
 			return
@@ -57,7 +64,7 @@ func (p *ProxyServer) Start(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		p.server.Shutdown(shutdownCtx)
+		srv.Shutdown(shutdownCtx)
 		return nil
 	case err := <-errCh:
 		return err
@@ -65,10 +72,13 @@ func (p *ProxyServer) Start(ctx context.Context) error {
 }
 
 func (p *ProxyServer) Stop(ctx context.Context) error {
-	if p.server == nil {
+	p.mu.Lock()
+	srv := p.server
+	p.mu.Unlock()
+	if srv == nil {
 		return nil
 	}
-	return p.server.Shutdown(ctx)
+	return srv.Shutdown(ctx)
 }
 
 func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {

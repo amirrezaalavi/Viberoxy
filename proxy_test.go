@@ -26,6 +26,41 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+// TestProxyServer_ConcurrentStartStop is a regression test for the
+// ProxyServer.server field hand-off between Start and Stop. startup() can
+// shut the proxy down right after runLoop returns, racing the `go proxy.Start`
+// goroutine's initialization; before the field was synchronized this was a
+// data race on p.server (flagged by -race) and Stop could read nil and
+// no-op while Start was still bringing the server up. Run with -race.
+func TestProxyServer_ConcurrentStartStop(t *testing.T) {
+	pool := NewWANPool(1, 0)
+	for i := 0; i < 25; i++ {
+		proxy := NewProxyServer(freePort(t), pool)
+		ctx, cancel := context.WithCancel(context.Background())
+		started := make(chan error, 1)
+		go func() { started <- proxy.Start(ctx) }()
+		stopDone := make(chan error, 1)
+		go func() { stopDone <- proxy.Stop(context.Background()) }()
+		cancel()
+		select {
+		case err := <-started:
+			if err != nil {
+				t.Fatalf("iter %d: Start error: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: Start did not return after cancel", i)
+		}
+		select {
+		case err := <-stopDone:
+			if err != nil {
+				t.Fatalf("iter %d: Stop error: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: Stop did not return", i)
+		}
+	}
+}
+
 func TestNewProxyServer(t *testing.T) {
 	pool := NewWANPool(4, 10700)
 	proxy := NewProxyServer(8080, pool)
