@@ -19,16 +19,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/health"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
 
 // State is a Path's lifecycle state, stored as int32 in Path.State.
 //
-// Only Active, Draining and Dead are assigned today. Probation and Suspect
-// exist so the later health/scheduler tasks (SPEC-H/SPEC-S) can grow the
-// state machine here without another identity change; nothing selects or
-// ejects on them yet.
+// Active, Suspect, Draining and Dead are assigned today. Suspect is the
+// health-ejection state (SPEC-H.3): an ejected path is excluded from
+// selection until half-open re-admission (internal/health drives it).
+// Probation exists so the scheduler tasks (SPEC-S) can still grow the
+// state machine without another identity change; nothing assigns it yet.
 type State int32
 
 const (
@@ -104,12 +106,20 @@ type Path struct {
 
 	// mu guards the health/performance samples below.
 	mu sync.Mutex
-	// ewmaTTFB is the time-to-first-byte EWMA — placeholder field, zero-valued;
-	// populated by later health/scheduler tasks.
+	// ewmaTTFB is the time-to-first-byte EWMA in nanoseconds-ish
+	// duration form: populated from relay first-byte observations and
+	// canary RTTs (SPEC-H.5). Zero until the first sample.
 	ewmaTTFB time.Duration
-	// goodputBps is the goodput EWMA in bits per second — placeholder field,
-	// zero-valued; populated by later health/scheduler tasks.
+	// goodputBps is the goodput EWMA in bits per second, populated at
+	// relay end from the bytes actually delivered (SPEC-H/SPEC-S input).
 	goodputBps float64
+
+	// hc is this generation's SPEC-H health state: the sliding outcome
+	// window (60s/30 outcomes), ejection with exponential backoff and the
+	// canary streak behind half-open re-admission. It lives here so the
+	// state dies with the generation: a replacement path starts healthy.
+	// Zero value is ready; all access is mutex-guarded inside health.
+	hc health.State
 }
 
 // nextID is the process-wide generation counter backing Path.ID.
@@ -238,4 +248,109 @@ func (p *Path) Stop() error {
 		return nil
 	}
 	return p.Proc.Stop("")
+}
+
+// ewmaAlpha is the smoothing factor for the health EWMA fields below.
+const ewmaAlpha = 0.25
+
+// RecordOutcome feeds one classified relay/dial outcome (SPEC-H.1) into
+// this path's health window (SPEC-H.2/H.3): OK clears the consecutive
+// failure counter, HARD_FAIL increments it, NEUTRAL changes nothing. It
+// returns true exactly when this outcome newly EJECTS the path — the
+// caller then sees the path state move Active -> Suspect (not-selected);
+// Draining/Dead states are never overwritten, drain policy belongs to the
+// drain task.
+func (p *Path) RecordOutcome(now time.Time, dest string, o health.Outcome) bool {
+	if p == nil {
+		return false
+	}
+	switch o {
+	case health.OK:
+		p.RecordSuccess()
+	case health.HardFail:
+		p.RecordFailure()
+	}
+	ejected := p.hc.Record(now, dest, o)
+	if ejected && p.GetState() == Active {
+		p.SetState(Suspect)
+	}
+	return ejected
+}
+
+// NoteCanary folds one canary interval result (SPEC-H.5) into this path's
+// health state. It returns true when the path is RE-ADMITTED: an ejected
+// (Suspect) path whose backoff elapsed and which just collected
+// HalfOpenSuccesses consecutive canary successes moves Suspect -> Active
+// again. Draining/Dead states are never touched.
+func (p *Path) NoteCanary(now time.Time, ok bool) (recovered bool) {
+	if p == nil {
+		return false
+	}
+	recovered = p.hc.NoteCanary(now, ok)
+	if recovered && p.GetState() == Suspect {
+		p.SetState(Active)
+	}
+	return recovered
+}
+
+// Ejected reports whether health has ejected this path (SPEC-H.3/H.4):
+// an ejected path is not admitted for new traffic until half-open
+// re-admission.
+func (p *Path) Ejected() bool {
+	if p == nil {
+		return false
+	}
+	return p.hc.Ejected()
+}
+
+// HealthSnapshot returns the path's window/backoff snapshot as of now,
+// for diagnostics and tests.
+func (p *Path) HealthSnapshot(now time.Time) health.Snapshot {
+	if p == nil {
+		return health.Snapshot{}
+	}
+	return p.hc.Snapshot(now)
+}
+
+// RecordHealth folds one observation into the path's performance EWMAs:
+// the time-to-first-byte observed for this connection (0 = unknown) and
+// the goodput in bits per second. Both are inputs to the later
+// scheduler/selector (SPEC-S); nothing selects on them yet.
+func (p *Path) RecordHealth(ttfb time.Duration, goodputBps float64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ttfb > 0 {
+		if p.ewmaTTFB == 0 {
+			p.ewmaTTFB = ttfb
+		} else {
+			p.ewmaTTFB = time.Duration(ewmaAlpha*float64(ttfb) + (1-ewmaAlpha)*float64(p.ewmaTTFB))
+		}
+	}
+	if goodputBps > 0 {
+		p.goodputBps = ewmaAlpha*goodputBps + (1-ewmaAlpha)*p.goodputBps
+	}
+}
+
+// TTFB returns the path's time-to-first-byte EWMA (0 = no sample yet).
+func (p *Path) TTFB() time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ewmaTTFB
+}
+
+// GoodputBps returns the path's goodput EWMA in bits per second
+// (0 = no sample yet).
+func (p *Path) GoodputBps() float64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.goodputBps
 }

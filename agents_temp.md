@@ -362,3 +362,109 @@ loop fails `TestRed_RT08_FailoverOnDialFailure` and
 **Note (for a later config task):** the policy is configurable through
 `retry.Options` in code; there is no env var yet — plumbing one would touch
 `proxycfg.ParseConfig` + `main.go`, which are outside this task's scope guard.
+
+## task-2-23: health subsystem — passive outcomes + canaries + global breaker (F-01, F-07)
+
+Three commits on `task-2-23-health`:
+
+1. `feat(health): passive outcome window + ejection + backoff (F-01)` — new
+   `internal/health` (`health.go` classification + `state.go` window/eject/
+   backoff) + `internal/path` state embedding + `relay.go` outcome hooks +
+   `wan.go` Suspect exclusion + `scripts/red_gate.sh`.
+2. `feat(health): canaries + global breaker (F-07)` — `internal/health/canary.go`
+   (endpoints, jitter, breaker) + T-HLT-03/04.
+3. `refactor(main): keepalive loop -> health canary loop` — `main.go` wiring +
+   `canary_test.go` (knob mapping + environmental-failure wiring test) + this
+   section.
+
+New package `internal/health` (pure policy; no knowledge of slots/paths):
+
+| Piece | Behavior |
+|---|---|
+| `health.Classify(Result{Up,Down,Err,DialErr,Duration,TFirst})` | SPEC-H.1: `OK` iff `down > 0`; `HARD_FAIL` on dial error, `up > 0 && down == 0` at close (both spec clauses: the timed `T_FIRST` flavor — default 8s — and the close flavor — no upstream byte ever arrived); `NEUTRAL` (`up == 0 && down == 0`, client abort) is ignored |
+| `health.State` (zero value ready, all methods take explicit `now` — **the injected clock**) | SPEC-H.2 sliding window (60s or 30 outcomes, smaller bound; only OK/HARD_FAIL recorded); SPEC-H.3 ejection: **>= 3 consecutive HARD_FAILs across >= 3 distinct destination HOSTS** (distinctness guard, T-HLT-06) **OR >= 8 outcomes at failRatio >= 50%** (unguarded on purpose — RT-02's dead WAN fails everything to ONE destination); SPEC-H.4 backoff `30s * 2^ejectCount` capped 10min, `ejectCount` decays one step per 10min of health; SPEC-H.5 canary streak: successes only count after the backoff elapsed, 2 consecutive => re-admit, any failure resets the streak |
+| `health.ApplyCanary([]PathCanary)` | SPEC-H.6: >=75% of paths failing canaries in the SAME interval => `degraded=true` and an **empty failing list** (nothing recorded/ejected/drained — T-HLT-03/T-CHAOS-05); below that the failing path indices come back for per-path handling |
+| `health.EndpointsFromEnv` / `JitterInterval` / `PathOK` | `HEALTH_ENDPOINTS` parsing (default gstatic `generate_204` + cloudflare `cdn-cgi/trace`), 15–30s base ±20% jitter (injected `*rand.Rand`), "path fails only if ALL endpoints failed" |
+| `health.SetEnvDegraded/EnvDegraded` | process-wide `env_degraded` gauge (atomic) |
+
+Wiring:
+
+- `internal/path.Path` embeds one `health.State` per generation (state dies
+  with the generation) and mirrors decisions onto lifecycle state:
+  `RecordOutcome(now, dest, outcome)` (eject => `Active -> Suspect`, never
+  overwrites `Draining`/`Dead`) and `NoteCanary(now, ok)` (half-open
+  re-admission => `Suspect -> Active`). The placeholder `ewmaTTFB` /
+  `goodputBps` fields are now populated (`RecordHealth`, alpha 0.25) from the
+  relay's first down byte + goodput; getters `TTFB()`/`GoodputBps()` added.
+- `relay.go`: `relayThroughWAN` classifies every relay end and calls
+  `RecordOutcome` — **success is credited only when `down > 0`** (the F-01
+  minimal fix; a splice error with bytes delivered is still OK);
+  `dialWAN` records its dial failure as a `HARD_FAIL` outcome (counter +
+  window, exactly one increment as before).
+- `wan.go`: `GetLeastLoadedExcluding`'s routable pass also skips
+  `path.Suspect` (like an over-threshold path); the degraded fallback is
+  untouched (still no blackhole, and `Draining` selection semantics are
+  untouched — RT-01 still fails, its rule belongs to a later task).
+- `main.go`: `keepaliveLoop`/`probeAllWANs` **replaced** by `canaryLoop` +
+  `runCanaries` + `canaryBaseInterval` + `canaryProbe` (per endpoint through
+  the slot's SOCKS5 via the existing `probeRoundTrip`, first success wins).
+
+**Env knob mapping (as required):**
+
+- `KEEPALIVE_INTERVAL` now drives the **canary** interval:
+  `canaryBaseInterval(keepaliveSeconds)` clamps it into SPEC-H.5's 15–30s
+  band (configured default 300 => 30s base; config minimum 10 => 15s), then
+  ±20% jitter is applied per tick. It no longer means "probe every 300s".
+- `WAN_FAIL_THRESHOLD` keeps both of its meanings: (a) selection's
+  over-threshold cutoff (`GetLeastLoaded*`, unchanged), and (b) the number
+  of **canary** failures before `runCanaries` marks the slot `Draining` —
+  the exact spot the old `probeAllWANs` did it ("where the current code
+  would"). Passive ejection thresholds (3-distinct / 8-at-50%, backoff
+  schedule) are fixed by SPEC-H.3/H.4 and are **not** env-tunable.
+- `HEALTH_ENDPOINTS` (new, read by `internal/health.EndpointsFromEnv`):
+  comma/whitespace-separated URLs; unset/blank => the two built-in
+  defaults. `ProbeWANURL` (ipify) is now reachable only through
+  `probeExitIP` — exit-IP reporting after a passing canary, never health
+  (F-07's SPOF fix). `ProbeWAN` itself is now only exercised by its tests.
+
+**Red suite / gate:** `TestRed_RT02_DeadWANDoesNotAttractTraffic` passes
+(`good=190 dead=10/200` typical runs; <=40 allowed) and was removed from
+`DEFAULT_ALLOW` — `scripts/red_gate.sh` exit 0 with **3 entries** (RT-01,
+RT-10, RT-11); full red suite **3 FAIL / 8 PASS / 0 SKIP**. `red_test.go`
+untouched: assertion-line grep diff vs HEAD is empty.
+
+**TDD:** T-HLT-01 window math + both ejection thresholds; T-HLT-02 backoff
+doubling to the 10min cap + `ejectCount` decay after 10min of health;
+T-HLT-03 all-canaries-fail => `env_degraded`, empty failing list, nobody
+ejected (75% boundary both ways); T-HLT-04 half-open: backoff gate, 1 vs 2
+consecutive canary successes, streak reset; T-HLT-05 `Suspect -> healthy`
+recovery (OK relays alone never re-admit; backoff + 2 canaries do; fresh
+streak re-ejects); T-HLT-06 one dead TARGET never ejects a healthy path
+(5 consecutive failures to one host stay put; 3 hosts eject). All use an
+injected fake clock — no sleeps. Root `canary_test.go` additionally pins the
+knob mapping and the production wiring of T-HLT-03 (2/2 failing paths =>
+nothing recorded, nothing drained, gauge set).
+
+**Mutation sanity (evidence):** with `Path.RecordOutcome` reverted to the
+pre-F-01 behavior (`RecordSuccess` unconditional, window not fed),
+`TestRed_RT02_DeadWANDoesNotAttractTraffic` fails exactly like the
+baseline: `good=26 dead=174 dead.ConsecutiveFails=0` — "dead WAN received
+174/200 connections". Restoring the rule turns it green again
+(`good=190 dead=10`), `go vet ./...` clean.
+
+**Deviation (flag for the metrics/observability task):** SPEC-H.6 asks for
+gauge `viberoxy_env_degraded`; `metrics*.go` is owned by a parallel task, so
+the gauge lives in `internal/health` (`SetEnvDegraded`/`EnvDegraded` atomic)
+plus a `slog.Warn("env_degraded: ...")` line. Expose it as
+`viberoxy_env_degraded` when metrics.go lands. The `HEALTH_ENDPOINTS` env
+var is read directly by `internal/health` (same dual-read pattern as
+`subs.AllowHTTPFromEnv`) — `proxycfg.ParseConfig` does not validate it yet
+(flag for a later config task).
+
+**Pitfall (host, not code):** back-to-back `go test -race` suites on this
+macOS host exhaust the loopback ephemeral port range — unrelated tests in
+untouched packages then fail with `dial tcp 127.0.0.1:<port>: connect:
+can't assign requested address` (TIME_WAIT churn; `netstat` is silent in
+the sandbox, so it looks like a code failure). Wait ~60s between heavy
+runs; a cooldown re-run of `go test -race -shuffle=on -count=1 ./...` is
+fully green (rc=0, 13/13 packages).

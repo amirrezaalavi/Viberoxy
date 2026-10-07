@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"time"
 	"viberoxy/internal/auth"
 	"viberoxy/internal/cands"
+	"viberoxy/internal/health"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/subs"
 )
@@ -200,7 +203,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	)
 
 	// startServices boots the HTTPS proxy, the observability server and the
-	// keepalive loop exactly once. With degraded boot enabled this happens
+	// health canary loop exactly once. With degraded boot enabled this happens
 	// as soon as the first WAN slot is active; otherwise only after the pool
 	// is full. Idempotent, so later calls (e.g. after the pool reaches the
 	// full WAN_COUNT) are no-ops.
@@ -272,7 +275,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 		slog.Info("api server started", "port", apiPort)
 
 		if cfg.KeepaliveInterval > 0 {
-			go keepaliveLoop(cfg, pool, ctx)
+			go canaryLoop(cfg, pool, ctx)
 		}
 	}
 
@@ -403,59 +406,149 @@ func runLoop(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, pro
 	}
 }
 
-// keepaliveLoop probes every active/draining WAN through its SOCKS5 listener
-// once per KEEPALIVE_INTERVAL. It stops when ctx is cancelled.
-func keepaliveLoop(cfg *proxycfg.Config, pool *WANPool, ctx context.Context) {
-	ticker := time.NewTicker(time.Duration(cfg.KeepaliveInterval) * time.Second)
-	defer ticker.Stop()
+// canaryLoop is the active health prober (SPEC-H.5), replacing the old
+// keepaliveLoop: every jittered 15–30s interval it runs one canary pass
+// over every active/draining WAN. The interval's base comes from
+// KEEPALIVE_INTERVAL, clamped into the 15–30s band (default 300 → 30s);
+// the endpoints come from HEALTH_ENDPOINTS (defaults: gstatic generate_204
+// + cloudflare cdn-cgi/trace — ipify is NEVER used for health, F-07).
+// It stops when ctx is cancelled.
+func canaryLoop(cfg *proxycfg.Config, pool *WANPool, ctx context.Context) {
+	base := canaryBaseInterval(cfg.KeepaliveInterval)
+	endpoints := health.EndpointsFromEnv()
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	timer := time.NewTimer(health.JitterInterval(base, rng))
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			probeAllWANs(cfg, pool)
+		case <-timer.C:
+			runCanaries(cfg, pool, endpoints)
+			timer.Reset(health.JitterInterval(base, rng))
 		}
 	}
 }
 
-// probeAllWANs runs one ProbeWAN per active/draining slot. A failed probe
-// increments the slot's ConsecutiveFails (a successful one resets it); once
-// the count reaches WAN_FAIL_THRESHOLD the slot is marked draining so the
-// next runCycle replaces it.
-func probeAllWANs(cfg *proxycfg.Config, pool *WANPool) {
+// canaryBaseInterval maps KEEPALIVE_INTERVAL (seconds) onto the canary
+// band: the legacy env knob now drives the ACTIVE canary interval, clamped
+// to SPEC-H.5's 15–30s window (values >= 30 → 30s, <= 15 → 15s; the
+// configured default 300 therefore runs canaries every 30s ± 20% jitter).
+func canaryBaseInterval(keepaliveSeconds int) time.Duration {
+	d := time.Duration(keepaliveSeconds) * time.Second
+	if d < health.CanaryIntervalMin {
+		return health.CanaryIntervalMin
+	}
+	if d > health.CanaryIntervalMax {
+		return health.CanaryIntervalMax
+	}
+	return d
+}
+
+// runCanaries executes one canary interval (SPEC-H.5/H.6): it GETs every
+// health endpoint through each active/draining slot's SOCKS5 listener — a
+// path's canary fails only if ALL endpoints failed — then applies the
+// interval verdict through health.ApplyCanary:
+//
+//   - environmental failure (>=75% of paths failing in the SAME interval):
+//     NOTHING is recorded, ejected or drained — only the env_degraded
+//     gauge moves and a warning is logged (T-HLT-03 / T-CHAOS-05);
+//   - otherwise a failing path records a failure exactly like the old
+//     keepalive did (counting toward WAN_FAIL_THRESHOLD, which marks the
+//     slot Draining for replacement — the existing MarkDraining
+//     machinery), and a passing path resets the counter, feeds its
+//     half-open/health streak and refreshes the exit IP through ipify
+//     (exit-IP reporting only — F-07's SPOF fix).
+func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
+	now := time.Now()
 	timeout := time.Duration(cfg.TestTimeout) * time.Second
-	for _, idx := range pool.GetSlotsByState(StateActive, StateDraining) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second // hand-built configs (tests) leave it zero
+	}
+
+	slots := pool.GetSlotsByState(StateActive, StateDraining)
+	if len(slots) == 0 {
+		return
+	}
+	results := make([]health.PathCanary, 0, len(slots))
+	for _, idx := range slots {
 		socksAddr := fmt.Sprintf("127.0.0.1:%d", pool.Slots[idx].ServicePort)
-		if err := ProbeWAN(socksAddr, timeout); err != nil {
-			pool.RecordFailure(idx)
-			fails := pool.SlotConsecutiveFails(idx)
-			slog.Warn("keepalive: probe failed", "index", idx, "fails", fails, "error", err)
-			if cfg.WanFailThreshold > 0 && fails >= int64(cfg.WanFailThreshold) && pool.GetState(idx) == StateActive {
-				if err := pool.MarkDraining(idx); err != nil {
-					slog.Warn("keepalive: failed to mark draining", "index", idx, "error", err)
-				} else {
-					slog.Warn("keepalive: wan unhealthy, marked draining", "index", idx, "fails", fails)
-				}
+		ok, rtt := canaryProbe(socksAddr, endpoints, timeout)
+		results = append(results, health.PathCanary{Index: idx, OK: ok, RTT: rtt})
+	}
+
+	degraded, failing := health.ApplyCanary(results)
+	health.SetEnvDegraded(degraded)
+	if degraded {
+		slog.Warn("env_degraded: canary endpoints failing on most paths; keeping everything serving",
+			"paths", len(results), "interval", "environmental")
+		return
+	}
+
+	failingSet := make(map[int]bool, len(failing))
+	for _, idx := range failing {
+		failingSet[idx] = true
+	}
+	for i, idx := range slots {
+		socksAddr := fmt.Sprintf("127.0.0.1:%d", pool.Slots[idx].ServicePort)
+		cur := pool.Slots[idx].Current.Load()
+		r := results[i]
+
+		if !failingSet[idx] {
+			pool.RecordSuccess(idx)
+			cur.NoteCanary(now, true)
+			if ip, err := probeExitIP(socksAddr, timeout); err == nil {
+				slot := pool.Slots[idx]
+				slot.mu.Lock()
+				slot.ExitIP = ip
+				slot.LastProbe = time.Now()
+				slot.mu.Unlock()
+				slog.Info("canary: ok", "index", idx, "exit_ip", ip, "rtt_ms", r.RTT.Milliseconds())
+			} else {
+				slog.Info("canary: ok", "index", idx, "rtt_ms", r.RTT.Milliseconds())
 			}
 			continue
 		}
-		pool.RecordSuccess(idx)
 
-		// Resolve exit IP after a successful probe: a lightweight HTTP GET
-		// to api.ipify.org through the slot's SOCKS5 listener. Failures are
-		// non-fatal — the slot is already proven healthy by ProbeWAN above.
-		if ip, err := probeExitIP(socksAddr, timeout); err == nil {
-			slot := pool.Slots[idx]
-			slot.mu.Lock()
-			slot.ExitIP = ip
-			slot.LastProbe = time.Now()
-			slot.mu.Unlock()
-			slog.Info("keepalive: probe ok", "index", idx, "exit_ip", ip)
-		} else {
-			slog.Info("keepalive: probe ok", "index", idx)
+		pool.RecordFailure(idx)
+		cur.NoteCanary(now, false)
+		fails := pool.SlotConsecutiveFails(idx)
+		slog.Warn("canary: path failed all endpoints", "index", idx, "fails", fails)
+		if cfg.WanFailThreshold > 0 && fails >= int64(cfg.WanFailThreshold) && pool.GetState(idx) == StateActive {
+			if err := pool.MarkDraining(idx); err != nil {
+				slog.Warn("canary: failed to mark draining", "index", idx, "error", err)
+			} else {
+				slog.Warn("canary: wan unhealthy, marked draining", "index", idx, "fails", fails)
+			}
 		}
 	}
+}
+
+// canaryProbe GETs each health endpoint through socksAddr and reports
+// whether ANY endpoint succeeded (a path's canary fails only if ALL fail)
+// plus the round-trip time of the first successful endpoint. Non-2xx/3xx
+// statuses count as endpoint failures.
+func canaryProbe(socksAddr string, endpoints []string, timeout time.Duration) (bool, time.Duration) {
+	for _, ep := range endpoints {
+		start := time.Now()
+		resp, conn, err := probeRoundTrip(socksAddr, ep, timeout)
+		if err != nil {
+			continue
+		}
+		rtt := time.Since(start)
+		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+			resp.Body.Close()
+			conn.Close()
+			continue
+		}
+		// Drain a small slice so the round trip really carried bytes.
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		conn.Close()
+		return true, rtt
+	}
+	return false, 0
 }
 
 // toCands converts speed-test results into cands.Entry values for the

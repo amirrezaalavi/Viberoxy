@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"time"
+	"viberoxy/internal/health"
 	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/relayio"
@@ -89,7 +90,11 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanPath *path.Path, targetHost s
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", r.pool.Slots[wanPath.Slot].ServicePort)
 	conn, err := socks5Dial(ctx, socksAddr, targetHost)
 	if err != nil {
-		wanPath.RecordFailure()
+		// A dial failure is a HARD_FAIL outcome (SPEC-H.1): it feeds the
+		// consecutive-failure counter AND the sliding window, so a path
+		// whose SOCKS layer answers but cannot be dialed ejects like any
+		// other hard failure.
+		wanPath.RecordOutcome(time.Now(), targetHost, health.HardFail)
 		slog.Warn("socks5 dial failed", "wan", wanPath.Slot, "target", targetHost, "error", err)
 		r.logAccess(targetHost, wanPath.Slot, 0, 0, start, "err", proto, "wan")
 		return nil, err
@@ -224,15 +229,54 @@ func (r *wanRelay) logAccess(target string, wan int, up, down int64, start time.
 
 // relayThroughWAN pipes clientConn and the upstream connection through
 // relayio.Splice until both directions finish (half-close preserved, idle and
-// handshake timeouts enforced), then records latency metrics, credits success
-// to the held path and writes the access-log line. Byte metrics are recorded
-// incrementally via relayOptions' OnBytes callback. Blocking; the caller owns
-// both conns.
+// handshake timeouts enforced), then classifies the outcome (SPEC-H.1),
+// credits it to the held path (success only when down > 0 — F-01), feeds the
+// path's sliding health window (ejection on the window's terms), records
+// latency metrics and the access-log line. Byte metrics are recorded
+// incrementally via relayOptions' OnBytes callback. Blocking; the caller
+// owns both conns.
 func (r *wanRelay) relayThroughWAN(wanPath *path.Path, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn, clientSrc io.Reader) {
-	stats := relayio.Splice(clientConn, upstream, clientSrc, r.relayOptions(strconv.Itoa(wanPath.Slot)))
+	opts := r.relayOptions(strconv.Itoa(wanPath.Slot))
+	// Capture the first down byte for the path's TTFB EWMA. Only the
+	// upstream->client goroutine writes firstDown, and Splice's WaitGroup
+	// establishes the happens-before edge with the read below.
+	var firstDown int64
+	onBytes := opts.OnBytes
+	opts.OnBytes = func(d relayio.Direction, n int64) {
+		if d == relayio.UpstreamToClient && firstDown == 0 {
+			firstDown = time.Now().UnixNano()
+		}
+		onBytes(d, n)
+	}
+	stats := relayio.Splice(clientConn, upstream, clientSrc, opts)
+	duration := time.Since(start)
+
+	// SPEC-H.1 outcome classification. The success rule CHANGED with
+	// F-01: only down > 0 credits success; up > 0 with nothing delivered
+	// is a hard failure that feeds the window (a black-holing WAN stops
+	// resetting its failure counter and can be ejected).
+	outcome := health.Classify(health.Result{
+		Up:       stats.Up,
+		Down:     stats.Down,
+		Err:      stats.Err,
+		Duration: duration,
+	})
+	if ejected := wanPath.RecordOutcome(time.Now(), targetHost, outcome); ejected {
+		slog.Warn("wan ejected by passive health",
+			"wan", wanPath.Slot, "target", targetHost, "outcome", outcome)
+	}
+	if outcome == health.OK {
+		var ttfb time.Duration
+		if firstDown > 0 {
+			ttfb = time.Unix(0, firstDown).Sub(start)
+		}
+		goodput := 0.0
+		if duration > 0 {
+			goodput = float64(stats.Down) * 8 / duration.Seconds()
+		}
+		wanPath.RecordHealth(ttfb, goodput)
+	}
+
 	metricProxyLatency.Observe(time.Since(start).Seconds())
-	// Success is credited to the path this connection ran on — the same
-	// generation it reserved on — never to whatever occupies the slot now.
-	wanPath.RecordSuccess()
 	r.logAccess(targetHost, wanPath.Slot, stats.Up, stats.Down, start, "ok", proto, "wan")
 }
