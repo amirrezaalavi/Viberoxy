@@ -527,3 +527,56 @@ pre-test `ResetEmpty` fails `TestRed_RT10_...`; removing it turns RT-10 green ag
 - Spare sizing (2xWanCount) and the TestBasePort/Spare range overlap check live in `startup`;
   a config task that adds env knobs should validate `TEST_BASE_PORT..+MAX_TEST_PER_CYCLE` not
   colliding with `WAN_BASE_PORT+WAN_COUNT..`.
+
+## task-3-4: continuous evaluation + hysteresis rotation (F-03, SPEC-R)
+
+One commit on `task-3-4-rotation`: `fix(rotation): continuous evaluation + hysteresis swaps (F-03/SPEC-R); RT-11 green`.
+
+**F-03 — full pool keeps evaluating.** `runCycle`'s loop head no longer breaks when the pool
+is full: it recomputes `poolFull` per config and, while full, tests up to
+`maxTestPerCycleFull = 2` NEW candidates per cycle (fill mode keeps `MaxTestPerCycle`).
+"New" = `HasServerPort` misses (active/draining) AND the Raw is not in `recentlyTested` —
+seeded from `candidatePool.List()` (the cands TTL ages the memory) plus every config tested
+this same cycle. Results feed the candidate pool exactly as before, so the old replacement
+block's `len(results) > 0` precondition is finally satisfiable.
+
+**SPEC-R — at most one make-before-break swap per cycle.** New `rotator` in `main.go`
+(`newRotator()`; process-wide `rotation`): knobs `rotationHysteresis = 0.30`,
+`rotationMinDwell = 10m`, injected `now`/`exitIP`/`test`/`start`, `lastSwap` cooldown
+reference. `decide()` gate order: FETCH_INTERVAL cooldown → worst incumbent (lowest score;
+`PickReplacementSlot` instability preference breaks ties) → MIN_DWELL via the incumbent
+path's `CreatedAt` (minted at activation) → per-candidate gates (speed bar, HasServerPort,
+exit-IP dedupe through `bestNewCandidate`'s exclude callback) → hysteresis
+`candidate >= (1+0.30) x incumbent`. `maybeSwap()` runs exactly one
+`DropAndReplace` with a single-entry cands pool (decision and swap cannot disagree; the
+mandatory re-test + spare-port start stay intact) and stamps `lastSwap` only on success.
+The old `MarkDraining` replacement block (unreachable dead code) is gone;
+`MarkDraining` itself is untouched (canary still owns it).
+
+**Simplifications / flags for later tasks:**
+- Score = benchmark `Speed` for now; the live goodput/TTFB EWMA score lands with the
+  scheduler task (`path.RecordHealth` EWMAs are still unused by rotation).
+- Candidate exit IP: production resolver `candidateExitIP` = the config's server address
+  when it is an IP literal, else unknown → gate skipped; the served side reads the
+  `ExitIP` the canary loop records per slot. When the scheduler task can carry observed
+  exit IPs onto candidates, swap the resolver.
+- Knobs are code constants — no env plumbing; a config task should add
+  `MAX_TEST_PER_CYCLE_FULL` / `HYSTERESIS` / `MIN_DWELL` env parsing in `proxycfg.ParseConfig`.
+
+**TDD / evidence:** `rotation_test.go` — T-ROT-01 (equal/+10%/+29% candidate ⇒ no swap),
+T-ROT-02 (>=30% better ⇒ exactly one swap, cooldown blocks the next), T-ROT-03 (MIN_DWELL
++ cooldown, injected clock), T-ROT-04 (exit-IP duplicate rejected; different/unknown pass),
+T-ROT-05 (full-pool budget 1..2 evaluations/cycle). `TestRed_RT11_FullPoolStillEvaluatesCandidates`
+green with `red_test.go` completely untouched (assertion grep diff vs HEAD empty: 22
+`t.Fatal*/t.Error*` lines both sides — sorted.txt already reflects the new evaluator).
+Mutation sanity: deleting the hysteresis condition makes T-ROT-01 fail
+(`decide() = victim 0 candidate &{... Speed:11.9 ...} (swap)`); restoring it goes green.
+
+**red_gate.sh:** RT-11 removed from `DEFAULT_ALLOW` (1 entry left: RT-01, a parallel
+task's). Empty allow list now has success semantics — "every TestRed_ must pass; zero
+failures allowed" — instead of `exit 1` on emptiness; bash-3.2 `set -u` empty-array
+expansions guarded with `${arr[@]+...}`. On this branch `RED_GATE_ALLOW='' bash
+scripts/red_gate.sh` prints the empty-list note then fails with
+`unexpected failure: TestRed_RT01_DrainingSlotNotSelected` (exit 1), proving the empty
+path enforces all-pass rather than erroring on emptiness; default run exits 0 with
+1 entry (failing=1 passing=10 skipping=0).

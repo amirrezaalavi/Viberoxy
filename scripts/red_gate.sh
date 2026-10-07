@@ -4,6 +4,11 @@
 # The suite is a set of repros of known bugs: every listed test is EXPECTED to
 # fail today, and each fix must shrink the allow-fail list in the same PR.
 #
+# An EMPTY allow list is a valid, stricter configuration with success
+# semantics: "every TestRed_ must pass; zero failures allowed" — with no
+# allow-listed exceptions, any FAIL or SKIP exits 1 ('unexpected failure:
+# <name>'). RED_GATE_ALLOW='' selects it explicitly.
+#
 # Exit 0 ONLY IF the set of failing tests equals the allow-fail list exactly:
 #   * every allow-listed test fails, and
 #   * no other test fails or skips.
@@ -21,7 +26,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 DEFAULT_ALLOW='
 TestRed_RT01_DrainingSlotNotSelected
-TestRed_RT11_FullPoolStillEvaluatesCandidates
 '
 
 ALLOW_RAW="${RED_GATE_ALLOW-$DEFAULT_ALLOW}"
@@ -32,9 +36,10 @@ for tok in $ALLOW_RAW; do
   allow+=("$tok")
 done
 
+# bash 3.2 + `set -u`: expanding an empty array is an unbound-variable
+# error, so every expansion below uses the ${arr[@]+...} guard.
 if [ "${#allow[@]}" -eq 0 ]; then
-  echo "red gate: allow-fail list is empty" >&2
-  exit 1
+  echo "red gate: allow-fail list is empty — every TestRed_ must pass (zero failures allowed)"
 fi
 
 logfile="$(mktemp "${TMPDIR:-/tmp}/red_gate.XXXXXX")" || exit 1
@@ -84,7 +89,7 @@ contains() {
 problems=()
 
 # Direction 1: every allow-listed test must fail (not pass, not skip, not vanish).
-for name in "${allow[@]}"; do
+for name in ${allow[@]+"${allow[@]}"}; do
   if contains "$name" ${failed[@]+"${failed[@]}"}; then
     continue
   elif contains "$name" ${passed[@]+"${passed[@]}"}; then
@@ -96,16 +101,17 @@ for name in "${allow[@]}"; do
   fi
 done
 
-# Direction 2: no unlisted test may fail or skip.
+# Direction 2: no unlisted test may fail or skip (with an empty allow list
+# that means EVERY failing/skipping test is unexpected: zero failures allowed).
 for name in ${failed[@]+"${failed[@]}"} ${skipped[@]+"${skipped[@]}"}; do
-  if ! contains "$name" "${allow[@]}"; then
+  if ! contains "$name" ${allow[@]+"${allow[@]}"}; then
     problems+=("unexpected failure: $name")
   fi
 done
 
 echo ""
 echo "== red gate results =="
-for name in "${allow[@]}"; do
+for name in ${allow[@]+"${allow[@]}"}; do
   if contains "$name" ${failed[@]+"${failed[@]}"}; then
     echo "  EXPECTED FAIL  $name"
   elif contains "$name" ${passed[@]+"${passed[@]}"}; then
@@ -128,5 +134,9 @@ if [ "${#problems[@]}" -gt 0 ]; then
   exit 1
 fi
 
-echo "red gate: OK — failing set exactly matches the ${#allow[@]} allow-listed tests"
+if [ "${#allow[@]}" -eq 0 ]; then
+  echo "red gate: OK — all TestRed_ tests passed (empty allow list: zero failures allowed)"
+else
+  echo "red gate: OK — failing set exactly matches the ${#allow[@]} allow-listed tests"
+fi
 exit 0
