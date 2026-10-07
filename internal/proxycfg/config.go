@@ -2,9 +2,12 @@ package proxycfg
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
+	"viberoxy/internal/auth"
 )
 
 type Config struct {
@@ -33,6 +36,25 @@ type Config struct {
 	AllowHTTPSubscription bool
 	Router                *Router
 	XrayMux               bool
+
+	// F-14 security configuration (all from env, hard-exit validated).
+	// ListenAddr is the bind host for the proxy, SOCKS5, API and metrics
+	// listeners: loopback (127.0.0.1) unless LISTEN_ADDR overrides it, and
+	// a non-loopback value is refused at startup unless ProxyUsers or
+	// APIToken authenticates the service or AllowPublic opts in.
+	ListenAddr string
+	// ProxyUsers are the PROXY_USERS user:password pairs enabling proxy
+	// authentication (CONNECT 407 / SOCKS5 RFC 1929). The front-ends re-read
+	// the env at request time (dual-read, like subs.AllowHTTPFromEnv); the
+	// parsed value here exists for startup validation and the bind gate.
+	ProxyUsers []auth.UserCred
+	// APIToken gates /api/* and the metrics endpoint (Bearer).
+	APIToken string
+	// AllowPublic accepts a non-loopback LISTEN_ADDR without authentication.
+	AllowPublic bool
+	// AllowPrivateTargets opts in to proxying loopback/link-local/private
+	// destinations (SSRF guard). Blocked by default.
+	AllowPrivateTargets bool
 }
 
 // MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
@@ -346,6 +368,73 @@ func ParseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: XRAY_MUX=%q: must be a boolean (true/false)", v)
 		}
 		cfg.XrayMux = b
+	}
+
+	// ---- F-14 security hardening ----
+
+	// LISTEN_ADDR: bind host for the proxy, SOCKS5, API and metrics
+	// listeners. Defaults to loopback so a fresh install is never exposed;
+	// must be an IP literal (hard-exit on anything else).
+	cfg.ListenAddr = auth.LoopbackHost
+	if v := os.Getenv("LISTEN_ADDR"); v != "" {
+		if net.ParseIP(v) == nil {
+			return nil, fmt.Errorf("error: LISTEN_ADDR=%q: must be a valid IP address", v)
+		}
+		cfg.ListenAddr = v
+	}
+
+	// PROXY_USERS: comma-separated user:password entries enabling proxy
+	// authentication (CONNECT 407, SOCKS5 RFC 1929). The error never echoes
+	// the value: it contains passwords and is logged on hard exit.
+	cfg.ProxyUsers = nil
+	if v := os.Getenv("PROXY_USERS"); v != "" {
+		users, err := auth.ParseUsers(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: PROXY_USERS: %w", err)
+		}
+		cfg.ProxyUsers = users
+	}
+
+	// API_TOKEN: bearer token gating /api/* and the metrics endpoint.
+	// Whitespace would make the Authorization header unparseable; the error
+	// must not echo the token itself.
+	cfg.APIToken = ""
+	if v := os.Getenv("API_TOKEN"); v != "" {
+		if strings.ContainsAny(v, " 	\r\n") {
+			return nil, fmt.Errorf("error: API_TOKEN must not contain whitespace")
+		}
+		cfg.APIToken = v
+	}
+
+	// ALLOW_PUBLIC: explicit opt-in to a non-loopback LISTEN_ADDR without
+	// authentication (useful behind another access-control layer).
+	cfg.AllowPublic = false
+	if v := os.Getenv("ALLOW_PUBLIC"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: ALLOW_PUBLIC=%q: must be a boolean (true/false)", v)
+		}
+		cfg.AllowPublic = b
+	}
+
+	// ALLOW_PRIVATE_TARGETS: opt-in to proxying connections to loopback/
+	// link-local/private destinations. Blocked by default (SSRF guard).
+	cfg.AllowPrivateTargets = false
+	if v := os.Getenv("ALLOW_PRIVATE_TARGETS"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: ALLOW_PRIVATE_TARGETS=%q: must be a boolean (true/false)", v)
+		}
+		cfg.AllowPrivateTargets = b
+	}
+
+	// The non-loopback gate runs after every opt-in above is parsed: a
+	// public LISTEN_ADDR needs authentication (PROXY_USERS / API_TOKEN) or
+	// an explicit ALLOW_PUBLIC=true. The listeners re-check the same policy
+	// at bind time (auth.EnsureBindAllowed) as defense in depth.
+	if !auth.IsLoopbackHost(cfg.ListenAddr) &&
+		!auth.BindAllowed(len(cfg.ProxyUsers) > 0, cfg.APIToken != "", cfg.AllowPublic) {
+		return nil, fmt.Errorf("error: LISTEN_ADDR=%q: non-loopback bind refused without authentication: set PROXY_USERS or API_TOKEN, or ALLOW_PUBLIC=true to accept public exposure", cfg.ListenAddr)
 	}
 
 	return cfg, nil

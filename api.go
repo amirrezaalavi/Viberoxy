@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/auth"
 	"viberoxy/internal/proxycfg"
 )
 
@@ -97,7 +100,10 @@ func handleTriggerCycle() http.HandlerFunc {
 // NewAPIHandler returns the viberoxy control API, including WAN state,
 // WAN drop/replacement, cycle timing, the manual cycle trigger, and the
 // candidate pool. A Config is supplied by startup; it is variadic to preserve
-// compatibility with callers that only use the read-only endpoints.
+// compatibility with callers that only use the read-only endpoints. When the
+// config carries an API_TOKEN, every /api/* route requires an
+// Authorization: Bearer header carrying that token (F-14); without a token
+// the API stays open.
 func NewAPIHandler(pool *WANPool, configs ...*proxycfg.Config) http.Handler {
 	var cfg *proxycfg.Config
 	if len(configs) > 0 {
@@ -119,7 +125,12 @@ func NewAPIHandler(pool *WANPool, configs ...*proxycfg.Config) http.Handler {
 	mux.Handle("/api/viberoxy/cycle", handleGetCycleTiming())
 	mux.Handle("/api/viberoxy/cycle/trigger", handleTriggerCycle())
 	mux.Handle("/api/viberoxy/candidates", handleGetCandidates())
-	return mux
+
+	token := ""
+	if cfg != nil {
+		token = cfg.APIToken
+	}
+	return auth.RequireBearer(token, mux)
 }
 
 // dropWANResponse is returned by the drop endpoint for every application-level
@@ -212,6 +223,11 @@ func handleDropWAN(pool *WANPool, opts DropAndReplaceOptions, cycleTrigger chan<
 // handleGetCandidates returns the current candidate pool as a JSON array.
 // Each entry carries the config identity and measured speed/error so the
 // UI can surface replacement candidates.
+//
+// F-14 credential redaction: the Raw share link (it carries UUIDs,
+// passwords and keys) is NEVER returned — only name, server, protocol, port
+// and a sha256 fingerprint of the Raw value so callers can still correlate
+// entries without learning the secret.
 func handleGetCandidates() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -225,23 +241,24 @@ func handleGetCandidates() http.HandlerFunc {
 			return
 		}
 		type candidateView struct {
-			Name     string  `json:"name"`
-			Server   string  `json:"server"`
-			Port     int     `json:"port"`
-			Protocol string  `json:"protocol"`
-			Raw      string  `json:"raw"`
-			Speed    float64 `json:"speed_mbps"`
-			Error    string  `json:"error,omitempty"`
+			Name      string  `json:"name"`
+			Server    string  `json:"server"`
+			Port      int     `json:"port"`
+			Protocol  string  `json:"protocol"`
+			RawSHA256 string  `json:"raw_sha256"`
+			Speed     float64 `json:"speed_mbps"`
+			Error     string  `json:"error,omitempty"`
 		}
 		list := candidatePool.List()
 		view := make([]candidateView, 0, len(list))
 		for _, c := range list {
+			sum := sha256.Sum256([]byte(c.Config.Raw))
 			cv := candidateView{
-				Server:   c.Config.Server,
-				Port:     c.Config.Port,
-				Protocol: c.Config.Protocol,
-				Raw:      c.Config.Raw,
-				Speed:    c.Speed,
+				Server:    c.Config.Server,
+				Port:      c.Config.Port,
+				Protocol:  c.Config.Protocol,
+				RawSHA256: hex.EncodeToString(sum[:]),
+				Speed:     c.Speed,
 			}
 			if c.Config.Name != "" {
 				cv.Name = c.Config.Name

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"viberoxy/internal/auth"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/subs"
 )
@@ -156,6 +158,34 @@ func logUnsupportedOnce(logged map[string]bool, proto string) {
 	slog.Info("skipping unsupported protocol", "protocol", proto)
 }
 
+// gateMetrics requires an Authorization: Bearer header with the API token
+// on the /metrics endpoint only (F-14): /healthz and /readyz stay open so
+// liveness and
+// readiness probes never need a credential.
+func gateMetrics(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+	gated := auth.RequireBearer(token, next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			gated.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// listenHost returns the bind host for a listener: cfg.ListenAddr, or the
+// loopback default when the config was built without it (test fixtures) —
+// a zero-value Config must never widen the bind to all interfaces (F-14).
+func listenHost(cfg *proxycfg.Config) string {
+	if cfg.ListenAddr == "" {
+		return auth.LoopbackHost
+	}
+	return cfg.ListenAddr
+}
+
 func startup(cfg *proxycfg.Config, ctx context.Context) {
 	slog.Info("starting viberoxy...")
 
@@ -180,6 +210,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 		proxyStarted = true
 
 		proxy = NewProxyServer(cfg.ProxyPort, pool, cfg.Router)
+		proxy.listenAddr = listenHost(cfg)
 		proxy.AccessLog = cfg.AccessLog
 		if cfg.WanFailThreshold > 0 {
 			proxy.WanFailThreshold = cfg.WanFailThreshold
@@ -192,6 +223,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 
 		if cfg.SocksPort > 0 {
 			socks := NewSocksServer(cfg.SocksPort, pool, cfg.Router)
+			socks.listenAddr = listenHost(cfg)
 			socks.AccessLog = cfg.AccessLog
 			if cfg.WanFailThreshold > 0 {
 				socks.WanFailThreshold = cfg.WanFailThreshold
@@ -206,8 +238,10 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 
 		if cfg.MetricsPort > 0 {
 			obsSrv = &http.Server{
-				Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
-				Handler: NewObservabilityHandler(pool),
+				Addr: net.JoinHostPort(listenHost(cfg), strconv.Itoa(cfg.MetricsPort)),
+				// F-14: /metrics carries operational detail; with an
+				// API_TOKEN configured it requires a bearer token.
+				Handler: gateMetrics(cfg.APIToken, NewObservabilityHandler(pool)),
 			}
 			go func() {
 				if err := obsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -226,7 +260,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			}
 		}
 		apiSrv := &http.Server{
-			Addr:    fmt.Sprintf(":%d", apiPort),
+			Addr:    net.JoinHostPort(listenHost(cfg), strconv.Itoa(apiPort)),
 			Handler: NewAPIHandler(pool, cfg),
 		}
 		go func() {

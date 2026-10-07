@@ -177,3 +177,58 @@ plain-http `httptest` servers. The policy itself is covered both ways in
 http `SUBSCRIBER_URL` rejected by default). `main_test.go` also gained two
 caller tests: `TestFetchSubscription_ConditionalGetKeepsConfigs` (304 replay)
 and `TestFetchSubscription_GarbageBodyKeepsPrevious`.
+
+## task-1-6: F-14 security hardening (loopback bind, proxy/API auth, credential redaction, SSRF guard)
+
+One commit on `task-1-6-auth`: `feat(auth): loopback default bind, proxy/API auth, credential redaction (F-14)`.
+
+New package `internal/auth/` (`auth.go` + `auth_test.go`, stdlib only) owns the primitives:
+
+| Behavior | Where |
+|---|---|
+| `PROXY_USERS` parsing (`user:password,...`, split at the FIRST colon so passwords may contain colons; errors never echo the value) | `auth.ParseUsers` |
+| constant-time credential check (`crypto/subtle`, looped without early exit) | `auth.CheckUsers` |
+| `Proxy-Authorization: Basic` parsing (case-insensitive scheme) | `auth.ParseBasic` |
+| `Authorization: Bearer` check + gate middleware (403 + `WWW-Authenticate`) | `auth.CheckBearer`, `auth.RequireBearer` |
+| bind policy: loopback always allowed; non-loopback needs `PROXY_USERS` or `API_TOKEN`, else `ALLOW_PUBLIC=true` | `auth.EnsureBindAllowed` / `BindAllowed` / `BindAllowedFromEnv` |
+| SSRF guard: loopback / link-local (incl. 169.254.169.254) / RFC1918+ULA / CGNAT / unspecified blocked unless `ALLOW_PRIVATE_TARGETS=true`; IPv4 shorthand normalised (`127.1`, `2130706433`, `0177.0.0.1`, `0x7f000001`); localhost-family names blocked; hostnames pass WITHOUT DNS resolution (documented: targets dial remotely through the WAN, a local resolve would add latency and a new failure mode) | `auth.TargetAllowed` |
+
+New env vars — all parsed and hard-exit validated in `proxycfg.ParseConfig`, then re-read at
+request/bind time by the enforcement points (the same dual-read pattern as
+`subs.AllowHTTPFromEnv` for `ALLOW_HTTP_SUBSCRIPTION`):
+
+- `LISTEN_ADDR` (IP literal, default `127.0.0.1`): bind host for the proxy, SOCKS5, API and
+  metrics listeners. Non-loopback is refused at startup unless `PROXY_USERS`/`API_TOKEN` is set
+  or `ALLOW_PUBLIC=true`.
+- `PROXY_USERS`: comma-separated `user:password` entries; enables CONNECT 407 (Basic) and
+  SOCKS5 RFC 1929 (method `0x02`, failure status `0x01`, no-auth-only greeting → `0xFF`).
+  Unset keeps the historical no-auth paths byte-for-byte.
+- `API_TOKEN`: bearer token gating `/api/*` (api.go) and `/metrics` only (main.go `gateMetrics`;
+  `/healthz` + `/readyz` stay open for probes).
+- `ALLOW_PUBLIC`, `ALLOW_PRIVATE_TARGETS` (bools, default false).
+
+Front-end wiring: `ProxyServer`/`SocksServer` gained a `listenAddr` field defaulting to
+`auth.LoopbackHost` (constructor-level defense) which `main.go` overrides via `listenHost(cfg)`
+(`""` in a hand-built Config still means loopback, never `:port`). `Start`/`Listen` re-check
+`auth.EnsureBindAllowed` before binding (defense in depth behind ParseConfig's hard exit), and
+both front-ends run `auth.TargetAllowed` before any dial (CONNECT → 403, SOCKS5 → REP `0x02`).
+
+Credential redaction: `GET /api/viberoxy/candidates` no longer returns `raw`; entries expose
+`{name, server, protocol, port, raw_sha256, speed_mbps, error?}` (`raw_sha256` = hex sha256 of
+the Raw link so callers can still correlate). Audit of the rest of api.go: the other endpoints
+expose only `WANSlotInfo` (no Config/Raw) and fixed strings — no other credential path found.
+
+Tests: `internal/auth/auth_test.go` (primitives, both ways),
+`internal/proxycfg/listen_auth_test.go` (+ F-14 defaults added to `TestParseConfig_Defaults`),
+root `security_test.go` (bind default, bind refusal/opt-in, 407 + authenticated tunnel, RFC 1929
+reject/accept, API 403/200, metrics 403 with open probes, candidates redaction against a
+UUID/password fixture, SSRF guard both ways on both front-ends). `security_test.go` has an
+`init()` setting `ALLOW_PRIVATE_TARGETS=true` for the whole test binary (existing proxy/socks
+tests target 127.0.0.1 echo servers) — the same pattern as `main_test.go`'s
+`ALLOW_HTTP_SUBSCRIPTION` init; each guard test still pins both directions explicitly. Red suite
+untouched: 9 FAIL / 2 PASS / 0 SKIP, `scripts/red_gate.sh` exit 0.
+
+Stale README/AGENTS rows for whoever consolidates: the `SOCKS_PORT` row ("No auth (RFC 1929 not
+implemented)") is now conditional on `PROXY_USERS`, and the README env table needs `LISTEN_ADDR`,
+`PROXY_USERS`, `API_TOKEN`, `ALLOW_PUBLIC`, `ALLOW_PRIVATE_TARGETS` plus a "loopback by default"
+note on the `PROXY_PORT`/`SOCKS_PORT`/`API_PORT`/`METRICS_PORT` bindings.
