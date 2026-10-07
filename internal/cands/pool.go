@@ -1,24 +1,43 @@
-package main
+// Package cands holds the pool of speed-tested proxy configs kept for
+// failover: the drop-and-replace API picks replacements from it, and each
+// cycle seeds it with the configs it just tested.
+package cands
 
 import (
 	"sort"
 	"sync"
+
+	"viberoxy/internal/proxycfg"
 )
 
-// CandidatePool is a thread-safe pool of top-N working test results,
+// Entry is one pool member: the outcome of a speed test for a single config.
+// It mirrors the tester's result struct in package main (which cannot move
+// here — the tester stays in main), so call sites convert at the boundary;
+// Config is shared by pointer, the value fields are copied.
+type Entry struct {
+	Config *proxycfg.ProxyConfig
+	Speed  float64
+	// StabilityScore is the number of distinct exit IPs observed across
+	// STABILITY_PROBES probes minus one. The pool carries it for parity
+	// with the tester's result but never ranks on it.
+	StabilityScore int
+	Error          error
+}
+
+// Pool is a thread-safe pool of top-N working test results,
 // sorted by speed descending. It tracks excluded configs so Best() can
 // skip them without removing them from the pool.
-type CandidatePool struct {
+type Pool struct {
 	mu         sync.Mutex
-	candidates []*TestResult   // sorted by speed desc (failed results last)
+	candidates []*Entry        // sorted by speed desc (failed results last)
 	excluded   map[string]bool // raw URI → excluded
 	maxLen     int
 }
 
-// NewCandidatePool creates a new pool with the given maximum length.
-func NewCandidatePool(maxLen int) *CandidatePool {
-	return &CandidatePool{
-		candidates: make([]*TestResult, 0, maxLen),
+// NewPool creates a new pool with the given maximum length.
+func NewPool(maxLen int) *Pool {
+	return &Pool{
+		candidates: make([]*Entry, 0, maxLen),
 		excluded:   make(map[string]bool),
 		maxLen:     maxLen,
 	}
@@ -26,7 +45,7 @@ func NewCandidatePool(maxLen int) *CandidatePool {
 
 // Update merges new test results into the pool, sorts by speed descending,
 // and trims to maxLen. Thread-safe.
-func (p *CandidatePool) Update(results []*TestResult) {
+func (p *Pool) Update(results []*Entry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -52,7 +71,7 @@ func (p *CandidatePool) Update(results []*TestResult) {
 }
 
 // Exclude marks a config (by its raw URI) as excluded. Thread-safe.
-func (p *CandidatePool) Exclude(rawURI string) {
+func (p *Pool) Exclude(rawURI string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.excluded[rawURI] = true
@@ -60,7 +79,7 @@ func (p *CandidatePool) Exclude(rawURI string) {
 
 // Best returns the top non-excluded, non-failed candidate, or nil if
 // none remain. Thread-safe.
-func (p *CandidatePool) Best() *TestResult {
+func (p *Pool) Best() *Entry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -78,13 +97,13 @@ func (p *CandidatePool) Best() *TestResult {
 
 // List returns a deep copy of the current pool slice. Mutating the
 // returned slice or its elements does not affect the pool. Thread-safe.
-func (p *CandidatePool) List() []*TestResult {
+func (p *Pool) List() []*Entry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	out := make([]*TestResult, len(p.candidates))
+	out := make([]*Entry, len(p.candidates))
 	for i, c := range p.candidates {
-		// Shallow copy of TestResult is sufficient: Speed and Error are
+		// Shallow copy of Entry is sufficient: Speed and Error are
 		// value fields; Config is a pointer but we don't mutate it here.
 		copy := *c
 		out[i] = &copy
@@ -93,7 +112,7 @@ func (p *CandidatePool) List() []*TestResult {
 }
 
 // Len returns the number of candidates currently in the pool. Thread-safe.
-func (p *CandidatePool) Len() int {
+func (p *Pool) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.candidates)

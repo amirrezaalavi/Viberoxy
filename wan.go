@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
@@ -97,7 +98,7 @@ type ReplacementStarter func(*proxycfg.ProxyConfig, int, ...bool) (*xrayproc.Han
 // DropAndReplaceOptions contains the candidate source, test settings, and
 // injectable process operations used by DropAndReplace.
 type DropAndReplaceOptions struct {
-	Candidates      *CandidatePool
+	Candidates      *cands.Pool
 	TestPort        int
 	Timeout         time.Duration
 	DownloadURL     string

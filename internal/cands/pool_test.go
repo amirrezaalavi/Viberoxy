@@ -1,4 +1,4 @@
-package main
+package cands
 
 import (
 	"errors"
@@ -19,14 +19,14 @@ func testCfg(name string) *proxycfg.ProxyConfig {
 	}
 }
 
-func testResult(name string, speed float64) *TestResult {
-	return &TestResult{Config: testCfg(name), Speed: speed}
+func testResult(name string, speed float64) *Entry {
+	return &Entry{Config: testCfg(name), Speed: speed}
 }
 
 var errFake = errors.New("fake test error")
 
-func TestNewCandidatePool(t *testing.T) {
-	pool := NewCandidatePool(5)
+func TestNewPool(t *testing.T) {
+	pool := NewPool(5)
 	if pool == nil {
 		t.Fatal("NewCandidatePool returned nil")
 	}
@@ -39,8 +39,8 @@ func TestNewCandidatePool(t *testing.T) {
 }
 
 func TestUpdateSortsBySpeedDesc(t *testing.T) {
-	pool := NewCandidatePool(10)
-	results := []*TestResult{
+	pool := NewPool(10)
+	results := []*Entry{
 		testResult("slow", 1.0),
 		testResult("fast", 100.0),
 		testResult("mid", 50.0),
@@ -61,8 +61,8 @@ func TestUpdateSortsBySpeedDesc(t *testing.T) {
 }
 
 func TestUpdateTrimsToMaxLen(t *testing.T) {
-	pool := NewCandidatePool(2)
-	results := []*TestResult{
+	pool := NewPool(2)
+	results := []*Entry{
 		testResult("a", 10.0),
 		testResult("b", 20.0),
 		testResult("c", 30.0),
@@ -81,10 +81,10 @@ func TestUpdateTrimsToMaxLen(t *testing.T) {
 }
 
 func TestUpdateMergesAndReplaces(t *testing.T) {
-	pool := NewCandidatePool(10)
+	pool := NewPool(10)
 
 	// Initial update
-	pool.Update([]*TestResult{
+	pool.Update([]*Entry{
 		testResult("a", 10.0),
 		testResult("b", 20.0),
 	})
@@ -93,7 +93,7 @@ func TestUpdateMergesAndReplaces(t *testing.T) {
 	}
 
 	// Second update: merge with new results, keep sorted
-	pool.Update([]*TestResult{
+	pool.Update([]*Entry{
 		testResult("c", 30.0),
 	})
 	if pool.Len() != 3 {
@@ -106,8 +106,8 @@ func TestUpdateMergesAndReplaces(t *testing.T) {
 }
 
 func TestBestReturnsTopNonExcluded(t *testing.T) {
-	pool := NewCandidatePool(10)
-	pool.Update([]*TestResult{
+	pool := NewPool(10)
+	pool.Update([]*Entry{
 		testResult("a", 10.0),
 		testResult("b", 20.0),
 		testResult("c", 30.0),
@@ -133,9 +133,9 @@ func TestBestReturnsTopNonExcluded(t *testing.T) {
 }
 
 func TestBestExcludesFailedResults(t *testing.T) {
-	pool := NewCandidatePool(10)
-	failResult := &TestResult{Config: testCfg("fail"), Speed: 0, Error: errFake}
-	pool.Update([]*TestResult{
+	pool := NewPool(10)
+	failResult := &Entry{Config: testCfg("fail"), Speed: 0, Error: errFake}
+	pool.Update([]*Entry{
 		failResult,
 		testResult("ok", 5.0),
 	})
@@ -150,8 +150,8 @@ func TestBestExcludesFailedResults(t *testing.T) {
 }
 
 func TestBestAllExcludedReturnsNil(t *testing.T) {
-	pool := NewCandidatePool(10)
-	pool.Update([]*TestResult{
+	pool := NewPool(10)
+	pool.Update([]*Entry{
 		testResult("a", 10.0),
 		testResult("b", 20.0),
 	})
@@ -164,8 +164,8 @@ func TestBestAllExcludedReturnsNil(t *testing.T) {
 }
 
 func TestExcludeIsIdempotent(t *testing.T) {
-	pool := NewCandidatePool(5)
-	pool.Update([]*TestResult{testResult("a", 10.0)})
+	pool := NewPool(5)
+	pool.Update([]*Entry{testResult("a", 10.0)})
 
 	pool.Exclude("vmess://a")
 	pool.Exclude("vmess://a") // no panic, no error
@@ -175,8 +175,8 @@ func TestExcludeIsIdempotent(t *testing.T) {
 }
 
 func TestListReturnsCopy(t *testing.T) {
-	pool := NewCandidatePool(5)
-	pool.Update([]*TestResult{testResult("a", 10.0)})
+	pool := NewPool(5)
+	pool.Update([]*Entry{testResult("a", 10.0)})
 
 	list1 := pool.List()
 	list2 := pool.List()
@@ -189,7 +189,7 @@ func TestListReturnsCopy(t *testing.T) {
 }
 
 func TestConcurrencySafe(t *testing.T) {
-	pool := NewCandidatePool(20)
+	pool := NewPool(20)
 	var wg sync.WaitGroup
 
 	// Concurrent updates
@@ -197,7 +197,7 @@ func TestConcurrencySafe(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			results := []*TestResult{
+			results := []*Entry{
 				testResult("a", float64(n)),
 				testResult("b", float64(n+1)),
 			}

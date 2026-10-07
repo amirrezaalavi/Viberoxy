@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
@@ -137,8 +138,8 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 8443, Raw: "ss://new"}
 	activeTestSlot(t, pool, 0, current)
 
-	candidates := NewCandidatePool(10)
-	candidates.Update([]*TestResult{
+	candidates := cands.NewPool(10)
+	candidates.Update([]*cands.Entry{
 		{Config: current, Speed: 100},
 		{Config: replacement, Speed: 80},
 	})
@@ -215,8 +216,8 @@ func TestHandleDropWAN_NoCandidatesTriggersCycle(t *testing.T) {
 	pool := NewWANPool(1, 10700)
 	current := &proxycfg.ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
 	activeTestSlot(t, pool, 0, current)
-	candidates := NewCandidatePool(1)
-	candidates.Update([]*TestResult{{Config: current, Speed: 50}})
+	candidates := cands.NewPool(1)
+	candidates.Update([]*cands.Entry{{Config: current, Speed: 50}})
 
 	trigger := make(chan struct{}, 1)
 	rec := httptest.NewRecorder()
@@ -247,8 +248,8 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 	pool := NewWANPool(1, 10700)
 	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
-	candidates := NewCandidatePool(1)
-	candidates.Update([]*TestResult{{Config: replacement, Speed: 50}})
+	candidates := cands.NewPool(1)
+	candidates.Update([]*cands.Entry{{Config: replacement, Speed: 50}})
 	started := false
 	opts := DropAndReplaceOptions{
 		Candidates: candidates,
@@ -284,7 +285,7 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 }
 
 func TestHandleDropWAN_RejectsInvalidRequests(t *testing.T) {
-	handler := handleDropWAN(NewWANPool(1, 10700), DropAndReplaceOptions{Candidates: NewCandidatePool(1)}, make(chan struct{}, 1))
+	handler := handleDropWAN(NewWANPool(1, 10700), DropAndReplaceOptions{Candidates: cands.NewPool(1)}, make(chan struct{}, 1))
 	tests := []struct {
 		name   string
 		method string
@@ -320,8 +321,8 @@ func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 	pool := NewWANPool(1, 10700)
 	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
-	candidates := NewCandidatePool(1)
-	candidates.Update([]*TestResult{{Config: replacement, Speed: 50}})
+	candidates := cands.NewPool(1)
+	candidates.Update([]*cands.Entry{{Config: replacement, Speed: 50}})
 	wantErr := errors.New("start failed")
 
 	_, err := pool.DropAndReplace(0, DropAndReplaceOptions{

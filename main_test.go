@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/proxycfg"
 )
 
@@ -568,7 +569,7 @@ func TestRunCycle_PopulatesCandidatePool(t *testing.T) {
 	}
 
 	pool := NewWANPool(1, 20700)
-	candidatePool := NewCandidatePool(50)
+	candidatePool := cands.NewPool(50)
 
 	runCycle(cfg, pool, candidatePool, 60*time.Second)
 
@@ -610,7 +611,7 @@ func TestRunCycle(t *testing.T) {
 
 	pool := NewWANPool(1, 20700)
 
-	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
+	runCycle(cfg, pool, cands.NewPool(50), 60*time.Second)
 
 	if _, err := os.Stat("sorted.txt"); err != nil {
 		t.Errorf("sorted.txt should exist: %v", err)
@@ -657,7 +658,7 @@ func TestRunCycle_WithActiveSlot(t *testing.T) {
 		Raw:      "socks5://127.0.0.1:1080",
 	}
 
-	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
+	runCycle(cfg, pool, cands.NewPool(50), 60*time.Second)
 
 	if _, err := os.Stat("sorted.txt"); err != nil {
 		t.Errorf("sorted.txt should exist: %v", err)
@@ -680,7 +681,7 @@ func TestRunCycle_UpdatesCycleTiming(t *testing.T) {
 	resetCycleTiming()
 
 	before := time.Now()
-	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
+	runCycle(cfg, pool, cands.NewPool(50), 60*time.Second)
 	after := time.Now()
 
 	last, next := cycleTimingSnapshot()
@@ -776,8 +777,8 @@ func TestHandleGetCandidates_EmptyPool(t *testing.T) {
 }
 
 func TestHandleGetCandidates_ReturnsPool(t *testing.T) {
-	p := NewCandidatePool(10)
-	p.Update([]*TestResult{
+	p := cands.NewPool(10)
+	p.Update([]*cands.Entry{
 		{Config: &proxycfg.ProxyConfig{Protocol: "ss", Server: "1.2.3.4", Port: 12345, Raw: "ss://test"}, Speed: 50.0},
 	})
 	candidatePool = p
@@ -804,7 +805,7 @@ func TestHandleGetCandidates_ReturnsPool(t *testing.T) {
 }
 
 func TestHandleGetCandidates_RejectsNonGet(t *testing.T) {
-	candidatePool = NewCandidatePool(5)
+	candidatePool = cands.NewPool(5)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/viberoxy/candidates", nil)
@@ -853,7 +854,7 @@ func TestRunLoop_ManualTriggerRunsCycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runLoop(cfg, pool, NewCandidatePool(50), nil, ctx)
+		runLoop(cfg, pool, cands.NewPool(50), nil, ctx)
 		close(done)
 	}()
 
@@ -901,7 +902,7 @@ func TestRunCycle_EmptyPool(t *testing.T) {
 
 	pool := NewWANPool(1, 20700)
 
-	runCycle(cfg, pool, NewCandidatePool(50), 60*time.Second)
+	runCycle(cfg, pool, cands.NewPool(50), 60*time.Second)
 }
 
 func TestRunCycle_DrainExpired(t *testing.T) {
@@ -933,7 +934,7 @@ func TestRunCycle_DrainExpired(t *testing.T) {
 	pool.Slots[0].State = StateDraining
 	pool.Slots[0].DrainAt = time.Now().Add(-2 * time.Minute)
 
-	runCycle(cfg, pool, NewCandidatePool(50), 10*time.Second)
+	runCycle(cfg, pool, cands.NewPool(50), 10*time.Second)
 }
 
 func TestStartup_Shutdown_WithProxy(t *testing.T) {
