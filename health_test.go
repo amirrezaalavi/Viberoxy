@@ -5,11 +5,12 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"testing"
+	"viberoxy/internal/proxycfg"
 )
 
 func TestReadyzRequiresRoutableWAN_Unhealthy(t *testing.T) {
 	pool := NewWANPool(1, 10700)
-	cfg := &ProxyConfig{Server: "1.2.3.4", Port: 443}
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
 	if err := pool.StartTesting(0, cfg); err != nil {
 		t.Fatalf("StartTesting error: %v", err)
 	}
@@ -43,7 +44,7 @@ func TestReadyzRequiresRoutableWAN_Unhealthy(t *testing.T) {
 
 func TestReadyzRequiresRoutableWAN_Healthy(t *testing.T) {
 	pool := NewWANPool(1, 10700)
-	cfg := &ProxyConfig{Server: "1.2.3.4", Port: 443}
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
 	if err := pool.StartTesting(0, cfg); err != nil {
 		t.Fatalf("StartTesting error: %v", err)
 	}

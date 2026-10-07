@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 // issuedPorts records every port freePort / consecutiveFreePorts hand out in
@@ -258,7 +259,7 @@ func TestHandleConnect_DirectRoute(t *testing.T) {
 	// 503. The direct route must bypass it entirely.
 	pool := NewWANPool(1, 0)
 
-	router := NewRouter(RouteProxyDefault, []string{".127.0.0.1"}, nil)
+	router := proxycfg.NewRouter(proxycfg.RouteProxyDefault, []string{".127.0.0.1"}, nil)
 	proxyPort := freePort(t)
 	proxy := NewProxyServer(proxyPort, pool, router)
 
@@ -302,7 +303,7 @@ func TestHandleConnect_DirectRouteOnlyMatchingHosts(t *testing.T) {
 	// Non-matching host still goes to the WAN path (no active slot -> 503),
 	// proving the router actually gates the decision.
 	pool := NewWANPool(1, 0)
-	router := NewRouter(RouteProxyDefault, []string{".direct.example"}, nil)
+	router := proxycfg.NewRouter(proxycfg.RouteProxyDefault, []string{".direct.example"}, nil)
 	proxyPort := freePort(t)
 	proxy := NewProxyServer(proxyPort, pool, router)
 

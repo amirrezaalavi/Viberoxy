@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 // wanRelay carries the WAN pool and per-connection relay settings shared by
@@ -19,7 +20,7 @@ import (
 // bidirectional pipe -> metrics -> access log.
 type wanRelay struct {
 	pool             *WANPool
-	router           *Router
+	router           *proxycfg.Router
 	AccessLog        bool
 	WanFailThreshold int
 }
@@ -55,9 +56,9 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanIndex int, targetHost string,
 
 // decideRoute returns the egress route for a target host. With no router
 // configured (or an all-proxy router) everything goes through the WAN pool.
-func (r *wanRelay) decideRoute(targetHost string) Route {
+func (r *wanRelay) decideRoute(targetHost string) proxycfg.Route {
 	if r.router == nil {
-		return RouteWAN
+		return proxycfg.RouteWAN
 	}
 	return r.router.Decide(targetHost)
 }

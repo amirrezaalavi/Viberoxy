@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 type ProxyServer struct {
@@ -18,7 +19,7 @@ type ProxyServer struct {
 	wanRelay
 }
 
-func NewProxyServer(port int, pool *WANPool, router ...*Router) *ProxyServer {
+func NewProxyServer(port int, pool *WANPool, router ...*proxycfg.Router) *ProxyServer {
 	p := &ProxyServer{
 		port: port,
 		wanRelay: wanRelay{
@@ -90,7 +91,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Split routing: a direct-route target bypasses the WAN pool entirely.
-	if p.decideRoute(targetHost) == RouteDirect {
+	if p.decideRoute(targetHost) == proxycfg.RouteDirect {
 		conn, err := p.directDial(r.Context(), targetHost, start, "connect")
 		if err != nil {
 			http.Error(w, "Bad Gateway", 502)

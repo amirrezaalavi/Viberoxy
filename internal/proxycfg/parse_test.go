@@ -1,4 +1,4 @@
-package main
+package proxycfg
 
 import (
 	"encoding/base64"

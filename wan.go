@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 type WANState int
@@ -38,7 +39,7 @@ func (s WANState) String() string {
 type WANSlot struct {
 	Index            int
 	State            WANState
-	Config           *ProxyConfig
+	Config           *proxycfg.ProxyConfig
 	Cmd              *exec.Cmd
 	ConfigPath       string
 	ServicePort      int
@@ -81,10 +82,10 @@ var (
 )
 
 // ReplacementTester re-tests a cached candidate before it is promoted.
-type ReplacementTester func(*ProxyConfig, int, time.Duration, string, int64, int) *TestResult
+type ReplacementTester func(*proxycfg.ProxyConfig, int, time.Duration, string, int64, int) *TestResult
 
 // ReplacementStarter starts the persistent xray process for a replacement.
-type ReplacementStarter func(*ProxyConfig, int, ...bool) (*exec.Cmd, string, error)
+type ReplacementStarter func(*proxycfg.ProxyConfig, int, ...bool) (*exec.Cmd, string, error)
 
 // DropAndReplaceOptions contains the candidate source, test settings, and
 // injectable process operations used by DropAndReplace.
@@ -180,7 +181,7 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 	return result, nil
 }
 
-func (p *WANPool) StartTesting(index int, cfg *ProxyConfig) error {
+func (p *WANPool) StartTesting(index int, cfg *proxycfg.ProxyConfig) error {
 	if index < 0 || index >= len(p.Slots) {
 		return errors.New("slot index out of range")
 	}

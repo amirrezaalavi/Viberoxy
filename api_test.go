@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 func TestHandleGetWANSlots(t *testing.T) {
@@ -16,7 +17,7 @@ func TestHandleGetWANSlots(t *testing.T) {
 
 	// Slot 0: empty (default).
 	// Slot 1: active with some state.
-	pool.StartTesting(1, &ProxyConfig{Server: "1.2.3.4", Port: 443})
+	pool.StartTesting(1, &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443})
 	cmd := exec.Command("sleep", "9999")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
@@ -30,7 +31,7 @@ func TestHandleGetWANSlots(t *testing.T) {
 	atomic.StoreInt64(&pool.Slots[1].ConnCount, 7)
 
 	// Slot 2: draining.
-	pool.StartTesting(2, &ProxyConfig{Server: "5.6.7.8", Port: 8443})
+	pool.StartTesting(2, &proxycfg.ProxyConfig{Server: "5.6.7.8", Port: 8443})
 	cmd2 := exec.Command("sleep", "9999")
 	if err := cmd2.Start(); err != nil {
 		t.Fatalf("start cmd2: %v", err)
@@ -118,7 +119,7 @@ func TestHandleGetWANSlots_EmptyPool(t *testing.T) {
 	}
 }
 
-func activeTestSlot(t *testing.T, pool *WANPool, index int, cfg *ProxyConfig) {
+func activeTestSlot(t *testing.T, pool *WANPool, index int, cfg *proxycfg.ProxyConfig) {
 	t.Helper()
 	if err := pool.StartTesting(index, cfg); err != nil {
 		t.Fatalf("StartTesting: %v", err)
@@ -132,8 +133,8 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 	defer metricWanStability.Set(0, "0")
 
 	pool := NewWANPool(1, 10700)
-	current := &ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
-	replacement := &ProxyConfig{Protocol: "ss", Server: "new.example", Port: 8443, Raw: "ss://new"}
+	current := &proxycfg.ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
+	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 8443, Raw: "ss://new"}
 	activeTestSlot(t, pool, 0, current)
 
 	candidates := NewCandidatePool(10)
@@ -142,7 +143,7 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 		{Config: replacement, Speed: 80},
 	})
 
-	var testedConfig, startedConfig *ProxyConfig
+	var testedConfig, startedConfig *proxycfg.ProxyConfig
 	var testPort, startPort int
 	opts := DropAndReplaceOptions{
 		Candidates:      candidates,
@@ -152,7 +153,7 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 		DownloadSize:    1_000_000,
 		StabilityProbes: 2,
 		XrayMux:         true,
-		TestCandidate: func(cfg *ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
+		TestCandidate: func(cfg *proxycfg.ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
 			testedConfig = cfg
 			testPort = port
 			if timeout != 3*time.Second || downloadURL != "https://example.test/file" || downloadSize != 1_000_000 || stabilityProbes != 2 {
@@ -160,7 +161,7 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 			}
 			return &TestResult{Config: cfg, Speed: 73.5, StabilityScore: 1}
 		},
-		StartCandidate: func(cfg *ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
 			startedConfig = cfg
 			startPort = port
 			if len(muxEnabled) != 1 || !muxEnabled[0] {
@@ -212,7 +213,7 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 
 func TestHandleDropWAN_NoCandidatesTriggersCycle(t *testing.T) {
 	pool := NewWANPool(1, 10700)
-	current := &ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
+	current := &proxycfg.ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
 	activeTestSlot(t, pool, 0, current)
 	candidates := NewCandidatePool(1)
 	candidates.Update([]*TestResult{{Config: current, Speed: 50}})
@@ -244,17 +245,17 @@ func TestHandleDropWAN_NoCandidatesTriggersCycle(t *testing.T) {
 
 func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 	pool := NewWANPool(1, 10700)
-	activeTestSlot(t, pool, 0, &ProxyConfig{Raw: "ss://old"})
-	replacement := &ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
+	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
+	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
 	candidates := NewCandidatePool(1)
 	candidates.Update([]*TestResult{{Config: replacement, Speed: 50}})
 	started := false
 	opts := DropAndReplaceOptions{
 		Candidates: candidates,
-		TestCandidate: func(cfg *ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
+		TestCandidate: func(cfg *proxycfg.ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
 			return &TestResult{Config: cfg, Error: errors.New("probe failed")}
 		},
-		StartCandidate: func(cfg *ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
 			started = true
 			return nil, "", nil
 		},
@@ -317,18 +318,18 @@ func TestHandleDropWAN_RejectsInvalidRequests(t *testing.T) {
 
 func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 	pool := NewWANPool(1, 10700)
-	activeTestSlot(t, pool, 0, &ProxyConfig{Raw: "ss://old"})
-	replacement := &ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
+	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
+	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
 	candidates := NewCandidatePool(1)
 	candidates.Update([]*TestResult{{Config: replacement, Speed: 50}})
 	wantErr := errors.New("start failed")
 
 	_, err := pool.DropAndReplace(0, DropAndReplaceOptions{
 		Candidates: candidates,
-		TestCandidate: func(cfg *ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
+		TestCandidate: func(cfg *proxycfg.ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
 			return &TestResult{Config: cfg, Speed: 45}
 		},
-		StartCandidate: func(cfg *ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
 			return nil, "", wantErr
 		},
 	})
