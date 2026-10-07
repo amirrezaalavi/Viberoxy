@@ -2,9 +2,11 @@ package cands
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
+	"time"
 	"viberoxy/internal/proxycfg"
 )
 
@@ -113,7 +115,7 @@ func TestBestReturnsTopNonExcluded(t *testing.T) {
 		testResult("c", 30.0),
 	})
 
-	best := pool.Best()
+	best := pool.Best(nil)
 	if best == nil {
 		t.Fatal("Best() returned nil")
 	}
@@ -123,7 +125,7 @@ func TestBestReturnsTopNonExcluded(t *testing.T) {
 
 	// Exclude the best
 	pool.Exclude(best.Config.Raw)
-	best = pool.Best()
+	best = pool.Best(nil)
 	if best == nil {
 		t.Fatal("Best() returned nil after excluding top")
 	}
@@ -140,7 +142,7 @@ func TestBestExcludesFailedResults(t *testing.T) {
 		testResult("ok", 5.0),
 	})
 
-	best := pool.Best()
+	best := pool.Best(nil)
 	if best == nil {
 		t.Fatal("Best() returned nil")
 	}
@@ -158,7 +160,7 @@ func TestBestAllExcludedReturnsNil(t *testing.T) {
 	pool.Exclude("vmess://a")
 	pool.Exclude("vmess://b")
 
-	if pool.Best() != nil {
+	if pool.Best(nil) != nil {
 		t.Error("expected nil when all candidates excluded")
 	}
 }
@@ -211,7 +213,7 @@ func TestConcurrencySafe(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_ = pool.List()
-			_ = pool.Best()
+			_ = pool.Best(nil)
 			_ = pool.Len()
 		}()
 	}
@@ -238,5 +240,121 @@ func TestConcurrencySafe(t *testing.T) {
 		return list[i].Speed > list[j].Speed
 	}) {
 		t.Error("pool not sorted by speed desc after concurrent updates")
+	}
+}
+
+// TestUpdateDedupesByRawNewestWins is the unit form of RT-09 (F-12): the
+// same config re-tested across cycles must leave exactly ONE entry, the
+// newest result, instead of accumulating a row per cycle.
+func TestUpdateDedupesByRawNewestWins(t *testing.T) {
+	pool := NewPool(10)
+	for _, speed := range []float64{10, 20, 5} {
+		pool.Update([]*Entry{{Config: testCfg("same"), Speed: speed}})
+	}
+	if n := pool.Len(); n != 1 {
+		t.Errorf("pool holds %d entries for one config after 3 updates; want 1", n)
+	}
+	list := pool.List()
+	if len(list) != 1 {
+		t.Fatalf("List returned %d entries; want 1", len(list))
+	}
+	if list[0].Speed != 5 {
+		t.Errorf("kept speed %v; want the newest result (5)", list[0].Speed)
+	}
+}
+
+// T-CAND-01: entries carry TestedAt and expire after DefaultTTL (30 min).
+// Determinism comes both from an explicit TestedAt on the entry and from
+// the injectable clock (p.now).
+func TestEntriesExpireAfterTTL(t *testing.T) {
+	if DefaultTTL != 30*time.Minute {
+		t.Errorf("DefaultTTL = %v, want 30m", DefaultTTL)
+	}
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+
+	pool := NewPool(10)
+	pool.now = func() time.Time { return now }
+	pool.Update([]*Entry{
+		{Config: testCfg("fresh"), Speed: 10, TestedAt: now.Add(-DefaultTTL + time.Minute)},
+		{Config: testCfg("stale"), Speed: 20, TestedAt: now.Add(-DefaultTTL - time.Minute)},
+	})
+	if n := pool.Len(); n != 1 {
+		t.Errorf("pool holds %d entries; want 1 (the stale one must expire after %v)", n, DefaultTTL)
+	}
+	list := pool.List()
+	if len(list) == 1 && list[0].Config.Name != "fresh" {
+		t.Errorf("surviving entry = %q, want fresh", list[0].Config.Name)
+	}
+
+	// Entries without an explicit TestedAt are stamped from the pool clock
+	// and expire when that clock advances past the TTL.
+	auto := NewPool(10)
+	auto.now = func() time.Time { return now }
+	auto.Update([]*Entry{{Config: testCfg("auto"), Speed: 1}})
+	if got := auto.List()[0].TestedAt; !got.Equal(now) {
+		t.Errorf("TestedAt = %v, want stamped from the pool clock (%v)", got, now)
+	}
+	auto.now = func() time.Time { return now.Add(DefaultTTL + time.Second) }
+	if n := auto.Len(); n != 0 {
+		t.Errorf("pool holds %d entries past the TTL; want 0", n)
+	}
+}
+
+// T-CAND-02: Best accepts an exclusion predicate and skips the configs it
+// matches (DropAndReplace uses this to keep already-serving configs out).
+func TestBestHonorsExclusionPredicate(t *testing.T) {
+	pool := NewPool(10)
+	a, b, c := testCfg("a"), testCfg("b"), testCfg("c")
+	pool.Update([]*Entry{
+		{Config: a, Speed: 30},
+		{Config: b, Speed: 20},
+		{Config: c, Speed: 10},
+	})
+
+	best := pool.Best(nil)
+	if best == nil || best.Config != a {
+		t.Fatalf("Best(nil) = %v, want a (top speed)", best)
+	}
+	best = pool.Best(func(cfg *proxycfg.ProxyConfig) bool { return cfg == a || cfg == b })
+	if best == nil || best.Config != c {
+		t.Errorf("Best(excluding a,b) = %v, want c", best)
+	}
+	if pool.Best(func(*proxycfg.ProxyConfig) bool { return true }) != nil {
+		t.Error("Best(excluding everything) = non-nil, want nil")
+	}
+}
+
+// T-CAND-03: a per-server cap keeps one flaky server:port (re-tested under
+// rotating share links) from flooding the pool; the fastest entries win.
+func TestUpdateCapsEntriesPerServer(t *testing.T) {
+	pool := NewPool(50)
+	total := DefaultMaxPerServer + 3
+	for i := 0; i < total; i++ {
+		pool.Update([]*Entry{{
+			Config: &proxycfg.ProxyConfig{
+				Protocol: "ss",
+				Server:   "flaky.example",
+				Port:     8388,
+				Raw:      fmt.Sprintf("ss://flaky-%d", i),
+			},
+			Speed: float64(10 * (i + 1)),
+		}})
+	}
+	if n := pool.Len(); n != DefaultMaxPerServer {
+		t.Errorf("pool holds %d entries for one server:port; want the cap %d", n, DefaultMaxPerServer)
+	}
+	list := pool.List()
+	for i, want := range []float64{80, 70, 60, 50, 40} {
+		if i < len(list) && list[i].Speed != want {
+			t.Errorf("entry %d speed = %v, want %v (fastest %d kept)", i, list[i].Speed, want, DefaultMaxPerServer)
+		}
+	}
+
+	pool.Update([]*Entry{{
+		Config: &proxycfg.ProxyConfig{Protocol: "ss", Server: "other.example", Port: 8388, Raw: "ss://other"},
+		Speed:  1,
+	}})
+	if n := pool.Len(); n != DefaultMaxPerServer+1 {
+		t.Errorf("pool holds %d entries after adding another server:port; want %d", n, DefaultMaxPerServer+1)
 	}
 }

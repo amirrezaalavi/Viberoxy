@@ -341,3 +341,44 @@ func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 		t.Error("slot should remain empty after start failure")
 	}
 }
+
+// F-12 part 2 (T-CAND-02): DropAndReplace must not promote a config that
+// is already serving in another slot (active/draining — the same rule as
+// runCycle's HasServerPort dedupe), nor the config it just dropped, even
+// when those are the fastest entries in the pool.
+func TestWANPoolDropAndReplace_SkipsActiveAndDroppedConfigs(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	dropped := &proxycfg.ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
+	busy := &proxycfg.ProxyConfig{Protocol: "ss", Server: "busy.example", Port: 8443, Raw: "ss://busy"}
+	activeTestSlot(t, pool, 0, dropped)
+	activeTestSlot(t, pool, 1, busy)
+
+	fresh := &proxycfg.ProxyConfig{Protocol: "ss", Server: "free.example", Port: 9000, Raw: "ss://free"}
+	candidates := cands.NewPool(10)
+	candidates.Update([]*cands.Entry{
+		{Config: busy, Speed: 100},   // fastest, but busy.example:8443 already serves slot 1
+		{Config: dropped, Speed: 90}, // the config just dropped from slot 0
+		{Config: fresh, Speed: 80},   // the only eligible one
+	})
+
+	var tested *proxycfg.ProxyConfig
+	_, err := pool.DropAndReplace(0, DropAndReplaceOptions{
+		Candidates: candidates,
+		TestCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ time.Duration, _ string, _ int64, _ int) *TestResult {
+			tested = cfg
+			return &TestResult{Config: cfg, Speed: 42}
+		},
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ ...bool) (*xrayproc.Handle, string, error) {
+			return nil, "", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("DropAndReplace: %v", err)
+	}
+	if tested != fresh {
+		t.Errorf("DropAndReplace promoted %s:%d; want the config not already serving another slot (%s:%d)", tested.Server, tested.Port, fresh.Server, fresh.Port)
+	}
+	if pool.Slots[0].Config != fresh || pool.GetState(0) != StateActive {
+		t.Errorf("slot 0 = %v/%v, want fresh config active", pool.Slots[0].Config, pool.GetState(0))
+	}
+}
