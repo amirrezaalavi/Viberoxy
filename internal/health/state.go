@@ -74,8 +74,17 @@ func destKey(dest string) string {
 // mirrors that onto the path lifecycle state, e.g. Active -> Suspect).
 // Neutral outcomes are ignored entirely.
 func (s *State) Record(now time.Time, dest string, o Outcome) bool {
+	ejected, _ := s.RecordWithReason(now, dest, o)
+	return ejected
+}
+
+// RecordWithReason is Record plus the SPEC-H.3 rule that fired, as a short
+// stable reason string for viberoxy_path_ejections_total (F-16, SPEC-M):
+// "consecutive_distinct" (rule A) or "fail_ratio" (rule B). The reason is
+// meaningful only when ejected is true.
+func (s *State) RecordWithReason(now time.Time, dest string, o Outcome) (ejected bool, reason string) {
 	if o == Neutral {
-		return false // client abort: not evidence about the path
+		return false, "" // client abort: not evidence about the path
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,13 +103,13 @@ func (s *State) Record(now time.Time, dest string, o Outcome) bool {
 	s.decay(now)
 
 	if s.suspect {
-		return false // already ejected; the window keeps recording for diagnostics
+		return false, "" // already ejected; the window keeps recording for diagnostics
 	}
-	if s.ejectRuleHit() {
+	if hit, why := s.ejectRuleHit(); hit {
 		s.eject(now)
-		return true
+		return true, why
 	}
-	return false
+	return false, ""
 }
 
 // NoteCanary folds one canary interval result for this path (SPEC-H.5)
@@ -241,14 +250,15 @@ func (s *State) tailRun() (run, distinct int) {
 	return run, len(seen)
 }
 
-// ejectRuleHit evaluates SPEC-H.3: eject on >= EjectConsecutive
-// consecutive HARD_FAILs across >= EjectDistinctDest distinct destination
-// hosts, OR on >= EjectMinOutcomes window outcomes with a fail ratio >=
-// EjectFailRatio. Caller holds s.mu.
-func (s *State) ejectRuleHit() bool {
+// ejectRuleHit evaluates SPEC-H.3 and reports which rule fired: rule A
+// (">= EjectConsecutive consecutive HARD_FAILs across >= EjectDistinctDest
+// distinct destination HOSTS") returns "consecutive_distinct"; rule B
+// (">= EjectMinOutcomes window outcomes with a fail ratio >= EjectFailRatio")
+// returns "fail_ratio"; no hit returns ("", false). Caller holds s.mu.
+func (s *State) ejectRuleHit() (bool, string) {
 	// Rule A: consecutive failures spanning distinct destinations.
 	if run, distinct := s.tailRun(); run >= EjectConsecutive && distinct >= EjectDistinctDest {
-		return true
+		return true, "consecutive_distinct"
 	}
 	// Rule B: enough outcomes, high enough failure ratio.
 	if len(s.entries) >= EjectMinOutcomes {
@@ -259,10 +269,10 @@ func (s *State) ejectRuleHit() bool {
 			}
 		}
 		if float64(fails)/float64(len(s.entries)) >= EjectFailRatio {
-			return true
+			return true, "fail_ratio"
 		}
 	}
-	return false
+	return false, ""
 }
 
 // eject flips the path out of selection and arms its backoff (SPEC-H.4).

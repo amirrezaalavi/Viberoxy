@@ -259,7 +259,8 @@ const ewmaAlpha = 0.25
 // returns true exactly when this outcome newly EJECTS the path — the
 // caller then sees the path state move Active -> Suspect (not-selected);
 // Draining/Dead states are never overwritten, drain policy belongs to the
-// drain task.
+// drain task. An ejection also notifies the observer (SPEC-M) with the
+// SPEC-H.3 rule that fired.
 func (p *Path) RecordOutcome(now time.Time, dest string, o health.Outcome) bool {
 	if p == nil {
 		return false
@@ -270,9 +271,12 @@ func (p *Path) RecordOutcome(now time.Time, dest string, o health.Outcome) bool 
 	case health.HardFail:
 		p.RecordFailure()
 	}
-	ejected := p.hc.Record(now, dest, o)
+	ejected, reason := p.hc.RecordWithReason(now, dest, o)
 	if ejected && p.GetState() == Active {
 		p.SetState(Suspect)
+	}
+	if ejected {
+		notify(Event{Kind: EventEjection, Path: p, Reason: reason})
 	}
 	return ejected
 }
@@ -325,13 +329,14 @@ func (p *Path) HealthSnapshot(now time.Time) health.Snapshot {
 // RecordHealth folds one observation into the path's performance EWMAs:
 // the time-to-first-byte observed for this connection (0 = unknown) and
 // the goodput in bits per second. Both are inputs to the later
-// scheduler/selector (SPEC-S); nothing selects on them yet.
+// scheduler/selector (SPEC-S); nothing selects on them yet. A non-zero
+// sample also notifies the observer (SPEC-M: viberoxy_path_ttfb_seconds),
+// once per sample, from the caller's values — never re-observed later.
 func (p *Path) RecordHealth(ttfb time.Duration, goodputBps float64) {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if ttfb > 0 {
 		if p.ewmaTTFB == 0 {
 			p.ewmaTTFB = ttfb
@@ -341,6 +346,11 @@ func (p *Path) RecordHealth(ttfb time.Duration, goodputBps float64) {
 	}
 	if goodputBps > 0 {
 		p.goodputBps = ewmaAlpha*goodputBps + (1-ewmaAlpha)*p.goodputBps
+	}
+	p.mu.Unlock()
+
+	if ttfb > 0 || goodputBps > 0 {
+		notify(Event{Kind: EventSample, Path: p, TTFB: ttfb, GoodputBps: goodputBps})
 	}
 }
 

@@ -523,6 +523,11 @@ func (p *WANPool) UnDrainIfRecovered(index int, halfOpenRecovery bool) bool {
 	if cur.GetState() != path.Draining {
 		return false // retired/vacant generation: nothing to bring back
 	}
+	// The drain ends HERE instead of at the reap: record how long it
+	// lasted (SPEC-M viberoxy_drain_seconds) while DrainAt is intact.
+	if !slot.DrainAt.IsZero() {
+		metricDrainSeconds.Observe(time.Since(slot.DrainAt).Seconds())
+	}
 	slot.State = StateActive
 	slot.DrainAt = time.Time{}
 	slot.drainReason = DrainReplace
@@ -908,6 +913,7 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 		}
 	}
 	if best != nil {
+		metricSelectionLastResort.Inc()
 		return best
 	}
 
@@ -930,6 +936,9 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 				bestCount = c
 			}
 		}
+	}
+	if best != nil {
+		metricSelectionLastResort.Inc()
 	}
 	return best
 }
@@ -969,6 +978,23 @@ func (p *WANPool) DrainExpired(maxDrain time.Duration) []int {
 		}
 	}
 	return result
+}
+
+// observeDrainDuration records how long slot index has been draining
+// (SPEC-M viberoxy_drain_seconds). No-op for out-of-range indices and for
+// a slot that never started draining (zero DrainAt).
+func (p *WANPool) observeDrainDuration(index int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	drainAt := slot.DrainAt
+	slot.mu.Unlock()
+	if drainAt.IsZero() {
+		return
+	}
+	metricDrainSeconds.Observe(time.Since(drainAt).Seconds())
 }
 
 func (p *WANPool) HealthCheckAll() []int {

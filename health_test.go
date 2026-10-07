@@ -74,3 +74,33 @@ func TestReadyzRequiresRoutableWAN_Healthy(t *testing.T) {
 		t.Errorf("got body %q, want %q", rec.Body.String(), "ready\n")
 	}
 }
+
+// TestReadyz_DrainingOnlyPoolNotReady pins D-03: draining means "no NEW
+// connections", so a pool whose only live paths are draining is NOT ready —
+// /readyz is 200 iff at least one ACTIVE routable path exists.
+func TestReadyz_DrainingOnlyPoolNotReady(t *testing.T) {
+	pool := NewWANPool(1, 10700)
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
+	if err := pool.StartTesting(0, cfg); err != nil {
+		t.Fatalf("StartTesting error: %v", err)
+	}
+	cmd := exec.Command("sleep", "9999")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start cmd: %v", err)
+	}
+	defer cmd.Process.Kill()
+	if err := pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/test-config.json"), "/tmp/test-config.json"); err != nil {
+		t.Fatalf("SetActive error: %v", err)
+	}
+	if err := pool.MarkDraining(0); err != nil {
+		t.Fatalf("MarkDraining error: %v", err)
+	}
+
+	handler := NewObservabilityHandler(pool)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("readyz (draining-only pool) = %d, want %d; a draining path takes no new connections",
+			rec.Code, http.StatusServiceUnavailable)
+	}
+}
