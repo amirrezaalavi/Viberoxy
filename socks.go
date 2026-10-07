@@ -137,7 +137,9 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 			return
 		}
 		clientConn.SetReadDeadline(time.Time{})
-		s.directRelay(targetHost, start, "socks5", clientConn, upstream)
+		// No hijack peek here: the SOCKS5 handshake reads bytes straight off
+		// clientConn (no bufio), so there is no buffered prefix to replay.
+		s.directRelay(targetHost, start, "socks5", clientConn, upstream, nil)
 		return
 	}
 
@@ -168,7 +170,7 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	// Handshake complete: drop the deadline before relaying.
 	clientConn.SetReadDeadline(time.Time{})
 
-	s.relayThroughWAN(wanIndex, targetHost, start, "socks5", clientConn, upstream)
+	s.relayThroughWAN(wanIndex, targetHost, start, "socks5", clientConn, upstream, nil)
 }
 
 // writeSocksReply sends a fixed-shape SOCKS5 reply: VER 0x05, REP, RSV 0x00,
