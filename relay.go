@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"time"
+	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/relayio"
 )
@@ -48,30 +49,37 @@ func (r *wanRelay) relayOptions(byteLabel string) relayio.Options {
 	}
 }
 
-// beginWAN reserves a connection on the chosen slot: it bumps the slot's
-// connection counter and records the per-protocol connection metric. The
-// caller must defer endWAN immediately after a successful beginWAN.
-func (r *wanRelay) beginWAN(wanIndex int, proto string) {
-	r.pool.IncConnCount(wanIndex)
-	metricProxyConnections.Inc(strconv.Itoa(wanIndex), proto)
+// beginWAN reserves a connection on the path selected for this connection:
+// it bumps that path's inflight counter and records the per-protocol
+// connection metric. The path — not the slot index — is the accounting
+// identity, and the caller must defer endWAN(wanPath) immediately after a
+// successful beginWAN, passing the very same pointer.
+func (r *wanRelay) beginWAN(wanPath *path.Path, proto string) {
+	wanPath.Reserve()
+	metricProxyConnections.Inc(strconv.Itoa(wanPath.Slot), proto)
 }
 
-// endWAN releases a connection previously reserved with beginWAN.
-func (r *wanRelay) endWAN(wanIndex int) {
-	r.pool.DecConnCount(wanIndex)
+// endWAN releases a connection previously reserved with beginWAN. It always
+// releases the path the handler holds, never the slot's current occupant: a
+// handler that outlives a reset/replacement can only ever touch its own
+// generation's counters (the F-04 ABA guard).
+func (r *wanRelay) endWAN(wanPath *path.Path) {
+	wanPath.Release()
 }
 
 // dialWAN connects to the slot's local SOCKS5 listener and completes the
-// SOCKS5 handshake to targetHost. On failure it records the slot failure,
-// writes the access-log line and returns the error; the caller maps the
-// error to its protocol-specific reply (HTTP 502 vs SOCKS5 REP 0x01).
-func (r *wanRelay) dialWAN(ctx context.Context, wanIndex int, targetHost string, start time.Time, proto string) (net.Conn, error) {
-	socksAddr := fmt.Sprintf("127.0.0.1:%d", r.pool.Slots[wanIndex].ServicePort)
+// SOCKS5 handshake to targetHost. On failure it records the failure on the
+// held path, writes the access-log line and returns the error; the caller maps
+// the error to its protocol-specific reply (HTTP 502 vs SOCKS5 REP 0x01).
+func (r *wanRelay) dialWAN(ctx context.Context, wanPath *path.Path, targetHost string, start time.Time, proto string) (net.Conn, error) {
+	// The service port is read from the slot: it is fixed for the slot's
+	// lifetime, so the held path and the occupant behind it always agree.
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", r.pool.Slots[wanPath.Slot].ServicePort)
 	conn, err := socks5Dial(ctx, socksAddr, targetHost)
 	if err != nil {
-		r.pool.RecordFailure(wanIndex)
-		slog.Warn("socks5 dial failed", "wan", wanIndex, "target", targetHost, "error", err)
-		r.logAccess(targetHost, wanIndex, 0, 0, start, "err", proto, "wan")
+		wanPath.RecordFailure()
+		slog.Warn("socks5 dial failed", "wan", wanPath.Slot, "target", targetHost, "error", err)
+		r.logAccess(targetHost, wanPath.Slot, 0, 0, start, "err", proto, "wan")
 		return nil, err
 	}
 	return conn, nil
@@ -147,13 +155,15 @@ func (r *wanRelay) logAccess(target string, wan int, up, down int64, start time.
 
 // relayThroughWAN pipes clientConn and the upstream connection through
 // relayio.Splice until both directions finish (half-close preserved, idle and
-// handshake timeouts enforced), then records latency metrics, resets the
-// slot's failure counter and writes the access-log line. Byte metrics are
-// recorded incrementally via relayOptions' OnBytes callback. Blocking; the
-// caller owns both conns.
-func (r *wanRelay) relayThroughWAN(wanIndex int, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn, clientSrc io.Reader) {
-	stats := relayio.Splice(clientConn, upstream, clientSrc, r.relayOptions(strconv.Itoa(wanIndex)))
+// handshake timeouts enforced), then records latency metrics, credits success
+// to the held path and writes the access-log line. Byte metrics are recorded
+// incrementally via relayOptions' OnBytes callback. Blocking; the caller owns
+// both conns.
+func (r *wanRelay) relayThroughWAN(wanPath *path.Path, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn, clientSrc io.Reader) {
+	stats := relayio.Splice(clientConn, upstream, clientSrc, r.relayOptions(strconv.Itoa(wanPath.Slot)))
 	metricProxyLatency.Observe(time.Since(start).Seconds())
-	r.pool.RecordSuccess(wanIndex)
-	r.logAccess(targetHost, wanIndex, stats.Up, stats.Down, start, "ok", proto, "wan")
+	// Success is credited to the path this connection ran on — the same
+	// generation it reserved on — never to whatever occupies the slot now.
+	wanPath.RecordSuccess()
+	r.logAccess(targetHost, wanPath.Slot, stats.Up, stats.Down, start, "ok", proto, "wan")
 }

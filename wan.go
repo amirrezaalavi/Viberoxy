@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
@@ -37,15 +38,21 @@ func (s WANState) String() string {
 }
 
 type WANSlot struct {
-	Index            int
-	State            WANState
-	Config           *proxycfg.ProxyConfig
-	Cmd              *xrayproc.Handle
-	ConfigPath       string
-	ServicePort      int
-	ConnCount        int64
-	ConsecutiveFails int64
-	SpeedMbps        float64
+	Index       int
+	State       WANState
+	Config      *proxycfg.ProxyConfig
+	Cmd         *xrayproc.Handle
+	ConfigPath  string
+	ServicePort int
+	// Current is the identity of the xray process occupying this slot right
+	// now: one *path.Path per occupant lifetime, swapped (never reused) on
+	// every (re)activation. Handlers reserve and release through the *Path
+	// they held at connection start — never through this slot index — so
+	// events left over from a previous occupant can never reach the current
+	// one (F-04). The pointer is never nil: NewWANPool and ResetEmpty always
+	// install one, vacant when the slot is empty.
+	Current   *atomic.Pointer[path.Path]
+	SpeedMbps float64
 	// StabilityScore ranks upstream exit churn (distinct exit IPs minus
 	// 1; 0 = stable or never probed). Used for replacement preference
 	// only — a churny slot is never rejected on this alone.
@@ -104,11 +111,16 @@ type DropAndReplaceOptions struct {
 func NewWANPool(count int, basePort int) *WANPool {
 	slots := make([]*WANSlot, count)
 	for i := 0; i < count; i++ {
-		slots[i] = &WANSlot{
+		slot := &WANSlot{
 			Index:       i,
 			State:       StateEmpty,
+			Current:     new(atomic.Pointer[path.Path]),
 			ServicePort: basePort + i,
 		}
+		// Every slot starts with its own vacant generation, so Current is
+		// never nil and even an empty slot accounts for itself.
+		slot.Current.Store(path.NewVacant(i, basePort+i))
+		slots[i] = slot
 	}
 	return &WANPool{Slots: slots, BasePort: basePort}
 }
@@ -209,6 +221,10 @@ func (p *WANPool) SetActive(index int, cmd *xrayproc.Handle, configPath string) 
 	slot.State = StateActive
 	slot.Cmd = cmd
 	slot.ConfigPath = configPath
+	// (Re)activation mints a brand-new generation: the replacement gets its
+	// own Path with a fresh ID, so reservations and credits held on the
+	// previous occupant stay with that occupant.
+	slot.Current.Store(path.New(slot.Config, cmd, index, slot.ServicePort))
 	return nil
 }
 
@@ -224,6 +240,9 @@ func (p *WANPool) MarkDraining(index int) error {
 	}
 	slot.State = StateDraining
 	slot.DrainAt = time.Now()
+	if cur := slot.Current.Load(); cur != nil {
+		cur.SetState(path.Draining)
+	}
 	return nil
 }
 
@@ -233,12 +252,18 @@ func (p *WANPool) ResetEmpty(index int) error {
 	}
 	slot := p.Slots[index]
 	slot.mu.Lock()
+	old := slot.Current.Load()
 	cmd := slot.Cmd
 	configPath := slot.ConfigPath
 	slot.mu.Unlock()
 
+	// Stop the retired occupant. For an activated slot old.Proc and cmd are
+	// the same handle, so the process and its temp config are torn down
+	// exactly as before the Path split.
 	if cmd != nil {
 		StopXray(cmd, configPath)
+	} else if old != nil && old.Proc != nil {
+		_ = old.Stop()
 	}
 
 	slot.mu.Lock()
@@ -246,13 +271,18 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.Config = nil
 	slot.Cmd = nil
 	slot.ConfigPath = ""
-	slot.ConnCount = 0
-	slot.ConsecutiveFails = 0
 	slot.SpeedMbps = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
 	slot.ExitIP = ""
 	slot.LastProbe = time.Time{}
+	// Retire the old generation and swap in a fresh vacant one. The retired
+	// Path keeps its own counters for handlers still in flight — they can no
+	// longer touch whatever occupies this slot next (F-04).
+	if old != nil {
+		old.SetState(path.Dead)
+	}
+	slot.Current.Store(path.NewVacant(index, slot.ServicePort))
 	slot.mu.Unlock()
 	return nil
 }
@@ -325,7 +355,7 @@ func (p *WANPool) HealthyActiveCount(thresholds ...int) int {
 		for _, slot := range p.Slots {
 			slot.mu.Lock()
 			s := slot.State
-			fails := atomic.LoadInt64(&slot.ConsecutiveFails)
+			fails := slot.Current.Load().ConsecutiveFails()
 			slot.mu.Unlock()
 			if s == StateActive || s == StateDraining {
 				if fails < int64(threshold) {
@@ -351,20 +381,23 @@ func (p *WANPool) HealthyActiveCount(thresholds ...int) int {
 	return count
 }
 
-// RecordFailure atomically increments a slot's consecutive-failure counter.
+// RecordFailure atomically increments the consecutive-failure counter of the
+// path currently occupying the slot: a probe targets the xray listening on
+// that service port right now, and its credit must not outlive it.
 func (p *WANPool) RecordFailure(index int) {
 	if index < 0 || index >= len(p.Slots) {
 		return
 	}
-	atomic.AddInt64(&p.Slots[index].ConsecutiveFails, 1)
+	p.Slots[index].Current.Load().RecordFailure()
 }
 
-// RecordSuccess atomically resets a slot's consecutive-failure counter.
+// RecordSuccess atomically resets the consecutive-failure counter of the
+// path currently occupying the slot.
 func (p *WANPool) RecordSuccess(index int) {
 	if index < 0 || index >= len(p.Slots) {
 		return
 	}
-	atomic.StoreInt64(&p.Slots[index].ConsecutiveFails, 0)
+	p.Slots[index].Current.Load().RecordSuccess()
 }
 
 // SlotConsecutiveFails returns the current consecutive-failure count for a
@@ -373,7 +406,7 @@ func (p *WANPool) SlotConsecutiveFails(index int) int64 {
 	if index < 0 || index >= len(p.Slots) {
 		return 0
 	}
-	return atomic.LoadInt64(&p.Slots[index].ConsecutiveFails)
+	return p.Slots[index].Current.Load().ConsecutiveFails()
 }
 
 // SlotSpeedMbps returns the last measured speed for a slot (0 if unknown).
@@ -457,8 +490,9 @@ func (p *WANPool) RoutableCount(threshold int) int {
 		slot.mu.Lock()
 		s := slot.State
 		cmd := slot.Cmd
+		cur := slot.Current.Load()
 		slot.mu.Unlock()
-		fails := atomic.LoadInt64(&slot.ConsecutiveFails)
+		fails := cur.ConsecutiveFails()
 		if s == StateActive || s == StateDraining {
 			if fails < int64(threshold) && cmd != nil {
 				count++
@@ -468,77 +502,72 @@ func (p *WANPool) RoutableCount(threshold int) int {
 	return count
 }
 
-// GetLeastLoaded returns the index of the active/draining slot with the
-// fewest connections. Slots whose ConsecutiveFails has reached the given
-// threshold are skipped as unhealthy; with no argument the default
-// DefaultFailThreshold (2) applies.
+// GetLeastLoaded returns the *path.Path of the active/draining slot with the
+// fewest connections — nil when no active/draining slot exists. Slots whose
+// current path's ConsecutiveFails has reached the given threshold are skipped
+// as unhealthy; with no argument the default DefaultFailThreshold (2) applies.
+//
+// The selection rule itself is unchanged: least-loaded wins, ties resolve to
+// the lowest slot index, load comes from the current occupant's clamped
+// connection count. What the callers hold is no longer the index but the
+// returned *Path: the handler reserves and releases that exact generation for
+// the connection's lifetime, which is what keeps slot-index accounting (and
+// the F-04 ABA bug) out of the relay.
 //
 // If no routable slot exists (all active/draining slots are over the
 // threshold), it falls back to the least-loaded among all active/draining
 // slots and logs a warning so the degradation is visible. This prevents
 // the proxy from blackholing traffic when every WAN is degraded but at
 // least one is still alive.
-func (p *WANPool) GetLeastLoaded(thresholds ...int) int {
+func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
 	threshold := DefaultFailThreshold
 	if len(thresholds) > 0 {
 		threshold = thresholds[0]
 	}
 
-	best := -1
+	var best *path.Path
 	var bestCount int64 = -1
 
 	// First pass: pick the least-loaded among routable slots.
-	for i, slot := range p.Slots {
+	for _, slot := range p.Slots {
 		slot.mu.Lock()
 		s := slot.State
-		c := atomic.LoadInt64(&slot.ConnCount)
+		cur := slot.Current.Load()
 		cmd := slot.Cmd
 		slot.mu.Unlock()
-		fails := atomic.LoadInt64(&slot.ConsecutiveFails)
+		fails := cur.ConsecutiveFails()
 		if s == StateActive || s == StateDraining {
 			if fails < int64(threshold) && cmd != nil {
-				if best == -1 || c < bestCount {
-					best = i
+				c := cur.Conns()
+				if best == nil || c < bestCount {
+					best = cur
 					bestCount = c
 				}
 			}
 		}
 	}
 
-	if best != -1 {
+	if best != nil {
 		return best
 	}
 
 	// Fallback: no routable slot. Pick the least-loaded among ALL
 	// active/draining slots (even over threshold) to avoid blackhole.
 	slog.Warn("no routable WAN: falling back to degraded slots", "threshold", threshold)
-	for i, slot := range p.Slots {
+	for _, slot := range p.Slots {
 		slot.mu.Lock()
 		s := slot.State
-		c := atomic.LoadInt64(&slot.ConnCount)
+		cur := slot.Current.Load()
 		slot.mu.Unlock()
 		if s == StateActive || s == StateDraining {
-			if best == -1 || c < bestCount {
-				best = i
+			c := cur.Conns()
+			if best == nil || c < bestCount {
+				best = cur
 				bestCount = c
 			}
 		}
 	}
 	return best
-}
-
-func (p *WANPool) IncConnCount(index int) {
-	if index < 0 || index >= len(p.Slots) {
-		return
-	}
-	atomic.AddInt64(&p.Slots[index].ConnCount, 1)
-}
-
-func (p *WANPool) DecConnCount(index int) {
-	if index < 0 || index >= len(p.Slots) {
-		return
-	}
-	atomic.AddInt64(&p.Slots[index].ConnCount, -1)
 }
 
 func (p *WANPool) DrainExpired(graceDuration time.Duration) []int {

@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
@@ -85,6 +86,8 @@ func rtMarkRoutable(p *WANPool, i, port int) {
 	s.State = StateActive
 	s.ServicePort = port
 	s.Cmd = xrayproc.Wrap(&exec.Cmd{}, "") // non-nil => routable; no real process needed
+	// Stand-in for SetActive: an occupied slot owns its own Path generation.
+	s.Current.Store(path.New(s.Config, s.Cmd, i, s.ServicePort))
 	s.mu.Unlock()
 }
 
@@ -136,9 +139,10 @@ func TestRed_RT01_DrainingSlotNotSelected(t *testing.T) {
 	if err := p.MarkDraining(0); err != nil {
 		t.Fatal(err)
 	}
-	p.IncConnCount(1)
-	p.IncConnCount(1) // slot 1 busier, slot 0 idle-but-draining
-	if got := p.GetLeastLoaded(2); got != 1 {
+	busy := p.Slots[1].Current.Load()
+	busy.Reserve()
+	busy.Reserve() // slot 1 busier, slot 0 idle-but-draining
+	if got := slotOf(p.GetLeastLoaded(2)); got != 1 {
 		t.Fatalf("GetLeastLoaded picked draining slot %d; want active slot 1", got)
 	}
 }
@@ -190,14 +194,18 @@ func TestRed_RT03_ConnCountNeverNegative(t *testing.T) {
 	p := NewWANPool(1, 20000)
 	rtMarkRoutable(p, 0, 20000)
 	p.Slots[0].Cmd = nil
+	r := &wanRelay{pool: p}
+	old := p.Slots[0].Current.Load() // the path the in-flight handlers hold
 	for i := 0; i < 3; i++ {
-		p.IncConnCount(0)
+		r.beginWAN(old, "test") // 3 connections reserved on the old xray
 	}
-	p.ResetEmpty(0) // replacement / reap while handlers are still in flight
+	p.ResetEmpty(0)             // replacement / reap while handlers are still in flight
+	rtMarkRoutable(p, 0, 20000) // the replacement occupies the slot: a NEW Path
+	cur := p.Slots[0].Current.Load()
 	for i := 0; i < 3; i++ {
-		p.DecConnCount(0) // the old handlers finish afterwards
+		r.endWAN(old) // the old handlers finish afterwards
 	}
-	if n := atomic.LoadInt64(&p.Slots[0].ConnCount); n < 0 {
+	if n := cur.Inflight.Load(); n < 0 {
 		t.Fatalf("ConnCount = %d; late decrements from old handlers leaked into the new WAN", n)
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"viberoxy/internal/auth"
 	"viberoxy/internal/proxycfg"
@@ -273,7 +272,9 @@ func handleGetCandidates() http.HandlerFunc {
 	}
 }
 
-// wanSlotInfo returns a consistent JSON view of one slot.
+// wanSlotInfo returns a consistent JSON view of one slot. Connection and
+// failure counters come from the path currently occupying the slot, so the
+// view never mixes generations.
 func wanSlotInfo(pool *WANPool, index int) WANSlotInfo {
 	slot := pool.Slots[index]
 	slot.mu.Lock()
@@ -281,16 +282,17 @@ func wanSlotInfo(pool *WANPool, index int) WANSlotInfo {
 	speed := slot.SpeedMbps
 	exitIP := slot.ExitIP
 	lastProbe := slot.LastProbe
+	cur := slot.Current.Load()
 	slot.mu.Unlock()
 
 	return WANSlotInfo{
 		Index:            index,
 		State:            state.String(),
 		SpeedMbps:        speed,
-		Conns:            atomic.LoadInt64(&slot.ConnCount),
+		Conns:            cur.Conns(),
 		ExitIP:           exitIP,
 		LastProbe:        lastProbe.Format(time.RFC3339),
-		ConsecutiveFails: atomic.LoadInt64(&slot.ConsecutiveFails),
+		ConsecutiveFails: cur.ConsecutiveFails(),
 	}
 }
 

@@ -3,12 +3,41 @@ package main
 import (
 	"os/exec"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
+	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
+
+// slotOf maps a selection result to the slot index the assertions below use
+// (-1 when no path was selected), keeping index-worded expectations readable.
+func slotOf(p *path.Path) int {
+	if p == nil {
+		return -1
+	}
+	return p.Slot
+}
+
+// slotInflight reads the raw inflight counter of the path currently occupying
+// a slot. Connection accounting lives on the Path now, not on the slot.
+func slotInflight(pool *WANPool, index int) int64 {
+	return pool.Slots[index].Current.Load().Inflight.Load()
+}
+
+// setSlotInflight seeds the inflight counter of the slot's current path, the
+// way tests used to seed slot.ConnCount directly.
+func setSlotInflight(pool *WANPool, index int, n int64) {
+	pool.Slots[index].Current.Load().Inflight.Store(n)
+}
+
+// setFails records n consecutive failures on the slot's current path, the way
+// tests used to seed slot.ConsecutiveFails directly.
+func setFails(pool *WANPool, index, n int) {
+	for i := 0; i < n; i++ {
+		pool.RecordFailure(index)
+	}
+}
 
 func TestNewWANPool(t *testing.T) {
 	pool := NewWANPool(4, 10700)
@@ -139,7 +168,8 @@ func TestResetEmpty(t *testing.T) {
 	cmd.Start()
 	defer cmd.Process.Kill()
 	pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/test-config.json"), "/tmp/test-config.json")
-	pool.IncConnCount(0)
+	before := pool.Slots[0].Current.Load()
+	before.Reserve()
 
 	if err := pool.ResetEmpty(0); err != nil {
 		t.Fatalf("ResetEmpty error: %v", err)
@@ -158,8 +188,13 @@ func TestResetEmpty(t *testing.T) {
 	if slot.ConfigPath != "" {
 		t.Error("configPath should be empty")
 	}
-	if atomic.LoadInt64(&slot.ConnCount) != 0 {
+	if slot.Current.Load().Inflight.Load() != 0 {
 		t.Error("ConnCount should be 0")
+	}
+	// The reset installed a NEW generation: the retired Path (with the
+	// reservation still on it) is no longer the slot's current occupant.
+	if after := slot.Current.Load(); after == before || after.ID == before.ID {
+		t.Errorf("ResetEmpty must swap in a fresh Path, got the same generation ID %d", after.ID)
 	}
 	if !slot.DrainAt.IsZero() {
 		t.Error("DrainAt should be zero")
@@ -303,10 +338,10 @@ func TestGetLeastLoaded(t *testing.T) {
 		pool.SetActive(i, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	}
 
-	atomic.StoreInt64(&pool.Slots[0].ConnCount, 10)
-	atomic.StoreInt64(&pool.Slots[1].ConnCount, 3)
+	setSlotInflight(pool, 0, 10)
+	setSlotInflight(pool, 1, 3)
 
-	idx := pool.GetLeastLoaded()
+	idx := slotOf(pool.GetLeastLoaded())
 	if idx != 1 {
 		t.Errorf("expected slot 1 (3 conns), got %d", idx)
 	}
@@ -314,7 +349,7 @@ func TestGetLeastLoaded(t *testing.T) {
 
 func TestGetLeastLoaded_AllEmpty(t *testing.T) {
 	pool := NewWANPool(3, 10700)
-	idx := pool.GetLeastLoaded()
+	idx := slotOf(pool.GetLeastLoaded())
 	if idx != -1 {
 		t.Errorf("expected -1, got %d", idx)
 	}
@@ -333,23 +368,23 @@ func TestGetLeastLoaded_SkipsUnhealthy(t *testing.T) {
 	}
 
 	// Slot 0 is unhealthy (2 fails >= threshold 2) despite fewer connections.
-	atomic.StoreInt64(&pool.Slots[0].ConnCount, 1)
-	atomic.StoreInt64(&pool.Slots[1].ConnCount, 5)
+	setSlotInflight(pool, 0, 1)
+	setSlotInflight(pool, 1, 5)
 	pool.RecordFailure(0)
 	pool.RecordFailure(0)
 
-	if idx := pool.GetLeastLoaded(2); idx != 1 {
+	if idx := slotOf(pool.GetLeastLoaded(2)); idx != 1 {
 		t.Errorf("GetLeastLoaded(2) = %d, want 1 (skip unhealthy slot 0)", idx)
 	}
 
 	// The default threshold (2) behaves identically.
-	if idx := pool.GetLeastLoaded(); idx != 1 {
+	if idx := slotOf(pool.GetLeastLoaded()); idx != 1 {
 		t.Errorf("GetLeastLoaded() = %d, want 1 (default threshold)", idx)
 	}
 
 	// A successful probe clears slot 0, which then wins on connection count.
 	pool.RecordSuccess(0)
-	if idx := pool.GetLeastLoaded(2); idx != 0 {
+	if idx := slotOf(pool.GetLeastLoaded(2)); idx != 0 {
 		t.Errorf("GetLeastLoaded(2) after recovery = %d, want 0", idx)
 	}
 }
@@ -373,7 +408,7 @@ func TestGetLeastLoaded_AllUnhealthy_FallsBack(t *testing.T) {
 	// With the new fallback semantics, GetLeastLoaded never returns -1
 	// when active slots exist — it picks the least-loaded among all
 	// active/draining slots even if all are over the threshold.
-	idx := pool.GetLeastLoaded(2)
+	idx := slotOf(pool.GetLeastLoaded(2))
 	if idx != 0 {
 		t.Errorf("GetLeastLoaded(2) = %d, want 0 (fallback to least-loaded)", idx)
 	}
@@ -393,26 +428,29 @@ func TestGetLeastLoaded_ThresholdOne(t *testing.T) {
 
 	// With threshold 1, a single failure excludes a slot.
 	pool.RecordFailure(0)
-	if idx := pool.GetLeastLoaded(1); idx != 1 {
+	if idx := slotOf(pool.GetLeastLoaded(1)); idx != 1 {
 		t.Errorf("GetLeastLoaded(1) = %d, want 1", idx)
 	}
 }
 
+// TestIncDecConnCount pins reserve/release accounting on the slot's Path —
+// connection counts no longer live on the slot itself.
 func TestIncDecConnCount(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	pool.IncConnCount(0)
-	pool.IncConnCount(0)
-	pool.IncConnCount(0)
-	if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c != 3 {
+	pth := pool.Slots[0].Current.Load()
+	pth.Reserve()
+	pth.Reserve()
+	pth.Reserve()
+	if c := pth.Inflight.Load(); c != 3 {
 		t.Errorf("expected 3, got %d", c)
 	}
-	pool.DecConnCount(0)
-	if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c != 2 {
+	pth.Release()
+	if c := pth.Inflight.Load(); c != 2 {
 		t.Errorf("expected 2, got %d", c)
 	}
-	pool.DecConnCount(0)
-	pool.DecConnCount(0)
-	if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c != 0 {
+	pth.Release()
+	pth.Release()
+	if c := pth.Inflight.Load(); c != 0 {
 		t.Errorf("expected 0, got %d", c)
 	}
 }
@@ -510,6 +548,7 @@ func TestShutdownAll(t *testing.T) {
 
 func TestConcurrentConnCount(t *testing.T) {
 	pool := NewWANPool(1, 10700)
+	pth := pool.Slots[0].Current.Load()
 	var wg sync.WaitGroup
 	n := 100
 
@@ -517,12 +556,12 @@ func TestConcurrentConnCount(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			pool.IncConnCount(0)
+			pth.Reserve()
 		}()
 	}
 	wg.Wait()
 
-	if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c != int64(n) {
+	if c := pth.Inflight.Load(); c != int64(n) {
 		t.Errorf("expected %d, got %d", n, c)
 	}
 
@@ -530,12 +569,12 @@ func TestConcurrentConnCount(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			pool.DecConnCount(0)
+			pth.Release()
 		}()
 	}
 	wg.Wait()
 
-	if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c != int64(n/2) {
+	if c := pth.Inflight.Load(); c != int64(n/2) {
 		t.Errorf("expected %d, got %d", n/2, c)
 	}
 }
@@ -567,19 +606,19 @@ func TestRecordFailureSuccess(t *testing.T) {
 
 	pool.RecordFailure(0)
 	pool.RecordFailure(0)
-	if f := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); f != 2 {
+	if f := pool.SlotConsecutiveFails(0); f != 2 {
 		t.Errorf("ConsecutiveFails = %d, want 2", f)
 	}
 
 	pool.RecordSuccess(0)
-	if f := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); f != 0 {
+	if f := pool.SlotConsecutiveFails(0); f != 0 {
 		t.Errorf("ConsecutiveFails after success = %d, want 0", f)
 	}
 
 	// Out-of-range indices must be no-ops.
 	pool.RecordFailure(99)
 	pool.RecordSuccess(-1)
-	if f := atomic.LoadInt64(&pool.Slots[1].ConsecutiveFails); f != 0 {
+	if f := pool.SlotConsecutiveFails(1); f != 0 {
 		t.Errorf("slot 1 ConsecutiveFails = %d, want 0", f)
 	}
 }
@@ -768,7 +807,7 @@ func TestResetEmpty_FromDraining(t *testing.T) {
 	defer cmd.Process.Kill()
 	pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	pool.MarkDraining(0)
-	pool.IncConnCount(0)
+	pool.Slots[0].Current.Load().Reserve()
 
 	if err := pool.ResetEmpty(0); err != nil {
 		t.Fatalf("ResetEmpty error: %v", err)
@@ -784,25 +823,25 @@ func TestRoutableWANConcept(t *testing.T) {
 	// Slot 0: active but over fail threshold (3 >= 2).
 	pool.Slots[0].State = StateActive
 	pool.Slots[0].Cmd = xrayproc.Wrap(exec.Command("sleep", "9999"), "")
-	atomic.StoreInt64(&pool.Slots[0].ConsecutiveFails, 3)
+	setFails(pool, 0, 3)
 
 	// Slot 1: active but over fail threshold (3 >= 2).
 	pool.Slots[1].State = StateActive
 	pool.Slots[1].Cmd = xrayproc.Wrap(exec.Command("sleep", "9999"), "")
-	atomic.StoreInt64(&pool.Slots[1].ConsecutiveFails, 3)
+	setFails(pool, 1, 3)
 
 	// Slot 2: active, healthy (0 < 2), with running xray.
 	pool.Slots[2].State = StateActive
 	pool.Slots[2].Cmd = xrayproc.Wrap(exec.Command("sleep", "9999"), "")
-	atomic.StoreInt64(&pool.Slots[2].ConsecutiveFails, 0)
+	setFails(pool, 2, 0)
 
 	// Only slot 2 is routable.
 	if c := pool.RoutableCount(DefaultFailThreshold); c != 1 {
 		t.Errorf("RoutableCount(2) = %d, want 1", c)
 	}
 
-	// GetLeastLoaded must return the healthy slot, never -1.
-	idx := pool.GetLeastLoaded(DefaultFailThreshold)
+	// GetLeastLoaded must return the healthy slot (nil only for an empty pool).
+	idx := slotOf(pool.GetLeastLoaded(DefaultFailThreshold))
 	if idx != 2 {
 		t.Errorf("GetLeastLoaded(2) = %d, want 2 (healthy slot)", idx)
 	}
@@ -866,6 +905,70 @@ func TestOrphanedProcessReap(t *testing.T) {
 		t.Error("slot.Config should be nil after reap")
 	}
 	if pool.Slots[0].ConfigPath != "" {
-		t.Error("slot.ConfigPath should be empty after reap")
+		t.Error("configPath should be empty after reap")
+	}
+}
+
+// TestPath_TPATH01_OldPathCannotMutateReplacement is T-PATH-01: the ABA guard
+// end to end. Handlers reserve on the *Path the selector handed them and
+// release that same pointer; when the slot is reset and re-occupied while
+// they are still in flight, their late release (and success credit) must land
+// on their own generation and never move the replacement's counters.
+func TestPath_TPATH01_OldPathCannotMutateReplacement(t *testing.T) {
+	pool := NewWANPool(1, 20000)
+	defer pool.ShutdownAll()
+	occupy := func() {
+		t.Helper()
+		if err := pool.StartTesting(0, &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}); err != nil {
+			t.Fatalf("StartTesting: %v", err)
+		}
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start cmd: %v", err)
+		}
+		if err := pool.SetActive(0, xrayproc.Wrap(cmd, ""), ""); err != nil {
+			cmd.Process.Kill()
+			t.Fatalf("SetActive: %v", err)
+		}
+	}
+
+	occupy()
+	relay := &wanRelay{pool: pool}
+	old := pool.Slots[0].Current.Load()
+	for i := 0; i < 3; i++ {
+		relay.beginWAN(old, "test")
+	}
+	if got := old.Inflight.Load(); got != 3 {
+		t.Fatalf("old path inflight = %d, want 3", got)
+	}
+
+	// Replacement while the old handlers are still in flight.
+	pool.ResetEmpty(0)
+	occupy()
+	cur := pool.Slots[0].Current.Load()
+	if cur == old || cur.ID == old.ID {
+		t.Fatalf("replacement reuses the old Path (ID %d): generations must never be shared", cur.ID)
+	}
+
+	// The old handlers finish afterwards.
+	for i := 0; i < 3; i++ {
+		relay.endWAN(old)
+	}
+	old.RecordSuccess()
+
+	if got := cur.Inflight.Load(); got != 0 {
+		t.Errorf("replacement inflight = %d, want 0 (old handler releases leaked into it)", got)
+	}
+	if got := cur.ConsecutiveFails(); got != 0 {
+		t.Errorf("replacement fails = %d, want 0 (old handler success leaked into it)", got)
+	}
+	if got := old.Inflight.Load(); got != 0 {
+		t.Errorf("old path inflight = %d, want 0 (its own accounting still balances)", got)
+	}
+
+	// And the replacement's own accounting still works after the leak attempt.
+	cur.Reserve()
+	if got := cur.Inflight.Load(); got != 1 {
+		t.Errorf("replacement inflight = %d, want 1", got)
 	}
 }
