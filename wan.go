@@ -544,6 +544,12 @@ func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
 // is the selection rule of GetLeastLoaded, byte-for-byte: least-loaded
 // active/draining under threshold, ties to the lowest index, degraded
 // fallback last. A nil or empty tried map is the plain GetLeastLoaded call.
+//
+// Health ejection (SPEC-H.3, F-01): a path the outcome window ejected
+// (path state Suspect) is skipped in the routable pass exactly like an
+// over-threshold path; it remains part of the degraded fallback (no
+// blackhole when nothing is routable), and half-open re-admission
+// (internal/health) clears Suspect again.
 func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds ...int) *path.Path {
 	threshold := DefaultFailThreshold
 	if len(thresholds) > 0 {
@@ -565,7 +571,7 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 		}
 		fails := cur.ConsecutiveFails()
 		if s == StateActive || s == StateDraining {
-			if fails < int64(threshold) && cmd != nil {
+			if fails < int64(threshold) && cmd != nil && cur.GetState() != path.Suspect {
 				c := cur.Conns()
 				if best == nil || c < bestCount {
 					best = cur
