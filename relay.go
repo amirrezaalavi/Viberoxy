@@ -7,10 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"sync"
-	"sync/atomic"
 	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/relayio"
 )
 
 // wanRelay carries the WAN pool and per-connection relay settings shared by
@@ -23,6 +22,30 @@ type wanRelay struct {
 	router           *proxycfg.Router
 	AccessLog        bool
 	WanFailThreshold int
+	// IdleTimeout and HandshakeTimeout bound the relayio splice (IDLE_TIMEOUT
+	// and the client's first-byte request phase). Zero means the relayio
+	// defaults (300s / 30s); fields exist so tests can inject short values.
+	IdleTimeout      time.Duration
+	HandshakeTimeout time.Duration
+}
+
+// relayOptions builds the splice options for one proxied connection on the
+// given byte-metric label ("direct" or the WAN index). Byte metrics are fed
+// through OnBytes as bytes flow, so they are visible while a half-closed
+// splice is still legitimately waiting on the reverse direction; the
+// per-direction totals from the returned Stats feed the access log.
+func (r *wanRelay) relayOptions(byteLabel string) relayio.Options {
+	return relayio.Options{
+		IdleTimeout:      r.IdleTimeout,
+		HandshakeTimeout: r.HandshakeTimeout,
+		OnBytes: func(d relayio.Direction, n int64) {
+			if d == relayio.ClientToUpstream {
+				metricProxyBytes.Add(float64(n), byteLabel, "up")
+			} else {
+				metricProxyBytes.Add(float64(n), byteLabel, "down")
+			}
+		},
+	}
 }
 
 // beginWAN reserves a connection on the chosen slot: it bumps the slot's
@@ -93,36 +116,16 @@ func (r *wanRelay) directDial(ctx context.Context, targetHost string, start time
 	return conn, nil
 }
 
-// directRelay pipes clientConn and the direct upstream connection
-// bidirectionally (same shape as relayThroughWAN, without WAN slot metrics)
+// directRelay pipes clientConn and the direct upstream connection through
+// relayio.Splice (same shape as relayThroughWAN, without WAN slot metrics)
 // and writes a direct-route access-log line. Blocking; caller owns conns.
-func (r *wanRelay) directRelay(targetHost string, start time.Time, proto string, clientConn, upstream net.Conn) {
+func (r *wanRelay) directRelay(targetHost string, start time.Time, proto string, clientConn, upstream net.Conn, clientSrc io.Reader) {
 	tuneTCPConn(clientConn)
 	tuneTCPConn(upstream)
 
-	var wg sync.WaitGroup
-	var upBytes, downBytes int64
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(upstream, clientConn)
-		atomic.AddInt64(&upBytes, n)
-		upstream.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(clientConn, upstream)
-		atomic.AddInt64(&downBytes, n)
-		clientConn.Close()
-	}()
-	wg.Wait()
-
-	up := atomic.LoadInt64(&upBytes)
-	down := atomic.LoadInt64(&downBytes)
-	metricProxyBytes.Add(float64(up), "direct", "up")
-	metricProxyBytes.Add(float64(down), "direct", "down")
+	stats := relayio.Splice(clientConn, upstream, clientSrc, r.relayOptions("direct"))
 	metricProxyLatency.Observe(time.Since(start).Seconds())
-	r.logAccess(targetHost, -1, up, down, start, "ok", proto, "direct")
+	r.logAccess(targetHost, -1, stats.Up, stats.Down, start, "ok", proto, "direct")
 }
 
 // logAccess emits one structured access-log line per proxied connection.
@@ -142,33 +145,15 @@ func (r *wanRelay) logAccess(target string, wan int, up, down int64, start time.
 	)
 }
 
-// relayThroughWAN pipes clientConn and the upstream connection
-// bidirectionally until both directions close, then records byte/latency
-// metrics, resets the slot's failure counter and writes the access-log line.
-// Blocking; the caller owns both conns.
-func (r *wanRelay) relayThroughWAN(wanIndex int, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn) {
-	var wg sync.WaitGroup
-	var upBytes, downBytes int64
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(upstream, clientConn)
-		atomic.AddInt64(&upBytes, n)
-		upstream.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(clientConn, upstream)
-		atomic.AddInt64(&downBytes, n)
-		clientConn.Close()
-	}()
-	wg.Wait()
-
-	up := atomic.LoadInt64(&upBytes)
-	down := atomic.LoadInt64(&downBytes)
-	metricProxyBytes.Add(float64(up), strconv.Itoa(wanIndex), "up")
-	metricProxyBytes.Add(float64(down), strconv.Itoa(wanIndex), "down")
+// relayThroughWAN pipes clientConn and the upstream connection through
+// relayio.Splice until both directions finish (half-close preserved, idle and
+// handshake timeouts enforced), then records latency metrics, resets the
+// slot's failure counter and writes the access-log line. Byte metrics are
+// recorded incrementally via relayOptions' OnBytes callback. Blocking; the
+// caller owns both conns.
+func (r *wanRelay) relayThroughWAN(wanIndex int, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn, clientSrc io.Reader) {
+	stats := relayio.Splice(clientConn, upstream, clientSrc, r.relayOptions(strconv.Itoa(wanIndex)))
 	metricProxyLatency.Observe(time.Since(start).Seconds())
 	r.pool.RecordSuccess(wanIndex)
-	r.logAccess(targetHost, wanIndex, up, down, start, "ok", proto, "wan")
+	r.logAccess(targetHost, wanIndex, stats.Up, stats.Down, start, "ok", proto, "wan")
 }

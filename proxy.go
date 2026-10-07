@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/relayio"
 )
 
 type ProxyServer struct {
@@ -104,7 +105,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Hijacking not supported", 500)
 			return
 		}
-		clientConn, _, err := hijacker.Hijack()
+		clientConn, rw, err := hijacker.Hijack()
 		if err != nil {
 			slog.Warn("hijack failed", "error", err)
 			http.Error(w, "Internal Server Error", 500)
@@ -113,7 +114,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		defer clientConn.Close()
 
 		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		p.directRelay(targetHost, start, "connect", clientConn, conn)
+		p.directRelay(targetHost, start, "connect", clientConn, conn, relayio.PeekReader(rw, clientConn))
 		return
 	}
 
@@ -139,7 +140,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, rw, err := hijacker.Hijack()
 	if err != nil {
 		slog.Warn("hijack failed", "error", err)
 		http.Error(w, "Internal Server Error", 500)
@@ -149,7 +150,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	p.relayThroughWAN(wanIndex, targetHost, start, "connect", clientConn, conn)
+	p.relayThroughWAN(wanIndex, targetHost, start, "connect", clientConn, conn, relayio.PeekReader(rw, clientConn))
 }
 
 func (p *ProxyServer) handleDefault(w http.ResponseWriter, r *http.Request) {
