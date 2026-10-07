@@ -26,6 +26,11 @@ import (
 // can never work (undecodable vmess/ss payloads, xhttp missing path/host/
 // mode); a config that reaches this point but cannot be rendered is a hard
 // failure, not a silently broken tunnel.
+//
+// Since D-04 the daemon's own default (env XRAY_MUX, parsed by
+// proxycfg.ParseConfig) is off; production and speed-test call sites both
+// pass that flag explicitly, so this omitted-argument default only affects
+// tests and callers with no config at hand.
 func BuildXrayConfig(cfg *proxycfg.ProxyConfig, inboundPort int, muxEnabled ...bool) ([]byte, error) {
 	mux := true
 	if len(muxEnabled) > 0 {

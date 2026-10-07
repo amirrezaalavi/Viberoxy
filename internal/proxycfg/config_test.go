@@ -114,8 +114,8 @@ func TestParseConfig_Defaults(t *testing.T) {
 	if !cfg.AllowDegradedBoot {
 		t.Error("AllowDegradedBoot = false, want true (default)")
 	}
-	if !cfg.XrayMux {
-		t.Error("XrayMux = false, want true (default)")
+	if cfg.XrayMux {
+		t.Error("XrayMux = true, want false (D-04: mux off by default)")
 	}
 }
 

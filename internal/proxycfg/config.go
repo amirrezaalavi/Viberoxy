@@ -312,12 +312,14 @@ func ParseConfig() (*Config, error) {
 		cfg.Router = NewRouter(mode, direct, proxy)
 	}
 
-	// XRAY_MUX enables xray outbound connection multiplexing (mux). With mux
-	// on (default), many client connections share one upstream connection to
-	// the proxy server, amortizing the TLS/protocol handshake that otherwise
-	// runs per connection — the single biggest lever on per-connection setup
-	// latency. Turn it off for workloads dominated by very large transfers.
-	cfg.XrayMux = true
+	// XRAY_MUX enables xray outbound connection multiplexing (mux). D-04:
+	// mux is OFF by default; set XRAY_MUX=true to opt in. With mux on, many
+	// client connections share one upstream connection to the proxy server,
+	// amortizing the TLS/protocol handshake that otherwise runs per
+	// connection — the single biggest lever on per-connection setup latency.
+	// Keep it off for workloads dominated by very large single transfers
+	// (mux adds a framing hop that costs throughput there).
+	cfg.XrayMux = false
 	if v := os.Getenv("XRAY_MUX"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {

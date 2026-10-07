@@ -19,13 +19,14 @@ import (
 func xrayMuxForRun() bool {
 	v := os.Getenv("XRAY_MUX")
 	if v == "" {
-		return true
+		// D-04: mux is off by default — must mirror proxycfg's default.
+		return false
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
 		// ParseConfig rejects invalid values at startup, so a running daemon
 		// never sees one; fall back to the default rather than guess.
-		return true
+		return false
 	}
 	return b
 }
@@ -47,6 +48,11 @@ type XrayConfig = xraycfg.XrayConfig
 // Note: production call sites never omit muxEnabled — they pass the parsed
 // proxycfg.Config.XrayMux (XRAY_MUX) explicitly; the omitted default exists
 // for tests and callers with no config at hand.
+//
+// Since D-04 the daemon's own default (env XRAY_MUX, parsed by
+// proxycfg.ParseConfig) is off; production and speed-test call sites both
+// pass that flag explicitly, so this omitted-argument default only affects
+// tests and callers with no config at hand.
 func BuildXrayConfig(cfg *proxycfg.ProxyConfig, inboundPort int, muxEnabled ...bool) ([]byte, error) {
 	return xraycfg.BuildXrayConfig(cfg, inboundPort, muxEnabled...)
 }
