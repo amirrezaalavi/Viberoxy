@@ -2,10 +2,33 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xraycfg"
 	"viberoxy/internal/xrayproc"
 )
+
+// xrayMuxForRun reports the mux flag for xray instances started without an
+// explicit setting — today only the speed-test instances in
+// TestSpeedWithStability (F-11 test/prod mux parity). It re-parses XRAY_MUX
+// exactly as proxycfg.ParseConfig does (same variable, same default) so a
+// speed test always exercises the mux configuration production runs with;
+// production call sites pass cfg.XrayMux explicitly. The default below must
+// stay identical to proxycfg's XRAY_MUX default (D-04 flips both together).
+func xrayMuxForRun() bool {
+	v := os.Getenv("XRAY_MUX")
+	if v == "" {
+		return true
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		// ParseConfig rejects invalid values at startup, so a running daemon
+		// never sees one; fall back to the default rather than guess.
+		return true
+	}
+	return b
+}
 
 // XrayConfig is the rendered xray JSON document type. It and the rest of the
 // config-generation code (BuildXrayConfig's body, buildOutbound, the extract*

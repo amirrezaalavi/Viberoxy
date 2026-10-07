@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -913,4 +916,101 @@ func mustMarshal(v interface{}) []byte {
 		panic(err)
 	}
 	return b
+}
+
+// ---------- F-11: speed-test xray instances must use the production mux setting ----------
+
+// TestSpeedTestXrayMuxMatchesProduction pins test/prod mux parity: the temp
+// xray a speed test starts gets exactly the mux flag production gives the
+// real xray (proxycfg.Config.XrayMux, sourced from XRAY_MUX), and renders
+// byte-identical config JSON from it.
+func TestSpeedTestXrayMuxMatchesProduction(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string // XRAY_MUX value ("" = leave unset)
+	}{
+		{"default", ""},
+		{"explicit-on", "true"},
+		{"explicit-off", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Isolate from the ambient environment so ParseConfig's defaults
+			// are what production would actually run with.
+			for _, key := range []string{
+				"SUBSCRIBER_URL", "FETCH_INTERVAL", "TEST_TIMEOUT", "DOWNLOAD_SIZE",
+				"DOWNLOAD_ENDPOINT", "DOWNLOAD_FALLBACK", "WAN_COUNT", "WAN_BASE_PORT",
+				"TEST_BASE_PORT", "PROXY_PORT", "SOCKS_PORT", "MINIMUM_SPEED",
+				"METRICS_PORT", "ACCESS_LOG", "KEEPALIVE_INTERVAL", "WAN_FAIL_THRESHOLD",
+				"STABILITY_PROBES", "ALLOW_DEGRADED_BOOT", "XRAY_MUX",
+			} {
+				unsetenv(t, key)
+			}
+			setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+			if tc.env != "" {
+				setenv(t, "XRAY_MUX", tc.env)
+			}
+
+			prod, err := proxycfg.ParseConfig()
+			if err != nil {
+				t.Fatalf("ParseConfig error: %v", err)
+			}
+
+			orig := startTestXray
+			var gotMux []bool
+			startTestXray = func(_ *proxycfg.ProxyConfig, _ int, muxEnabled ...bool) (*xrayproc.Handle, string, error) {
+				mux := true // BuildXrayConfig's default when the flag is omitted
+				if len(muxEnabled) > 0 {
+					mux = muxEnabled[0]
+				}
+				gotMux = append(gotMux, mux)
+				return nil, "", errors.New("stub: this test never spawns xray")
+			}
+			t.Cleanup(func() { startTestXray = orig })
+
+			// The same sharelink the T-XRAY-01 ss-tcp golden is built from.
+			proxy := proxycfg.ParseSingle("ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#MySS")
+			if proxy == nil {
+				t.Fatal("ParseSingle returned nil")
+			}
+			res := TestSpeedWithStability(proxy, 10999, time.Second, "http://example.invalid/", 0, 0)
+			if res == nil || res.Error == nil {
+				t.Fatal("expected the stubbed speed test to return an error result")
+			}
+			if len(gotMux) != 1 {
+				t.Fatalf("speed-test xray started %d times, want 1", len(gotMux))
+			}
+			if gotMux[0] != prod.XrayMux {
+				t.Errorf("speed-test xray mux=%v, production mux=%v (XRAY_MUX=%q): test and production instances must match",
+					gotMux[0], prod.XrayMux, tc.env)
+			}
+
+			// Same flag must render the same bytes — parity is about the
+			// actual config, not just the boolean.
+			fromProd, err := BuildXrayConfig(proxy, 10800, prod.XrayMux)
+			if err != nil {
+				t.Fatalf("BuildXrayConfig (production flag) error: %v", err)
+			}
+			fromTest, err := BuildXrayConfig(proxy, 10800, gotMux[0])
+			if err != nil {
+				t.Fatalf("BuildXrayConfig (test flag) error: %v", err)
+			}
+			if !bytes.Equal(fromProd, fromTest) {
+				t.Errorf("test and production xray configs differ:\nproduction:\n%s\ntest:\n%s", fromProd, fromTest)
+			}
+
+			// ...and the agreed flag must render the T-XRAY-01 golden bytes,
+			// so the speed test exercises byte-for-byte what production runs.
+			goldenName := "ss-tcp.mux-off.json"
+			if prod.XrayMux {
+				goldenName = "ss-tcp.mux-on.json"
+			}
+			golden, err := os.ReadFile(filepath.Join("internal", "xraycfg", "testdata", goldenName))
+			if err != nil {
+				t.Fatalf("read golden %s: %v", goldenName, err)
+			}
+			if !bytes.Equal(fromProd, golden) {
+				t.Errorf("production render differs from golden %s:\ngolden:\n%s\nrender:\n%s", goldenName, golden, fromProd)
+			}
+		})
+	}
 }
