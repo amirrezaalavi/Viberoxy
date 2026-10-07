@@ -109,6 +109,11 @@ func NewAPIHandler(pool *WANPool, configs ...*proxycfg.Config) http.Handler {
 		cfg = configs[0]
 	}
 	dropOpts := DropAndReplaceOptions{Candidates: candidatePool}
+	// F-13: the drop path tests on the same shared test-port allocator the
+	// cycle uses and boots replacements on spare service ports; startup
+	// wires both onto the pool.
+	dropOpts.TestPorts = pool.TestPorts()
+	dropOpts.SparePorts = pool.SparePorts()
 	if cfg != nil {
 		dropOpts.TestPort = cfg.TestBasePort
 		dropOpts.Timeout = time.Duration(cfg.TestTimeout) * time.Second

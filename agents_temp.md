@@ -468,3 +468,62 @@ can't assign requested address` (TIME_WAIT churn; `netstat` is silent in
 the sandbox, so it looks like a code failure). Wait ~60s between heavy
 runs; a cooldown re-run of `go test -race -shuffle=on -count=1 ./...` is
 fully green (rc=0, 13/13 packages).
+## task-3-3: make-before-break `DropAndReplace` on spare ports (F-13, RT-10 green)
+
+One commit on `task-3-3-swap`: `fix(rotation): make-before-break DropAndReplace on spare ports (F-13); RT-10 green`.
+
+New sequence in `wan.go` (`DropAndReplace`), all failure paths leave the slot exactly as it was:
+
+1. **pick** under `replaceMu` (snapshot occupant + `Candidates.Best(exclude)` with the
+   F-12 HasServerPort rule) — the lock is then released;
+2. **test** the candidate on a port Acquired from `opts.TestPorts` (released the moment the
+   test returns; exhaustion => `ErrNoReplacementCandidate`-family error, never a reused port)
+   while the OLD occupant stays Active and serving — this is RT-10's assertion;
+3. **start** the replacement on a spare service port (`opts.SparePorts`; an empty slot keeps
+   its own free port), so the old process never loses its listener;
+4. **`WANPool.Swap(index, expected, newPath, configPath, releasePort)`** — the atomic cutover
+   under `replaceMu` + `slot.mu`: config/cmd/config-path/service-port move to the replacement
+   (front-end dials follow `slot.ServicePort`), the retired Path goes `path.Draining`, probe/
+   speed bookkeeping clears. It refuses (`ErrNoReplacementCandidate`-wrapped, nothing changed)
+   when the slot no longer holds `expected` — another replacement won, or a reset happened
+   mid-test; the loser stops the process it started;
+5. **post-swap teardown**: stop the retired process, THEN Release its spare (listener down
+   before the port can be re-issued). `ResetEmpty` does the same and restores
+   `ServicePort = BasePort+index` when the slot held a spare.
+
+`replaceMu` is now held ONLY around the pick and the cutover — never across the speed test or
+the process start, so concurrent drops of different slots test in parallel.
+
+Wiring (`startup`): `ports.NewTestPorts(TestBasePort, MaxTestPerCycle+WanCount)` and
+`ports.NewSpareWANPorts(WanBasePort, WanCount, 2*WanCount)` (2x because an occupied slot still
+holds its spare while the replacement checks out the next — one full round of concurrent swaps
+needs two per slot; invalid ranges log+fall back to legacy behavior rather than refusing to
+boot), stored via `pool.SetPortAllocators`, threaded into `DropAndReplaceOptions` by
+`NewAPIHandler`, and drawn from by `runCycle`/`startup` through `acquireCycleTestPort`
+(fallback: historical `TEST_BASE_PORT+seq` when a hand-built pool has no allocator).
+
+Tests: `swap_test.go` — T-SWAP-01 (full swap under ~200 rps load through the SOCKS front-end,
+zero failed connections; FakeWAN/FakeClient harness), T-SWAP-02 x3 (drop tests draw from the
+shared allocator with exhaustion+release accounting; runCycle draws from the same allocator;
+concurrent drops never share a test port and do overlap), T-SWAP-03 (already-serving
+server:port skipped at the pick + cands Best cross-check), failure path (failed test => old
+WAN still serving through the front). `api_test.go` flipped three break-before-make assertions
+to the new contract (no-candidates, test-failure, start-failure now all leave the slot Active
+with the old WAN — renamed `..._StartFailureKeepsOldWAN`). `red_test.go` untouched (assertion
+grep diff vs HEAD empty — plumbing needed no changes at all).
+`scripts/red_gate.sh`: RT-10 removed from `DEFAULT_ALLOW` — allow list 3 entries, gate exit 0;
+red suite 3 FAIL (RT-01/02/11) / 8 PASS / 0 SKIP. Mutation sanity: re-inserting the old
+pre-test `ResetEmpty` fails `TestRed_RT10_...`; removing it turns RT-10 green again.
+
+**Flags for later tasks:**
+
+- `relay.go:dialWAN` still reads `Slots[wanPath.Slot].ServicePort` WITHOUT the slot lock
+  ("fixed for the slot's lifetime" is no longer true after a swap). `probeAllWANs` was moved
+  onto the lock by this task; the relay read is the known remaining spot — the drain/relay
+  task should dial the held path's immutable `wanPath.Port` instead, which also removes the
+  held-path-vs-slot disagreement. T-SWAP-01 quiesces its workers around the cutover (documented
+  in the test) so `-race` stays clean until then; in-flight conns across the retired process's
+  teardown are the later drain policy's job (DRAIN_MAX / inflight==0).
+- Spare sizing (2xWanCount) and the TestBasePort/Spare range overlap check live in `startup`;
+  a config task that adds env knobs should validate `TEST_BASE_PORT..+MAX_TEST_PER_CYCLE` not
+  colliding with `WAN_BASE_PORT+WAN_COUNT..`.
