@@ -820,16 +820,20 @@ func TestOrphanedProcessReap(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
 	}
-	if err := pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/test-config.json"), "/tmp/test-config.json"); err != nil {
+	proc := xrayproc.Wrap(cmd, "/tmp/test-config.json")
+	if err := pool.SetActive(0, proc, "/tmp/test-config.json"); err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 
-	// Simulate the process exiting: kill it and reap the zombie.
+	// Simulate the process exiting: kill it; the handle's reaper reaps the
+	// zombie, so the test must wait on Exited instead of calling Wait.
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill cmd: %v", err)
 	}
-	if err := cmd.Wait(); err != nil {
-		t.Logf("cmd.Wait() returned (expected for killed process): %v", err)
+	select {
+	case <-proc.Exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child was not reaped within 2s")
 	}
 
 	// Confirm the process is truly gone (reaped via Wait).

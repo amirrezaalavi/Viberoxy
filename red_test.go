@@ -208,8 +208,11 @@ func TestRed_RT04_HealthCheckDetectsExitedProcess(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Skip("sh unavailable")
 	}
-	time.Sleep(300 * time.Millisecond)
 	proc := xrayproc.Wrap(cmd, "")
+	select {
+	case <-proc.Exited:
+	case <-time.After(2 * time.Second):
+	}
 	if HealthCheckXray(proc) {
 		t.Fatal("HealthCheckXray reports an exited (zombie) process as healthy")
 	}

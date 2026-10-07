@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
@@ -786,7 +787,11 @@ func TestHealthCheckXray(t *testing.T) {
 	}
 
 	cmd.Process.Kill()
-	cmd.Wait()
+	select {
+	case <-proc.Exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child was not reaped within 2s")
+	}
 
 	if HealthCheckXray(proc) {
 		t.Error("expected health check to return false for killed process")
