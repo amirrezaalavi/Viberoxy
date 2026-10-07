@@ -85,3 +85,39 @@ from `DEFAULT_ALLOW` (it now passes); allow list is 10 entries, gate exit 0.
 Stale AGENTS.md pointers (for whoever consolidates): "Health-check / stop a
 running xray → `xray.go`" (now `internal/xrayproc`), and any Directory Map row
 naming `StartXray`/`StopXray`/`HealthCheckXray` as living in `xray.go`.
+
+
+## task-1-5: subscription fetching extracted to `internal/subs` (F-18)
+
+New package `internal/subs/` (`fetch.go` + `fetch_test.go`, stdlib only) owns
+what `main.go:fetchSubscription` used to do inline:
+
+| Behavior | Where |
+|---|---|
+| body cap — `io.LimitReader(resp.Body, MaxBodyBytes+1)`, `MaxBodyBytes = 8 MiB`; over the cap is a `KindOversized` error, never an unbounded `io.ReadAll` | `subs.Fetch` |
+| https-only scheme policy; plain `http://` needs `ALLOW_HTTP_SUBSCRIPTION=true` | `subs.Fetch` (reads the env via `subs.AllowHTTPFromEnv()`, `Options.AllowHTTP` forces it) **and** `proxycfg.ParseConfig` (rejects an http `SUBSCRIBER_URL` at startup unless opted in) |
+| conditional GET — `If-None-Match` / `If-Modified-Since` replayed from `Options.ETag` / `Options.LastModified`; a 304 is `Result{NotModified: true}` with a **nil error** (first-class result) | `subs.Fetch` |
+| empty/whitespace body → `KindEmptyBody` error | `subs.Fetch` |
+| distinguishable kinds — `KindOK`, `KindTransport`, `KindBadScheme`, `KindOversized`, `KindStatus`, `KindEmptyBody`, `KindNotModified` (`KindOf(err)` / `Outcome(res, err)`) | `internal/subs` |
+
+`main.go` keeps its one job: `fetchSubscription(url) []*proxycfg.ProxyConfig`
+logs and returns what the two call sites need. It now holds a mutex-guarded
+`fetchSubscriptionState` (url + ETag + Last-Modified + last parsed configs):
+validators are only replayed to the URL they came from, an error or a body
+that parses to zero configs returns `nil` (startup keeps retrying, a running
+cycle keeps its pool), and a 304 returns the configs already parsed. New env
+var: `ALLOW_HTTP_SUBSCRIPTION` (bool, default false) — field
+`Config.AllowHTTPSubscription`, parsed and enforced in `ParseConfig`.
+
+`README.md` env table not updated (out of scope for this task): someone
+should add `ALLOW_HTTP_SUBSCRIPTION` when consolidating into `AGENTS.md`.
+
+**Deviation (flag for whoever owns `main_test.go`):** `main_test.go` gained an
+`init()` that sets `ALLOW_HTTP_SUBSCRIPTION=true`, because its integration
+tests drive `fetchSubscription` / `startup()` / `runCycle()` against
+plain-http `httptest` servers. The policy itself is covered both ways in
+`internal/subs/fetch_test.go` (env unset → rejected, env set → allowed) and in
+`internal/proxycfg/config_test.go` (default false, opt-in, invalid value,
+http `SUBSCRIBER_URL` rejected by default). `main_test.go` also gained two
+caller tests: `TestFetchSubscription_ConditionalGetKeepsConfigs` (304 replay)
+and `TestFetchSubscription_GarbageBodyKeepsPrevious`.

@@ -49,6 +49,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"WAN_FAIL_THRESHOLD",
 		"STABILITY_PROBES",
 		"ALLOW_DEGRADED_BOOT",
+		"ALLOW_HTTP_SUBSCRIPTION",
 		"XRAY_MUX",
 	} {
 		unsetenv(t, key)
@@ -113,6 +114,9 @@ func TestParseConfig_Defaults(t *testing.T) {
 	}
 	if !cfg.AllowDegradedBoot {
 		t.Error("AllowDegradedBoot = false, want true (default)")
+	}
+	if cfg.AllowHTTPSubscription {
+		t.Error("AllowHTTPSubscription = true, want false (default: https-only subscriptions)")
 	}
 	if !cfg.XrayMux {
 		t.Error("XrayMux = false, want true (default)")
@@ -406,6 +410,42 @@ func TestParseConfig_InvalidAllowDegradedBoot(t *testing.T) {
 	_, err := ParseConfig()
 	if err == nil {
 		t.Fatal("expected error for ALLOW_DEGRADED_BOOT=maybe, got nil")
+	}
+}
+
+func TestParseConfig_AllowHTTPSubscriptionTrue(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "http://example.com/sub")
+	setenv(t, "ALLOW_HTTP_SUBSCRIPTION", "true")
+
+	cfg, err := ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if !cfg.AllowHTTPSubscription {
+		t.Error("AllowHTTPSubscription = false, want true (ALLOW_HTTP_SUBSCRIPTION=true)")
+	}
+	if cfg.SubscriberURL != "http://example.com/sub" {
+		t.Errorf("SubscriberURL = %q, want %q", cfg.SubscriberURL, "http://example.com/sub")
+	}
+}
+
+func TestParseConfig_InvalidAllowHTTPSubscription(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ALLOW_HTTP_SUBSCRIPTION", "maybe")
+
+	_, err := ParseConfig()
+	if err == nil {
+		t.Fatal("expected error for ALLOW_HTTP_SUBSCRIPTION=maybe, got nil")
+	}
+}
+
+func TestParseConfig_HTTPSubscriberRejectedByDefault(t *testing.T) {
+	unsetenv(t, "ALLOW_HTTP_SUBSCRIPTION")
+	setenv(t, "SUBSCRIBER_URL", "http://example.com/sub")
+
+	_, err := ParseConfig()
+	if err == nil {
+		t.Fatal("expected error for plain http:// SUBSCRIBER_URL without opt-in, got nil")
 	}
 }
 

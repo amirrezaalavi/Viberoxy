@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"syscall"
 	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/subs"
 )
 
 var (
@@ -49,22 +49,71 @@ func markCycleComplete(now time.Time, interval time.Duration) {
 	cycleTimingMu.Unlock()
 }
 
+// fetchSubscriptionState holds the validators and configs of the last
+// usable fetch, so a 304 (unchanged subscription) reuses them without
+// re-parsing and a failed fetch never overwrites them (F-18).
+type fetchSubscriptionState struct {
+	url          string
+	etag         string
+	lastModified string
+	configs      []*proxycfg.ProxyConfig
+}
+
+var (
+	subStateMu sync.Mutex
+	subState   fetchSubscriptionState
+)
+
+// fetchSubscription is a thin caller over internal/subs: it logs and
+// returns the configs main.go needs. On any error it returns nil, so both
+// call sites keep whatever configs they already have (startup retries, a
+// running cycle skips); on a 304 it returns the previously parsed configs.
 func fetchSubscription(url string) []*proxycfg.ProxyConfig {
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(url)
+	subStateMu.Lock()
+	prev := subState
+	subStateMu.Unlock()
+
+	opts := subs.Options{
+		AllowHTTP: subs.AllowHTTPFromEnv(),
+	}
+	if prev.url == url {
+		// Only replay validators for the subscription they came from.
+		opts.ETag = prev.etag
+		opts.LastModified = prev.lastModified
+	}
+
+	res, err := subs.Fetch(url, opts)
 	if err != nil {
-		slog.Warn("fetch subscription failed", "url", url, "error", err)
+		slog.Warn("fetch subscription failed", "url", url, "kind", string(subs.KindOf(err)), "error", err)
 		return nil
 	}
-	defer resp.Body.Close()
+	if res.NotModified {
+		if prev.url != url {
+			slog.Warn("fetch subscription failed", "url", url, "kind", string(subs.KindNotModified), "error", "no cached configs for this url")
+			return nil
+		}
+		slog.Info("subscription not modified", "url", url, "configs", len(prev.configs))
+		return prev.configs
+	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		slog.Warn("read subscription body failed", "error", err)
+	configs := proxycfg.ParseConfigs(string(res.Body))
+	if len(configs) == 0 {
+		// Garbage payload: report it as a failure so the caller keeps the
+		// configs it already has, and leave subState (and its validators)
+		// untouched so a later conditional GET still has a good fallback.
+		slog.Warn("fetch subscription failed", "url", url, "kind", string(subs.KindEmptyBody), "error", "no parseable configs in body")
 		return nil
 	}
 
-	configs := proxycfg.ParseConfigs(string(body))
+	subStateMu.Lock()
+	subState = fetchSubscriptionState{
+		url:          url,
+		etag:         res.ETag,
+		lastModified: res.LastModified,
+		configs:      configs,
+	}
+	subStateMu.Unlock()
+
 	slog.Info("fetched subscription", "url", url, "configs", len(configs))
 	return configs
 }
