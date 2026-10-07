@@ -19,6 +19,15 @@ import (
 	"viberoxy/internal/proxycfg"
 )
 
+func init() {
+	// Integration tests drive fetchSubscription and startup() against
+	// plain-http httptest servers, so opt in to the subscription scheme
+	// policy that ParseConfig enforces by default (https-only unless
+	// ALLOW_HTTP_SUBSCRIPTION=true). internal/subs tests cover both
+	// sides of the policy with the variable explicitly set/unset.
+	os.Setenv("ALLOW_HTTP_SUBSCRIPTION", "true")
+}
+
 func setenv(t *testing.T, key, value string) {
 	t.Helper()
 	orig, ok := os.LookupEnv(key)
@@ -326,6 +335,67 @@ func TestFetchSubscription_InvalidURL(t *testing.T) {
 	configs := fetchSubscription("http://127.0.0.1:1")
 	if configs != nil {
 		t.Errorf("expected nil on connection error, got %d configs", len(configs))
+	}
+}
+
+// TestFetchSubscription_ConditionalGetKeepsConfigs: the second fetch
+// replays the stored ETag, and the server's 304 is answered with the
+// configs already parsed — no re-parse, no empty result.
+func TestFetchSubscription_ConditionalGetKeepsConfigs(t *testing.T) {
+	const etag = `"sub-v2"`
+	body := base64.StdEncoding.EncodeToString([]byte(
+		"ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#TestSS\n" +
+			"trojan://password123@5.6.7.8:443#TestTrojan"))
+
+	var mu sync.Mutex
+	sawConditional := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.Header.Get("If-None-Match") == etag {
+			sawConditional = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		mu.Unlock()
+		w.Header().Set("ETag", etag)
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	first := fetchSubscription(srv.URL)
+	if len(first) != 2 {
+		t.Fatalf("first fetch: %d configs, want 2", len(first))
+	}
+
+	second := fetchSubscription(srv.URL)
+	if len(second) != 2 {
+		t.Fatalf("304 fetch: %d configs, want the 2 previously parsed", len(second))
+	}
+	if second[0].Server != "1.2.3.4" || second[1].Server != "5.6.7.8" {
+		t.Errorf("304 configs = %s:%d, %s:%d; want 1.2.3.4, 5.6.7.8",
+			second[0].Server, second[0].Port, second[1].Server, second[1].Port)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !sawConditional {
+		t.Error("second request did not carry If-None-Match")
+	}
+}
+
+// TestFetchSubscription_GarbageBodyKeepsPrevious: a body that parses to
+// zero configs is reported as a failure (nil), so callers keep the configs
+// they already have.
+func TestFetchSubscription_GarbageBodyKeepsPrevious(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "definitely not a proxy config line")
+	}))
+	defer srv.Close()
+
+	configs := fetchSubscription(srv.URL)
+	if len(configs) != 0 {
+		t.Errorf("expected no configs for garbage body, got %d", len(configs))
 	}
 }
 

@@ -27,8 +27,12 @@ type Config struct {
 	StabilityProbes   int
 	AccessLog         bool
 	AllowDegradedBoot bool
-	Router            *Router
-	XrayMux           bool
+	// AllowHTTPSubscription opts in to plain http:// SUBSCRIBER_URL values
+	// (ALLOW_HTTP_SUBSCRIPTION). https-only by default; false unless the
+	// env var explicitly says otherwise.
+	AllowHTTPSubscription bool
+	Router                *Router
+	XrayMux               bool
 }
 
 // MaxTestPerCycle bounds how many configs are speed-tested in one runCycle.
@@ -43,6 +47,19 @@ func (c *Config) MaxTestPerCycleVal() int {
 func ParseConfig() (*Config, error) {
 	cfg := &Config{}
 
+	// ALLOW_HTTP_SUBSCRIPTION: opt in to a plain http:// SUBSCRIBER_URL.
+	// Subscriptions are fetched over https only unless this is true
+	// (F-18). Parsed before SUBSCRIBER_URL so the scheme policy below can
+	// enforce it; unparsable values hard-exit like every other knob.
+	cfg.AllowHTTPSubscription = false
+	if v := os.Getenv("ALLOW_HTTP_SUBSCRIPTION"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: ALLOW_HTTP_SUBSCRIPTION=%q: must be a boolean (true/false)", v)
+		}
+		cfg.AllowHTTPSubscription = b
+	}
+
 	cfg.SubscriberURL = os.Getenv("SUBSCRIBER_URL")
 	if cfg.SubscriberURL == "" {
 		return nil, fmt.Errorf("error: SUBSCRIBER_URL=%q: must be set to a valid HTTP/HTTPS URL", cfg.SubscriberURL)
@@ -50,6 +67,9 @@ func ParseConfig() (*Config, error) {
 	u, err := url.Parse(cfg.SubscriberURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("error: SUBSCRIBER_URL=%q: must be a valid HTTP/HTTPS URL", cfg.SubscriberURL)
+	}
+	if u.Scheme == "http" && !cfg.AllowHTTPSubscription {
+		return nil, fmt.Errorf("error: SUBSCRIBER_URL=%q: plain http:// is refused by default, set ALLOW_HTTP_SUBSCRIPTION=true to allow it", cfg.SubscriberURL)
 	}
 
 	cfg.FetchInterval = 300
