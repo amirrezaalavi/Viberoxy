@@ -2,17 +2,24 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
+	"viberoxy/internal/auth"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/relayio"
 )
 
 type ProxyServer struct {
 	port int
+	// listenAddr is the bind host. Constructors default it to loopback
+	// (auth.LoopbackHost); main overrides it from cfg.ListenAddr. A
+	// non-loopback value is refused by Start unless auth is configured or
+	// ALLOW_PUBLIC=true (F-14).
+	listenAddr string
 	// mu guards server: Start publishes it from its own goroutine while
 	// startup()'s shutdown path may call Stop concurrently.
 	mu     sync.Mutex
@@ -22,7 +29,8 @@ type ProxyServer struct {
 
 func NewProxyServer(port int, pool *WANPool, router ...*proxycfg.Router) *ProxyServer {
 	p := &ProxyServer{
-		port: port,
+		port:       port,
+		listenAddr: auth.LoopbackHost,
 		wanRelay: wanRelay{
 			pool:             pool,
 			AccessLog:        true,
@@ -36,6 +44,13 @@ func NewProxyServer(port int, pool *WANPool, router ...*proxycfg.Router) *ProxyS
 }
 
 func (p *ProxyServer) Start(ctx context.Context) error {
+	// Defense in depth (F-14): proxycfg.ParseConfig refuses a non-loopback
+	// LISTEN_ADDR at startup, but direct constructors bypass it — re-check
+	// the same policy here before binding.
+	if err := auth.EnsureBindAllowed(p.listenAddr); err != nil {
+		return err
+	}
+
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			p.handleConnect(w, r)
@@ -45,7 +60,7 @@ func (p *ProxyServer) Start(ctx context.Context) error {
 	})
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", p.port),
+		Addr:    net.JoinHostPort(p.listenAddr, strconv.Itoa(p.port)),
 		Handler: handler,
 	}
 	p.mu.Lock()
@@ -85,9 +100,34 @@ func (p *ProxyServer) Stop(ctx context.Context) error {
 
 func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// Proxy authentication (F-14): while PROXY_USERS is set, every CONNECT
+	// must present matching Proxy-Authorization Basic credentials.
+	users, required, err := auth.UsersFromEnv()
+	if err != nil {
+		// Malformed PROXY_USERS (ParseConfig would have hard-exited at
+		// startup): fail closed — no usable users, so every request 407s.
+		slog.Error("invalid PROXY_USERS, rejecting proxy connections", "error", err)
+	}
+	if required {
+		user, pass, ok := auth.ParseBasic(r.Header.Get("Proxy-Authorization"))
+		if !ok || !auth.CheckUsers(users, user, pass) {
+			w.Header().Set("Proxy-Authenticate", `Basic realm="viberoxy"`)
+			http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+			return
+		}
+	}
+
 	targetHost := r.Host
 	if targetHost == "" {
 		http.Error(w, "Bad Request", 400)
+		return
+	}
+
+	// SSRF guard (F-14): never dial loopback/link-local/private targets
+	// unless ALLOW_PRIVATE_TARGETS=true.
+	if !auth.TargetAllowed(targetHost, auth.AllowPrivateTargetsFromEnv()) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 

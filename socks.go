@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"time"
+	"viberoxy/internal/auth"
 	"viberoxy/internal/proxycfg"
 )
 
@@ -21,17 +23,24 @@ const socksDialTimeout = 30 * time.Second
 
 // SocksServer is a SOCKS5 front-end listener (RFC 1928). It accepts TCP
 // CONNECT commands only: BIND (0x02) and UDP ASSOCIATE (0x03) are rejected
-// with REP 0x07 (command not supported). No authentication methods are
-// offered (no-auth only; RFC 1929 user/password is not implemented).
+// with REP 0x07 (command not supported). While PROXY_USERS is set, RFC 1929
+// username/password authentication (method 0x02) is required; without it
+// the listener stays no-auth (method 0x00), the historical behavior.
 type SocksServer struct {
 	port int
+	// listenAddr is the bind host. Constructors default it to loopback
+	// (auth.LoopbackHost); main overrides it from cfg.ListenAddr. A
+	// non-loopback value is refused by Listen unless auth is configured or
+	// ALLOW_PUBLIC=true (F-14).
+	listenAddr string
 	wanRelay
 }
 
 // NewSocksServer creates a SOCKS5 front-end listener on the given port.
 func NewSocksServer(port int, pool *WANPool, router ...*proxycfg.Router) *SocksServer {
 	s := &SocksServer{
-		port: port,
+		port:       port,
+		listenAddr: auth.LoopbackHost,
 		wanRelay: wanRelay{
 			pool:             pool,
 			AccessLog:        true,
@@ -49,7 +58,12 @@ func NewSocksServer(port int, pool *WANPool, router ...*proxycfg.Router) *SocksS
 // nil. It returns an error only if the listener cannot be bound or accept
 // fails while the context is still active.
 func (s *SocksServer) Listen(ctx context.Context) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
+	// Defense in depth (F-14): mirror proxycfg's startup gate here for
+	// callers that construct the server directly.
+	if err := auth.EnsureBindAllowed(s.listenAddr); err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(s.listenAddr, strconv.Itoa(s.port)))
 	if err != nil {
 		return err
 	}
@@ -84,8 +98,8 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	// within socksHandshakeTimeout or the connection is dropped.
 	clientConn.SetReadDeadline(time.Now().Add(socksHandshakeTimeout))
 
-	// Greeting: [VER=0x05, NMETHODS, METHODS...]. Only no-auth (0x00) is
-	// offered; any other version is rejected by closing the connection.
+	// Greeting: [VER=0x05, NMETHODS, METHODS...]. Any other version is
+	// rejected by closing the connection.
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(clientConn, header); err != nil {
 		return
@@ -97,7 +111,32 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	if _, err := io.ReadFull(clientConn, methods); err != nil {
 		return
 	}
-	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
+
+	// Method selection (F-14): PROXY_USERS set → RFC 1929 user/password
+	// (0x02) is mandatory and no-auth cannot slip through; unset → the
+	// historical no-auth (0x00) reply.
+	users, required, err := auth.UsersFromEnv()
+	if err != nil {
+		// Malformed PROXY_USERS: fail closed (no usable users, every
+		// subnegotiation fails), but still negotiate 0x02 so the client
+		// gets a status instead of a silent hang.
+		slog.Error("invalid PROXY_USERS, rejecting socks5 connections", "error", err)
+	}
+	if required {
+		if !bytes.Contains(methods, []byte{0x02}) {
+			// RFC 1928 §3: no acceptable method offered.
+			if _, err := clientConn.Write([]byte{0x05, 0xFF}); err != nil {
+				return
+			}
+			return
+		}
+		if _, err := clientConn.Write([]byte{0x05, 0x02}); err != nil {
+			return
+		}
+		if !socksAuthenticate(clientConn, users) {
+			return
+		}
+	} else if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
@@ -117,6 +156,13 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	targetHost, err := parseSocksTarget(clientConn, req[3])
 	if err != nil {
 		writeSocksReply(clientConn, 0x08) // address type not supported
+		return
+	}
+
+	// SSRF guard (F-14): never dial loopback/link-local/private targets
+	// unless ALLOW_PRIVATE_TARGETS=true.
+	if !auth.TargetAllowed(targetHost, auth.AllowPrivateTargetsFromEnv()) {
+		writeSocksReply(clientConn, 0x02) // connection not allowed by ruleset
 		return
 	}
 
@@ -171,6 +217,41 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	clientConn.SetReadDeadline(time.Time{})
 
 	s.relayThroughWAN(wanIndex, targetHost, start, "socks5", clientConn, upstream, nil)
+}
+
+// socksAuthenticate performs the RFC 1929 username/password subnegotiation
+// ([VER=0x01, ULEN, UNAME, PLEN, PASSWD]) and reports whether the
+// credentials matched. A failed exchange is answered with [0x01, 0x01]
+// (failure) and the caller drops the connection; success is [0x01, 0x00].
+// Credential comparison is constant-time (auth.CheckUsers).
+func socksAuthenticate(conn net.Conn, users []auth.UserCred) bool {
+	sub := make([]byte, 2) // VER, ULEN
+	if _, err := io.ReadFull(conn, sub); err != nil {
+		return false
+	}
+	if sub[0] != 0x01 {
+		return false
+	}
+	uname := make([]byte, int(sub[1]))
+	if _, err := io.ReadFull(conn, uname); err != nil {
+		return false
+	}
+	plen := make([]byte, 1)
+	if _, err := io.ReadFull(conn, plen); err != nil {
+		return false
+	}
+	passwd := make([]byte, int(plen[0]))
+	if _, err := io.ReadFull(conn, passwd); err != nil {
+		return false
+	}
+	if !auth.CheckUsers(users, string(uname), string(passwd)) {
+		if _, err := conn.Write([]byte{0x01, 0x01}); err != nil {
+			return false
+		}
+		return false
+	}
+	_, err := conn.Write([]byte{0x01, 0x00})
+	return err == nil
 }
 
 // writeSocksReply sends a fixed-shape SOCKS5 reply: VER 0x05, REP, RSV 0x00,

@@ -51,6 +51,11 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"ALLOW_DEGRADED_BOOT",
 		"ALLOW_HTTP_SUBSCRIPTION",
 		"XRAY_MUX",
+		"LISTEN_ADDR",
+		"PROXY_USERS",
+		"API_TOKEN",
+		"ALLOW_PUBLIC",
+		"ALLOW_PRIVATE_TARGETS",
 	} {
 		unsetenv(t, key)
 	}
@@ -120,6 +125,22 @@ func TestParseConfig_Defaults(t *testing.T) {
 	}
 	if cfg.XrayMux {
 		t.Error("XrayMux = true, want false (D-04: mux off by default)")
+	}
+	// F-14 defaults: loopback bind, no auth, private targets blocked.
+	if cfg.ListenAddr != "127.0.0.1" {
+		t.Errorf("ListenAddr = %q, want 127.0.0.1 (loopback by default)", cfg.ListenAddr)
+	}
+	if len(cfg.ProxyUsers) != 0 {
+		t.Errorf("ProxyUsers = %+v, want none by default", cfg.ProxyUsers)
+	}
+	if cfg.APIToken != "" {
+		t.Errorf("APIToken = %q, want empty by default", cfg.APIToken)
+	}
+	if cfg.AllowPublic {
+		t.Error("AllowPublic = true, want false by default")
+	}
+	if cfg.AllowPrivateTargets {
+		t.Error("AllowPrivateTargets = true, want false by default (SSRF guard on)")
 	}
 }
 
