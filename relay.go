@@ -11,6 +11,7 @@ import (
 	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/relayio"
+	"viberoxy/internal/retry"
 )
 
 // wanRelay carries the WAN pool and per-connection relay settings shared by
@@ -28,7 +29,17 @@ type wanRelay struct {
 	// defaults (300s / 30s); fields exist so tests can inject short values.
 	IdleTimeout      time.Duration
 	HandshakeTimeout time.Duration
+	// Retry is the bounded dial-stage failover policy (F-08 stage 1): how
+	// many WAN paths one connection may attempt (max 2 extra), the shared
+	// dial budget and the token-bucket storm guard. Zero means
+	// defaultDialRetry; tests inject their own policy.
+	Retry *retry.Policy
 }
+
+// defaultDialRetry backs hand-built wanRelays (tests do &wanRelay{pool: p})
+// that never went through NewProxyServer/NewSocksServer. It is shared so the
+// token-bucket storm guard still sees aggregate traffic from those callers.
+var defaultDialRetry = retry.New(retry.Options{})
 
 // relayOptions builds the splice options for one proxied connection on the
 // given byte-metric label ("direct" or the WAN index). Byte metrics are fed
@@ -69,8 +80,9 @@ func (r *wanRelay) endWAN(wanPath *path.Path) {
 
 // dialWAN connects to the slot's local SOCKS5 listener and completes the
 // SOCKS5 handshake to targetHost. On failure it records the failure on the
-// held path, writes the access-log line and returns the error; the caller maps
-// the error to its protocol-specific reply (HTTP 502 vs SOCKS5 REP 0x01).
+// held path, writes the access-log line and returns the error; the caller
+// maps the error to its protocol-specific reply (HTTP 502 vs SOCKS5 REP 0x01)
+// or, through dialWANFailover, retries it on another path first.
 func (r *wanRelay) dialWAN(ctx context.Context, wanPath *path.Path, targetHost string, start time.Time, proto string) (net.Conn, error) {
 	// The service port is read from the slot: it is fixed for the slot's
 	// lifetime, so the held path and the occupant behind it always agree.
@@ -83,6 +95,63 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanPath *path.Path, targetHost s
 		return nil, err
 	}
 	return conn, nil
+}
+
+// dialWANFailover runs the bounded dial stage for one connection (F-08 stage
+// 1): select the best WAN path, dial it, and on a DIAL-STAGE failure retry on
+// the next-best path that has not been tried yet on this connection — at most
+// r.Retry.MaxAttempts (3 total) attempts inside one shared dial budget,
+// guarded by the policy's token bucket. On success it returns the live
+// connection and the path that produced it; the caller must defer
+// endWAN(wanPath) with that very pointer and owns the conn. On failure it
+// returns nil, nil and an error: retry.ErrNoCandidate when no path was ever
+// eligible (front-ends answer 503 / their no-WAN reply), the last dial error
+// otherwise (502 / REP 0x01 — the pre-existing final-failure semantics).
+//
+// SAFETY (T-RETRY-03/04): this is a DIAL-stage retry only. Every attempt
+// happens before the relay splices a single application byte, and the retry
+// helper (retry.Run) terminates on the first successful dial — there is no
+// code here, deliberately, that could re-dial or replay once the relay has
+// started. Direct-route dials never come through here: a direct failure is a
+// direct failure.
+func (r *wanRelay) dialWANFailover(ctx context.Context, targetHost string, start time.Time, proto string) (net.Conn, *path.Path, error) {
+	pol := r.Retry
+	if pol == nil {
+		pol = defaultDialRetry
+	}
+
+	// Paths already attempted on THIS connection. next() hands out the
+	// best path not in here and marks it, so every retry lands on a path
+	// not yet tried while the selection rule stays GetLeastLoaded's.
+	tried := make(map[*path.Path]bool)
+	next := func() (*path.Path, bool) {
+		cand := r.pool.GetLeastLoadedExcluding(tried, r.WanFailThreshold)
+		if cand == nil {
+			return nil, false
+		}
+		tried[cand] = true
+		return cand, true
+	}
+
+	// One dial-stage attempt on one path: reserve around the dial exactly
+	// like the pre-failover code did, and give the reservation back when
+	// the dial fails (the connection never used that path). On success the
+	// reservation stays held — the caller releases it via endWAN.
+	dial := func(actx context.Context, cand *path.Path) (net.Conn, error) {
+		r.beginWAN(cand, proto)
+		conn, err := r.dialWAN(actx, cand, targetHost, start, proto)
+		if err != nil {
+			r.endWAN(cand)
+			return nil, err
+		}
+		return conn, nil
+	}
+
+	conn, wanPath, err := retry.Run(ctx, pol, next, dial)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, wanPath, nil
 }
 
 // decideRoute returns the egress route for a target host. With no router

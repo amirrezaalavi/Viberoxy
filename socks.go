@@ -11,6 +11,7 @@ import (
 	"time"
 	"viberoxy/internal/auth"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/retry"
 )
 
 // socksHandshakeTimeout bounds the SOCKS5 greeting/request phase so a client
@@ -45,6 +46,7 @@ func NewSocksServer(port int, pool *WANPool, router ...*proxycfg.Router) *SocksS
 			pool:             pool,
 			AccessLog:        true,
 			WanFailThreshold: DefaultFailThreshold,
+			Retry:            retry.New(retry.Options{}),
 		},
 	}
 	if len(router) > 0 {
@@ -189,22 +191,19 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 		return
 	}
 
-	wanPath := s.pool.GetLeastLoaded(s.WanFailThreshold)
-	if wanPath == nil {
-		writeSocksReply(clientConn, 0x01) // general failure
-		return
-	}
-
-	s.beginWAN(wanPath, "socks5")
-	defer s.endWAN(wanPath)
-
 	dialCtx, cancel := context.WithTimeout(context.Background(), socksDialTimeout)
 	defer cancel()
-	upstream, err := s.dialWAN(dialCtx, wanPath, targetHost, start, "socks5")
+
+	// Bounded dial-stage failover (F-08 stage 1): the dial phase may touch
+	// several distinct WAN paths within the retry policy's attempt cap and
+	// budget. Both final outcomes keep the historical reply: no eligible
+	// WAN and exhausted attempts are each REP 0x01 (general failure).
+	upstream, wanPath, err := s.dialWANFailover(dialCtx, targetHost, start, "socks5")
 	if err != nil {
 		writeSocksReply(clientConn, 0x01) // general failure
 		return
 	}
+	defer s.endWAN(wanPath)
 	defer upstream.Close()
 
 	// Success: REP 0x00, RSV 0x00, ATYP 0x01 (IPv4), BND.ADDR 0.0.0.0,
