@@ -11,7 +11,7 @@ import (
 func TestIsXraySupported(t *testing.T) {
 	supported := []string{
 		"ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#S",
-		"vmess://" + base64.StdEncoding.EncodeToString(mustMarshal(map[string]interface{}{"add": "1.2.3.4", "port": 443, "ps": "V"})),
+		"vmess://" + base64.StdEncoding.EncodeToString(mustMarshal(map[string]interface{}{"add": "1.2.3.4", "port": 443, "id": "109d47e4-4efe-45f8-9f63-52af26e1a5e2", "ps": "V"})),
 		"vless://109d47e4-4efe-45f8-9f63-52af26e1a5e2@1.2.3.4:12345?encryption=none#V",
 		"trojan://password123@1.2.3.4:443#T",
 		"socks5://user:pass@1.2.3.4:1080#S5",
@@ -128,6 +128,7 @@ func TestParseVMess_PortAsString(t *testing.T) {
 		"add":  "1.2.3.4",
 		"port": "54321",
 		"ps":   "PortString",
+		"id":   "109d47e4-4efe-45f8-9f63-52af26e1a5e2",
 	}
 	b, _ := json.Marshal(v)
 	raw := "vmess://" + base64.StdEncoding.EncodeToString(b)
@@ -149,6 +150,7 @@ func TestParseVMess_AddressField(t *testing.T) {
 		"address": "5.6.7.8",
 		"port":    8080,
 		"ps":      "AddrField",
+		"id":      "109d47e4-4efe-45f8-9f63-52af26e1a5e2",
 	}
 	b, _ := json.Marshal(v)
 	raw := "vmess://" + base64.StdEncoding.EncodeToString(b)
@@ -470,7 +472,7 @@ func TestParseBase64Subscription(t *testing.T) {
 	lines := []string{
 		"ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#MySS",
 		"trojan://pass@5.6.7.8:443#TrojanA",
-		"vmess://" + base64.StdEncoding.EncodeToString(mustMarshal(map[string]interface{}{"add": "9.10.11.12", "port": 443, "ps": "VMessB"})),
+		"vmess://" + base64.StdEncoding.EncodeToString(mustMarshal(map[string]interface{}{"add": "9.10.11.12", "port": 443, "id": "109d47e4-4efe-45f8-9f63-52af26e1a5e2", "ps": "VMessB"})),
 		"hysteria2://auth@13.14.15.16:443#Hy2C",
 		"# this is a comment",
 		"",
