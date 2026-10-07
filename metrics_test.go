@@ -10,6 +10,31 @@ import (
 	"viberoxy/internal/proxycfg"
 )
 
+// isolateMetricSeries gives a test its own view of one series of a
+// process-global metric: the series starts genuinely unset ("never recorded"
+// — Value reports 0 and the exposition omits it) regardless of which tests
+// ran before, and whatever state existed beforehand is restored on cleanup.
+// Global metrics are shared across the package, so any test asserting an
+// unset value must establish that state itself rather than assume a virgin
+// registry (go test -shuffle=on reorders tests between runs).
+func isolateMetricSeries(t *testing.T, m *Metric, labelValues ...string) {
+	t.Helper()
+	key := strings.Join(labelValues, "\x00")
+	m.mu.Lock()
+	prev, had := m.series[key]
+	delete(m.series, key)
+	m.mu.Unlock()
+	t.Cleanup(func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if had {
+			m.series[key] = prev
+		} else {
+			delete(m.series, key)
+		}
+	})
+}
+
 func TestRegistry_ExpositionFormat(t *testing.T) {
 	reg := NewRegistry()
 	g := NewGauge("test_gauge", "A test gauge.", "wan")
@@ -212,6 +237,11 @@ func TestObservabilityHandler(t *testing.T) {
 }
 
 func TestRefreshPoolMetrics(t *testing.T) {
+	// Slot 1's speed series must be genuinely unset: refreshPoolMetrics only
+	// writes speeds > 0, so any earlier write from another test would poison
+	// the "no speed recorded" assertion below.
+	isolateMetricSeries(t, metricWanSpeedMbps, "1")
+
 	pool := NewWANPool(2, 10700)
 	pool.Slots[0].State = StateActive
 	pool.SetSlotSpeedMbps(0, 12.5)
@@ -230,6 +260,12 @@ func TestRefreshPoolMetrics(t *testing.T) {
 }
 
 func TestMetricWanStability(t *testing.T) {
+	// Other tests write these series via SetSlotStability (pool state is
+	// per-test, but the gauge is process-global), so establish the "never
+	// probed" state explicitly instead of assuming a virgin registry.
+	isolateMetricSeries(t, metricWanStability, "0")
+	isolateMetricSeries(t, metricWanStability, "1")
+
 	pool := NewWANPool(2, 10700)
 
 	// Unknown/never probed: gauge stays unset (0).
