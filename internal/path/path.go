@@ -270,7 +270,8 @@ const (
 // returns true exactly when this outcome newly EJECTS the path — the
 // caller then sees the path state move Active -> Suspect (not-selected);
 // Draining/Dead states are never overwritten, drain policy belongs to the
-// drain task.
+// drain task. An ejection also notifies the observer (SPEC-M) with the
+// SPEC-H.3 rule that fired.
 func (p *Path) RecordOutcome(now time.Time, dest string, o health.Outcome) bool {
 	if p == nil {
 		return false
@@ -281,9 +282,12 @@ func (p *Path) RecordOutcome(now time.Time, dest string, o health.Outcome) bool 
 	case health.HardFail:
 		p.RecordFailure()
 	}
-	ejected := p.hc.Record(now, dest, o)
+	ejected, reason := p.hc.RecordWithReason(now, dest, o)
 	if ejected && p.GetState() == Active {
 		p.SetState(Suspect)
+	}
+	if ejected {
+		notify(Event{Kind: EventEjection, Path: p, Reason: reason})
 	}
 	return ejected
 }
@@ -351,6 +355,8 @@ func (p *Path) HealthSnapshot(now time.Time) health.Snapshot {
 // moves a fraction 1-exp(-dt/tau) of the way to the better sample, so a
 // path that recovers earns its standing back gradually instead of on one
 // lucky relay, while a regression is priced in on the very next sample.
+// A non-zero sample also notifies the observer (SPEC-M:
+// viberoxy_path_ttfb_seconds), once per sample, from the caller's values.
 func (p *Path) RecordHealth(ttfb time.Duration, goodputBps float64) {
 	p.recordHealthAt(time.Now(), ttfb, goodputBps)
 }
@@ -362,8 +368,6 @@ func (p *Path) recordHealthAt(now time.Time, ttfb time.Duration, goodputBps floa
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if ttfb > 0 {
 		switch {
 		case p.ewmaTTFB == 0:
@@ -386,6 +390,11 @@ func (p *Path) recordHealthAt(now time.Time, ttfb time.Duration, goodputBps floa
 	}
 	if now.After(p.healthAt) {
 		p.healthAt = now
+	}
+	p.mu.Unlock()
+
+	if ttfb > 0 || goodputBps > 0 {
+		notify(Event{Kind: EventSample, Path: p, TTFB: ttfb, GoodputBps: goodputBps})
 	}
 }
 

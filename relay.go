@@ -114,6 +114,9 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanPath *path.Path, targetHost s
 		// whose SOCKS layer answers but cannot be dialed ejects like any
 		// other hard failure.
 		wanPath.RecordOutcome(time.Now(), targetHost, health.HardFail)
+		// Dial-stage failures are connection outcomes too (SPEC-M):
+		// the same HardFail the window records, reason dial_error.
+		recordConnOutcome(wanPath, health.HardFail, "dial_error")
 		slog.Warn("socks5 dial failed", "wan", wanPath.Slot, "target", targetHost, "error", err)
 		r.logAccess(targetHost, wanPath.Slot, 0, 0, start, "err", proto, "wan")
 		return nil, err
@@ -270,9 +273,21 @@ func (r *wanRelay) directRelay(targetHost string, start time.Time, proto string,
 }
 
 // logAccess emits one structured access-log line per proxied connection.
+//
+// F-16 truth: the logged status is DERIVED from what actually happened,
+// not from what the caller hoped — "ok" only when bytes reached the client
+// (down > 0), "err" otherwise, the same rule health.Classify scores the
+// connection with. The status argument is deliberately kept (call sites
+// unchanged) and always overridden here, so no call site can log a relay
+// that delivered nothing as "ok".
 func (r *wanRelay) logAccess(target string, wan int, up, down int64, start time.Time, status, proto, route string) {
 	if !r.AccessLog {
 		return
+	}
+	if down > 0 {
+		status = "ok"
+	} else {
+		status = "err"
 	}
 	slog.Info("proxy access",
 		"target", target,
@@ -320,12 +335,17 @@ func (r *wanRelay) relayThroughWAN(wanPath *path.Path, targetHost string, start 
 	// F-01: only down > 0 credits success; up > 0 with nothing delivered
 	// is a hard failure that feeds the window (a black-holing WAN stops
 	// resetting its failure counter and can be ejected).
-	outcome := health.Classify(health.Result{
+	//
+	// ClassifyReason is Classify plus the clause that decided it, so the
+	// same call feeds the window below AND viberoxy_conn_outcome_total
+	// (SPEC-M / F-16) — metric and health can never disagree.
+	outcome, outcomeReason := health.ClassifyReason(health.Result{
 		Up:       stats.Up,
 		Down:     stats.Down,
 		Err:      stats.Err,
 		Duration: duration,
 	})
+	recordConnOutcome(wanPath, outcome, outcomeReason)
 	if ejected := wanPath.RecordOutcome(time.Now(), targetHost, outcome); ejected {
 		slog.Warn("wan ejected by passive health",
 			"wan", wanPath.Slot, "target", targetHost, "outcome", outcome)

@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"viberoxy/internal/health"
+	"viberoxy/internal/path"
+	"viberoxy/internal/retry"
 )
 
 // histogramBuckets are the fixed bucket edges (in seconds) shared by all
@@ -152,6 +155,16 @@ func (m *Metric) Value(labelValues ...string) float64 {
 	return s.value
 }
 
+// Delete removes one series (identified by its label values) from the
+// metric. Used to retire per-path series once their generation is gone,
+// so cardinality stays bounded by the live path generations. No-op when
+// the series was never recorded.
+func (m *Metric) Delete(labelValues ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.series, strings.Join(labelValues, "\x00"))
+}
+
 // Registry holds a set of metrics and renders them in Prometheus text format.
 type Registry struct {
 	mu      sync.Mutex
@@ -256,6 +269,11 @@ func escapeLabelValue(s string) string {
 }
 
 // Global observability metrics shared across the process.
+//
+// SPEC-M (F-16) metrics live next to the historical ones. Their labels:
+// "path" is the path generation ID (internal/path Path.ID — monotonic,
+// never reused), "slot" the stable WAN slot index; "path" and "slot" are
+// therefore always distinct values.
 var (
 	metricsRegistry        = NewRegistry()
 	metricWansActive       = NewGauge("viberoxy_wans_active", "Number of active WAN slots.")
@@ -266,8 +284,47 @@ var (
 	metricProxyLatency     = NewHistogram("viberoxy_proxy_latency_seconds", "Tunnel latency from CONNECT to close, in seconds.")
 	metricTestDuration     = NewHistogram("viberoxy_test_duration_seconds", "Duration of one speed test, in seconds.")
 	metricBuildInfo        = NewGauge("viberoxy_build_info", "Build information.", "version")
+
+	// Per-path state and performance (refreshed from the pool on each
+	// /metrics scrape; the TTFB histogram is fed per sample by the path
+	// observer, never re-observed at scrape time).
+	metricPathState    = NewGauge("viberoxy_path_state", "Path lifecycle state: 0=probation, 1=active, 2=suspect, 3=draining, 4=dead.", "path", "slot")
+	metricPathInflight = NewGauge("viberoxy_path_inflight", "Connections in flight on this path generation.", "path", "slot")
+	metricPathTTFB     = NewHistogram("viberoxy_path_ttfb_seconds", "Time-to-first-byte samples observed on paths, in seconds.")
+	metricPathGoodput  = NewGauge("viberoxy_path_goodput_bps", "Goodput EWMA of this path generation in bits per second.", "path", "slot")
+
+	// Classified connection outcomes and health ejections (fed at relay
+	// end from health.ClassifyReason, and from the path observer on
+	// ejection).
+	metricConnOutcome   = NewCounter("viberoxy_conn_outcome_total", "Classified relay outcomes per path generation (SPEC-H.1).", "path", "outcome", "reason")
+	metricPathEjections = NewCounter("viberoxy_path_ejections_total", "Health ejections per path generation, by the SPEC-H.3 rule that fired.", "path", "reason")
+
+	// Retry, rotation, environment and selection behavior.
+	metricRetryTotal          = NewCounter("viberoxy_retry_total", "Dial-stage retry events by stage and outcome.", "stage", "outcome")
+	metricSwapTotal           = NewCounter("viberoxy_swap_total", "Rotation decisions by result (swapped|cooldown|dwell|hysteresis|no_candidate).", "result")
+	metricEnvDegraded         = NewGauge("viberoxy_env_degraded", "1 while the environmental canary breaker is tripped (SPEC-H.6), else 0.")
+	metricSelectionLastResort = NewCounter("viberoxy_selection_last_resort_total", "Selections that had to fall back to a degraded (or, last resort, draining) path.")
+
+	// Drains and the must-stay-zero session-reset counter.
+	metricDrainSeconds        = NewHistogram("viberoxy_drain_seconds", "Time a slot spent draining before it was reaped or un-drained, in seconds.")
+	metricSessionResetOnDrain = NewCounter("viberoxy_session_reset_on_drain_total", "Sessions reset because a path drained. MUST stay 0: a drain never resets a live session.")
 )
 
+// recordConnOutcome counts one classified relay outcome against the path
+// generation that carried it (F-16 / SPEC-M). Called at relay end with the
+// result of health.ClassifyReason — the very classification the health
+// window is fed — so the metric and the window can never disagree.
+func recordConnOutcome(p *path.Path, o health.Outcome, reason string) {
+	if p == nil {
+		return
+	}
+	metricConnOutcome.Inc(strconv.FormatUint(p.ID, 10), o.String(), reason)
+}
+
+// init registers every metric and wires the hooks the internal packages
+// expose (retry events, path ejections/samples). Those packages cannot
+// import this registry — package main sits above them — so the hook is
+// installed here, once, instead of an import cycle existing.
 func init() {
 	metricsRegistry.Register(metricWansActive)
 	metricsRegistry.Register(metricWanSpeedMbps)
@@ -277,5 +334,44 @@ func init() {
 	metricsRegistry.Register(metricProxyLatency)
 	metricsRegistry.Register(metricTestDuration)
 	metricsRegistry.Register(metricBuildInfo)
+	metricsRegistry.Register(metricPathState)
+	metricsRegistry.Register(metricPathInflight)
+	metricsRegistry.Register(metricPathTTFB)
+	metricsRegistry.Register(metricPathGoodput)
+	metricsRegistry.Register(metricConnOutcome)
+	metricsRegistry.Register(metricPathEjections)
+	metricsRegistry.Register(metricRetryTotal)
+	metricsRegistry.Register(metricSwapTotal)
+	metricsRegistry.Register(metricEnvDegraded)
+	metricsRegistry.Register(metricSelectionLastResort)
+	metricsRegistry.Register(metricDrainSeconds)
+	metricsRegistry.Register(metricSessionResetOnDrain)
 	metricBuildInfo.Set(1, version)
+
+	// Zero-valued series that must be visible from the first scrape:
+	// env_degraded starts healthy, no selection has fallen back yet, and
+	// session_reset_on_drain_total must read 0 forever (SPEC-M).
+	metricEnvDegraded.Set(0)
+	metricSelectionLastResort.Set(0)
+	metricSessionResetOnDrain.Set(0)
+
+	// internal/retry -> viberoxy_retry_total{stage,outcome}.
+	retry.SetEventHook(func(stage, outcome string) {
+		metricRetryTotal.Inc(stage, outcome)
+	})
+
+	// internal/path events -> ejection counter + TTFB histogram.
+	path.SetObserver(func(ev path.Event) {
+		if ev.Path == nil {
+			return
+		}
+		switch ev.Kind {
+		case path.EventEjection:
+			metricPathEjections.Inc(strconv.FormatUint(ev.Path.ID, 10), ev.Reason)
+		case path.EventSample:
+			if ev.TTFB > 0 {
+				metricPathTTFB.Observe(ev.TTFB.Seconds())
+			}
+		}
+	})
 }

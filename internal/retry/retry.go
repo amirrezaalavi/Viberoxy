@@ -41,6 +41,48 @@ const (
 // failed", so front-ends can keep 503 vs 502 / REP 0x01 semantics.
 var ErrNoCandidate = errors.New("retry: no candidate to dial")
 
+// StageDial is the only retry stage that exists: the dial stage. The
+// T-RETRY-03/04 safety rule forbids any post-dial retry, so no other stage
+// may ever be emitted from here.
+const StageDial = "dial"
+
+// EventHook receives one dial-stage event (SPEC-M, viberoxy_retry_total):
+// stage is StageDial and outcome is one of
+//
+//	success      — the dial succeeded (terminal)
+//	retry        — the attempt failed and another attempt follows
+//	failed       — the attempt failed and the dial stage ends
+//	no_candidate — no candidate was ever available to dial
+//
+// exactly once per attempt (plus once for the empty-pool case). The hook
+// exists so package main can count retry events without internal/retry
+// importing the metric registry (no import cycle).
+type EventHook func(stage, outcome string)
+
+var (
+	hookMu    sync.RWMutex
+	eventHook EventHook
+)
+
+// SetEventHook installs the observability hook (nil uninstalls it). It is
+// wired once at process start from metrics.go's init.
+func SetEventHook(fn EventHook) {
+	hookMu.Lock()
+	eventHook = fn
+	hookMu.Unlock()
+}
+
+// emit delivers one event to the installed hook, if any. Called with no
+// policy lock held (Run holds none), so the hook may take its own locks.
+func emit(stage, outcome string) {
+	hookMu.RLock()
+	fn := eventHook
+	hookMu.RUnlock()
+	if fn != nil {
+		fn(stage, outcome)
+	}
+}
+
 // Options configures a Policy. Any non-positive numeric field selects its
 // default; pass MaxAttempts=1 to disable retries outright.
 type Options struct {
@@ -194,6 +236,7 @@ func Run[C any](ctx context.Context, p *Policy, next func() (C, bool), dial func
 
 	cand, ok := next()
 	if !ok {
+		emit(StageDial, "no_candidate")
 		return nil, zero, ErrNoCandidate
 	}
 
@@ -203,26 +246,24 @@ func Run[C any](ctx context.Context, p *Policy, next func() (C, bool), dial func
 		if err == nil {
 			// Terminal: hand the connection back untouched. No further
 			// candidate is even requested once a dial has succeeded.
+			emit(StageDial, "success")
 			return conn, cand, nil
 		}
 		lastErr = err
 
-		if attempt >= p.MaxAttempts {
-			break // attempt cap (max 2 extra attempts by default)
+		// Decide (in the pre-existing stop order: attempt cap, shared
+		// budget, no candidate, empty bucket) whether this failure ends
+		// the dial stage or buys one more attempt.
+		outcome := "failed"
+		if attempt < p.MaxAttempts && p.now().Before(deadline) {
+			if nxt, ok := next(); ok && p.Bucket.Take() {
+				outcome = "retry"
+				cand = nxt
+			}
 		}
-		if !p.now().Before(deadline) {
-			break // shared dial budget exhausted
+		emit(StageDial, outcome)
+		if outcome != "retry" {
+			return nil, zero, lastErr
 		}
-		nxt, ok := next()
-		if !ok {
-			break // no eligible candidate left (already-tried excluded)
-		}
-		if !p.Bucket.Take() {
-			// Storm guard: empty retry budget => fail fast on this
-			// dial error instead of piling onto the pool.
-			break
-		}
-		cand = nxt
 	}
-	return nil, zero, lastErr
 }

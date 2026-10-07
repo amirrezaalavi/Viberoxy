@@ -129,17 +129,33 @@ func (r Result) tFirst() time.Duration {
 // ever came back" — no upstream byte ever arrived either way, so both are
 // hard failures; the T_FIRST branch is the timed flavor of that rule.
 func Classify(r Result) Outcome {
+	o, _ := ClassifyReason(r)
+	return o
+}
+
+// ClassifyReason is Classify plus the SPEC-H.1 clause that decided it, as a
+// short stable reason string for observability (F-16, SPEC-M — the reason
+// label of viberoxy_conn_outcome_total):
+//
+//	dial_error        — DialErr != nil (dial-stage failure)
+//	delivered         — down > 0: bytes reached the client (OK)
+//	first_byte_timeout— client sent, no upstream byte within T_FIRST
+//	no_down            — client sent, connection ended with nothing back
+//	client_abort       — up == 0 && down == 0 (Neutral)
+//
+// The outcome is byte-for-byte Classify's; the reason only names the clause.
+func ClassifyReason(r Result) (Outcome, string) {
 	if r.DialErr != nil {
-		return HardFail // dial error
+		return HardFail, "dial_error"
 	}
 	if r.Down > 0 {
-		return OK // success rule: bytes reached the client
+		return OK, "delivered"
 	}
 	if r.Up > 0 && r.Duration >= r.tFirst() {
-		return HardFail // no first byte within T_FIRST while the client sent data
+		return HardFail, "first_byte_timeout"
 	}
 	if r.Up > 0 {
-		return HardFail // up > 0 && down == 0 at close
+		return HardFail, "no_down"
 	}
-	return Neutral // up == 0 && down == 0: client abort
+	return Neutral, "client_abort"
 }

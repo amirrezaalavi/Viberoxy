@@ -525,6 +525,11 @@ func (p *WANPool) UnDrainIfRecovered(index int, halfOpenRecovery bool) bool {
 	if cur.GetState() != path.Draining {
 		return false // retired/vacant generation: nothing to bring back
 	}
+	// The drain ends HERE instead of at the reap: record how long it
+	// lasted (SPEC-M viberoxy_drain_seconds) while DrainAt is intact.
+	if !slot.DrainAt.IsZero() {
+		metricDrainSeconds.Observe(time.Since(slot.DrainAt).Seconds())
+	}
 	slot.State = StateActive
 	slot.DrainAt = time.Time{}
 	slot.drainReason = DrainReplace
@@ -969,13 +974,20 @@ func (p *WANPool) Select(opts SelectOptions) (*path.Path, func()) {
 	if opts.ClientID != "" && affinity.Sticky(opts.Hostport) {
 		siteKey = affinity.SiteKey(opts.Hostport)
 	}
-	return sched.Select(sched.Request{
+	picked, release := sched.Select(sched.Request{
 		Routable:   routable,
 		Degraded:   degraded,
 		LastResort: lastResort,
 		ClientID:   opts.ClientID,
 		SiteKey:    siteKey,
 	})
+	if picked != nil && len(routable) == 0 {
+		// Degraded or draining last-resort pick (SPEC-M): availability
+		// over preference — count it. Routed through the production
+		// entry so the metric reflects what selection actually did.
+		metricSelectionLastResort.Inc()
+	}
+	return picked, release
 }
 
 // DrainExpired returns the indices of draining slots whose drain is
@@ -1013,6 +1025,23 @@ func (p *WANPool) DrainExpired(maxDrain time.Duration) []int {
 		}
 	}
 	return result
+}
+
+// observeDrainDuration records how long slot index has been draining
+// (SPEC-M viberoxy_drain_seconds). No-op for out-of-range indices and for
+// a slot that never started draining (zero DrainAt).
+func (p *WANPool) observeDrainDuration(index int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	drainAt := slot.DrainAt
+	slot.mu.Unlock()
+	if drainAt.IsZero() {
+		return
+	}
+	metricDrainSeconds.Observe(time.Since(drainAt).Seconds())
 }
 
 func (p *WANPool) HealthCheckAll() []int {

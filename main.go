@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -539,6 +540,7 @@ func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
 
 	degraded, failing := health.ApplyCanary(results)
 	health.SetEnvDegraded(degraded)
+	metricEnvDegraded.Set(bool01(degraded)) // SPEC-M: stamped at event time too
 	if degraded {
 		slog.Warn("env_degraded: canary endpoints failing on most paths; keeping everything serving",
 			"paths", len(results), "interval", "environmental")
@@ -802,16 +804,35 @@ func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64,
 	return rotationDecision{Victim: victim, Candidate: cand, Reason: "swap"}
 }
 
+// swapResultOf maps a rotationDecision.Reason onto the closed set of
+// viberoxy_swap_total result labels (SPEC-M): the reason strings are
+// free-form log text, the metric labels are stable.
+func swapResultOf(reason string) string {
+	switch {
+	case strings.HasPrefix(reason, "cooldown"):
+		return "cooldown"
+	case strings.HasPrefix(reason, "dwell"):
+		return "dwell"
+	case strings.HasPrefix(reason, "hysteresis"):
+		return "hysteresis"
+	default:
+		// "no candidate cleared the speed bar..." and "no active wan":
+		// no swap happened because no candidate cleared the gates.
+		return "no_candidate"
+	}
+}
+
 // maybeSwap runs SPEC-R's rotation for one cycle: decide, then perform
 // the single chosen swap through the make-before-break DropAndReplace
 // path (the old occupant keeps serving until the candidate is tested
 // and started on a spare port). At most one DropAndReplace ever runs
 // per call, so a cycle can never swap twice; a successful cutover
 // stamps lastSwap to start the cooldown. Returns true iff a swap cut
-// over.
+// over. Every verdict increments viberoxy_swap_total{result} (SPEC-M).
 func (r *rotator) maybeSwap(pool *WANPool, cfg *proxycfg.Config, results []*TestResult) bool {
 	d := r.decide(pool, results, cfg.MinimumSpeed, time.Duration(cfg.FetchInterval)*time.Second)
 	if d.Victim < 0 {
+		metricSwapTotal.Inc(swapResultOf(d.Reason))
 		slog.Info("cycle: rotation skipped", "reason", d.Reason)
 		return false
 	}
@@ -844,13 +865,32 @@ func (r *rotator) maybeSwap(pool *WANPool, cfg *proxycfg.Config, results []*Test
 		"speed", d.Candidate.Speed,
 		"incumbent_speed", pool.SlotSpeedMbps(d.Victim))
 	if _, err := pool.DropAndReplace(d.Victim, opts); err != nil {
+		// Every failure path here is a candidate-class refusal (no
+		// candidate, failed re-test, failed start, lost swap race):
+		// the observable result is "no swap because of the candidate".
+		metricSwapTotal.Inc("no_candidate")
 		slog.Warn("cycle: rotation swap failed", "index", d.Victim, "error", err)
 		return false
 	}
+	metricSwapTotal.Inc("swapped")
 	r.mu.Lock()
 	r.lastSwap = r.now()
 	r.mu.Unlock()
 	return true
+}
+
+// reapCompletedDrains performs the cycle's drain reap (F-02): every drain
+// DrainExpired reports complete is recorded as a drain duration
+// (SPEC-M viberoxy_drain_seconds) while DrainAt is still intact, logged,
+// and reset. Returns the reaped indices.
+func reapCompletedDrains(pool *WANPool, drainMax time.Duration) []int {
+	expired := pool.DrainExpired(drainMax)
+	for _, idx := range expired {
+		pool.observeDrainDuration(idx)
+		slog.Info("cycle: draining expired", "index", idx)
+		pool.ResetEmpty(idx)
+	}
+	return expired
 }
 
 // runCycle runs one fetch/test/replace cycle. drainMax is DRAIN_MAX
@@ -868,10 +908,7 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 	// Reap completed drains (F-02): inflight == 0, or DRAIN_MAX elapsed;
 	// a health-drained slot whose canary streak recovered comes back to
 	// Active inside DrainExpired instead of being killed here.
-	for _, idx := range pool.DrainExpired(drainMax) {
-		slog.Info("cycle: draining expired", "index", idx)
-		pool.ResetEmpty(idx)
-	}
+	reapCompletedDrains(pool, drainMax)
 
 	for _, idx := range pool.HealthCheckAll() {
 		slog.Warn("cycle: wan died, resetting", "index", idx)
