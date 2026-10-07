@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 func startTestSocksServer(t *testing.T) (net.Listener, string) {
@@ -479,7 +480,7 @@ func TestTestSpeed(t *testing.T) {
 	// environment assumption (any ambient listener on it fails the test).
 	port := freePort(t)
 	rawURL := fmt.Sprintf("socks5://%s:%d", mockHost, mockPort)
-	cfg := &ProxyConfig{
+	cfg := &proxycfg.ProxyConfig{
 		Protocol: "socks5",
 		Server:   mockHost,
 		Port:     mockPort,
@@ -508,7 +509,7 @@ func TestTestSpeed(t *testing.T) {
 }
 
 func TestTestSpeed_XrayFailure(t *testing.T) {
-	cfg := &ProxyConfig{
+	cfg := &proxycfg.ProxyConfig{
 		Protocol: "socks5",
 		Server:   "0.0.0.1",
 		Port:     1,
@@ -579,7 +580,7 @@ func TestTestAll(t *testing.T) {
 	downloadServer := startTestDownloadServer(t, 10000)
 	defer downloadServer.Close()
 
-	configs := []*ProxyConfig{
+	configs := []*proxycfg.ProxyConfig{
 		{Protocol: "socks5", Server: "127.0.0.1", Port: 1080, Raw: "socks5://127.0.0.1:1080", Name: "A"},
 		{Protocol: "socks5", Server: "127.0.0.1", Port: 1080, Raw: "socks5://127.0.0.1:1080", Name: "B"},
 	}
@@ -597,7 +598,7 @@ func TestTestAll(t *testing.T) {
 }
 
 func TestTestAll_SortsResults(t *testing.T) {
-	configs := []*ProxyConfig{
+	configs := []*proxycfg.ProxyConfig{
 		{Protocol: "socks5", Server: "127.0.0.1", Port: 1080, Raw: "socks5://127.0.0.1:1080", Name: "A"},
 		{Protocol: "socks5", Server: "127.0.0.1", Port: 1080, Raw: "socks5://127.0.0.1:1080", Name: "B"},
 		{Protocol: "socks5", Server: "127.0.0.1", Port: 1080, Raw: "socks5://127.0.0.1:1080", Name: "C"},
@@ -800,13 +801,13 @@ func TestMeasureStability(t *testing.T) {
 }
 
 func TestBestNewCandidate(t *testing.T) {
-	neverActive := func(*ProxyConfig) bool { return false }
+	neverActive := func(*proxycfg.ProxyConfig) bool { return false }
 
 	tests := []struct {
 		name    string
 		results []*TestResult
 		min     float64
-		active  func(*ProxyConfig) bool
+		active  func(*proxycfg.ProxyConfig) bool
 		want    int // index into results, or -1 for nil
 	}{
 		{
@@ -841,11 +842,11 @@ func TestBestNewCandidate(t *testing.T) {
 		{
 			name: "filters already active",
 			results: []*TestResult{
-				{Config: &ProxyConfig{Server: "a", Port: 1}, Speed: 50},
-				{Config: &ProxyConfig{Server: "b", Port: 2}, Speed: 7},
+				{Config: &proxycfg.ProxyConfig{Server: "a", Port: 1}, Speed: 50},
+				{Config: &proxycfg.ProxyConfig{Server: "b", Port: 2}, Speed: 7},
 			},
 			min: 5.0,
-			active: func(c *ProxyConfig) bool {
+			active: func(c *proxycfg.ProxyConfig) bool {
 				return c.Server == "a"
 			},
 			want: 1,

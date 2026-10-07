@@ -8,11 +8,12 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"viberoxy/internal/proxycfg"
 )
 
 func TestBuildXrayConfig_Shadowsocks(t *testing.T) {
 	raw := "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#MySS"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -85,7 +86,7 @@ func TestBuildXrayConfig_Shadowsocks(t *testing.T) {
 
 func TestBuildXrayConfig_MuxDisabled(t *testing.T) {
 	raw := "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#MySS"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -108,7 +109,7 @@ func TestBuildXrayConfig_FreedomFallbackNoMux(t *testing.T) {
 	// hysteria2 is a freedom fallback: mux must never be emitted there,
 	// even when the caller requests mux on.
 	raw := "hysteria2://auth@1.2.3.4:443"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -137,7 +138,7 @@ func TestBuildXrayConfig_Socks5OutboundNoMux(t *testing.T) {
 	// and corrupt every stream (downloads die with EOF). Mux must never be
 	// emitted on socks5 outbounds, even when the caller requests mux on.
 	raw := "socks5://user:pass@1.2.3.4:1080#MySocks"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -188,7 +189,7 @@ func TestBuildXrayConfig_VMess(t *testing.T) {
 	b, _ := json.Marshal(v)
 	raw := "vmess://" + base64.StdEncoding.EncodeToString(b) + "#MyVMess"
 
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -250,7 +251,7 @@ func TestBuildXrayConfig_VMess(t *testing.T) {
 
 func TestBuildXrayConfig_VLess(t *testing.T) {
 	raw := "vless://109d47e4-4efe-45f8-9f63-52af26e1a5e2@1.2.3.4:12345?encryption=none&security=tls&type=tcp&path=%2F&host=example.com&sni=sni.example.com&fp=chrome&alpn=h2&flow=xtls-rprx-vision#MyVLess"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -323,7 +324,7 @@ func TestBuildXrayConfig_VLess(t *testing.T) {
 
 func TestBuildXrayConfig_Trojan(t *testing.T) {
 	raw := "trojan://password123@1.2.3.4:443?security=tls&type=tcp&path=%2F&host=example.com&sni=sni.example.com&fp=chrome&alpn=h2#MyTrojan"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -372,7 +373,7 @@ func TestBuildXrayConfig_Trojan(t *testing.T) {
 
 func TestBuildXrayConfig_SOCKS5(t *testing.T) {
 	raw := "socks5://user:pass@1.2.3.4:1080#MySocks"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -430,7 +431,7 @@ func TestBuildXrayConfig_SOCKS5(t *testing.T) {
 
 func TestBuildXrayConfig_SOCKS5_NoAuth(t *testing.T) {
 	raw := "socks5://1.2.3.4:1080#NoAuth"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -462,7 +463,7 @@ func TestBuildXrayConfig_SOCKS5_NoAuth(t *testing.T) {
 
 func TestBuildXrayConfig_Fallback(t *testing.T) {
 	raw := "hysteria2://auth123@1.2.3.4:443#MyHy2"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -497,7 +498,7 @@ func TestBuildXrayConfig_Fallback(t *testing.T) {
 
 func TestBuildXrayConfig_Fallback_TUIC(t *testing.T) {
 	raw := "tuic://uuid:pass@1.2.3.4:443#MyTUIC"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -519,7 +520,7 @@ func TestBuildXrayConfig_Fallback_TUIC(t *testing.T) {
 
 func TestBuildXrayConfig_Fallback_WireGuard(t *testing.T) {
 	raw := "wireguard://key@1.2.3.4:51820#MyWG"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -541,7 +542,7 @@ func TestBuildXrayConfig_Fallback_WireGuard(t *testing.T) {
 
 func TestBuildXrayConfig_WebSocketStream(t *testing.T) {
 	raw := "vless://uuid@1.2.3.4:443?type=ws&path=%2Fws&host=example.com&security=none#MyWS"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -576,7 +577,7 @@ func TestBuildXrayConfig_WebSocketStream(t *testing.T) {
 
 func TestBuildXrayConfig_GRPCStream(t *testing.T) {
 	raw := "vless://uuid@1.2.3.4:443?type=grpc&path=mygrpc&security=none#MyGRPC"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -608,7 +609,7 @@ func TestBuildXrayConfig_GRPCStream(t *testing.T) {
 
 func TestBuildXrayConfig_TLSStream(t *testing.T) {
 	raw := "vless://uuid@1.2.3.4:443?security=tls&type=tcp&sni=example.com&fp=chrome&alpn=h2,http/1.1#MyTLS"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -646,7 +647,7 @@ func TestBuildXrayConfig_TLSStream(t *testing.T) {
 
 func TestBuildXrayConfig_RealityStream(t *testing.T) {
 	raw := "vless://uuid@1.2.3.4:443?security=reality&type=tcp&sni=example.com&fp=chrome&pbk=publickey&sid=1234&spx=spiderx#MyReality"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -704,7 +705,7 @@ func TestBuildXrayConfig_TCPHTTPHeader(t *testing.T) {
 		b, _ := json.Marshal(v)
 		return b
 	}()) + "#VMessTCPHTTP"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -750,7 +751,7 @@ func TestBuildXrayConfig_ValidJSON(t *testing.T) {
 		"hysteria2://auth@1.2.3.4:443",
 	}
 	for _, raw := range tests {
-		cfg := ParseSingle(raw)
+		cfg := proxycfg.ParseSingle(raw)
 		if cfg == nil {
 			t.Fatalf("failed to parse: %s", raw)
 		}
@@ -908,7 +909,7 @@ func TestStreamSettings_TCPOnly(t *testing.T) {
 
 func TestBuildXrayConfig_RealityTrojanAuth(t *testing.T) {
 	raw := "trojan://password@1.2.3.4:443?security=reality&type=tcp&sni=example.com&fp=chrome&pbk=pubkey&sid=abcd&spx=spid#RealityTrojan"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -953,7 +954,7 @@ func TestStreamSettings_XHTTP(t *testing.T) {
 
 func TestBuildXrayConfig_LogLevel(t *testing.T) {
 	raw := "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@1.2.3.4:12345#Test"
-	cfg := ParseSingle(raw)
+	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
@@ -966,4 +967,12 @@ func TestBuildXrayConfig_LogLevel(t *testing.T) {
 	if !strings.Contains(string(data), `"loglevel": "none"`) {
 		t.Error("expected loglevel 'none' in config")
 	}
+}
+
+func mustMarshal(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

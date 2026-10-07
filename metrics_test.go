@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"viberoxy/internal/proxycfg"
 )
 
 func TestRegistry_ExpositionFormat(t *testing.T) {
@@ -253,7 +254,7 @@ func TestParseConfig_MetricsEnv(t *testing.T) {
 	setenv(t, "METRICS_PORT", "9090")
 	setenv(t, "ACCESS_LOG", "false")
 
-	cfg, err := parseConfig()
+	cfg, err := proxycfg.ParseConfig()
 	if err != nil {
 		t.Fatalf("parseConfig() error: %v", err)
 	}
@@ -269,7 +270,7 @@ func TestParseConfig_InvalidMetricsPort(t *testing.T) {
 	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
 	setenv(t, "METRICS_PORT", "70000")
 
-	if _, err := parseConfig(); err == nil {
+	if _, err := proxycfg.ParseConfig(); err == nil {
 		t.Fatal("expected error for METRICS_PORT=70000, got nil")
 	}
 }
@@ -278,7 +279,7 @@ func TestParseConfig_InvalidAccessLog(t *testing.T) {
 	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
 	setenv(t, "ACCESS_LOG", "maybe")
 
-	if _, err := parseConfig(); err == nil {
+	if _, err := proxycfg.ParseConfig(); err == nil {
 		t.Fatal("expected error for ACCESS_LOG=maybe, got nil")
 	}
 }

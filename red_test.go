@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 // ---------- helpers ----------
@@ -215,7 +216,7 @@ func TestRed_RT04_HealthCheckDetectsExitedProcess(t *testing.T) {
 // ---------- RT-05  (F-11) mux must not be combined with xtls-rprx-vision ----------
 func TestRed_RT05_NoMuxWithVisionFlow(t *testing.T) {
 	raw := "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=example.com&fp=chrome&pbk=abc&sid=01&type=tcp#n"
-	cfg := &ProxyConfig{Protocol: "vless", Server: "1.2.3.4", Port: 443, Raw: raw}
+	cfg := &proxycfg.ProxyConfig{Protocol: "vless", Server: "1.2.3.4", Port: 443, Raw: raw}
 	b, err := BuildXrayConfig(cfg, 10700, true)
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +323,7 @@ func TestRed_RT08_FailoverOnDialFailure(t *testing.T) {
 func TestRed_RT09_CandidatePoolDedupes(t *testing.T) {
 	cp := NewCandidatePool(10)
 	r := func() *TestResult {
-		return &TestResult{Config: &ProxyConfig{Raw: "ss://same", Server: "1.1.1.1", Port: 1}, Speed: 10}
+		return &TestResult{Config: &proxycfg.ProxyConfig{Raw: "ss://same", Server: "1.1.1.1", Port: 1}, Speed: 10}
 	}
 	cp.Update([]*TestResult{r()})
 	cp.Update([]*TestResult{r()})
@@ -341,20 +342,20 @@ func TestRed_RT10_DropAndReplaceKeepsOldWANUntilCandidateValidated(t *testing.T)
 	pool := NewWANPool(1, 20000)
 	pool.Slots[0].State = StateActive
 	pool.Slots[0].Cmd = old
-	pool.Slots[0].Config = &ProxyConfig{Raw: "a", Server: "1.1.1.1", Port: 1}
+	pool.Slots[0].Config = &proxycfg.ProxyConfig{Raw: "a", Server: "1.1.1.1", Port: 1}
 	defer pool.ShutdownAll()
 
 	cp := NewCandidatePool(5)
-	cp.Update([]*TestResult{{Config: &ProxyConfig{Raw: "b", Server: "2.2.2.2", Port: 2}, Speed: 20}})
+	cp.Update([]*TestResult{{Config: &proxycfg.ProxyConfig{Raw: "b", Server: "2.2.2.2", Port: 2}, Speed: 20}})
 
 	var stateDuringTest WANState = -1
 	opts := DropAndReplaceOptions{
 		Candidates: cp,
-		TestCandidate: func(cfg *ProxyConfig, _ int, _ time.Duration, _ string, _ int64, _ int) *TestResult {
+		TestCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ time.Duration, _ string, _ int64, _ int) *TestResult {
 			stateDuringTest = pool.GetState(0)
 			return &TestResult{Config: cfg, Speed: 20}
 		},
-		StartCandidate: func(cfg *ProxyConfig, _ int, _ ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ ...bool) (*exec.Cmd, string, error) {
 			c := exec.Command("sleep", "30")
 			return c, "", c.Start()
 		},
@@ -384,7 +385,7 @@ func TestRed_RT11_FullPoolStillEvaluatesCandidates(t *testing.T) {
 	defer cmd.Process.Kill()
 	pool.Slots[0].State = StateActive
 	pool.Slots[0].Cmd = cmd
-	pool.Slots[0].Config = &ProxyConfig{Protocol: "ss", Server: "1.1.1.1", Port: 1}
+	pool.Slots[0].Config = &proxycfg.ProxyConfig{Protocol: "ss", Server: "1.1.1.1", Port: 1}
 	pool.Slots[0].SpeedMbps = 5.1
 
 	dir := t.TempDir()
@@ -393,7 +394,7 @@ func TestRed_RT11_FullPoolStillEvaluatesCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Chdir(wd)
-	cfg := &Config{SubscriberURL: srv.URL, WanCount: 1, MinimumSpeed: 5, FetchInterval: 30, TestTimeout: 3,
+	cfg := &proxycfg.Config{SubscriberURL: srv.URL, WanCount: 1, MinimumSpeed: 5, FetchInterval: 30, TestTimeout: 3,
 		TestBasePort: rtFreePort(t), WanBasePort: 20000, DownloadSize: 1000000}
 	runCycle(cfg, pool, NewCandidatePool(10), time.Minute)
 

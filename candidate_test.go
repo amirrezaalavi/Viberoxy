@@ -5,11 +5,12 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"viberoxy/internal/proxycfg"
 )
 
 // helper: build a ProxyConfig with a distinct Raw URI
-func testCfg(name string) *ProxyConfig {
-	return &ProxyConfig{
+func testCfg(name string) *proxycfg.ProxyConfig {
+	return &proxycfg.ProxyConfig{
 		Protocol: "vmess",
 		Server:   "example.com",
 		Port:     443,

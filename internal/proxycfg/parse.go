@@ -1,4 +1,4 @@
-package main
+package proxycfg
 
 import (
 	"encoding/base64"
@@ -8,14 +8,6 @@ import (
 	"strconv"
 	"strings"
 )
-
-type ProxyConfig struct {
-	Protocol string
-	Server   string
-	Port     int
-	Name     string
-	Raw      string
-}
 
 func ParseConfigs(body string) []*ProxyConfig {
 	body = strings.TrimSpace(body)
@@ -38,7 +30,7 @@ func ParseConfigs(body string) []*ProxyConfig {
 }
 
 func decodeLines(body string) []string {
-	if decoded, err := base64Decode(body); err == nil {
+	if decoded, err := Base64Decode(body); err == nil {
 		decoded = strings.ReplaceAll(decoded, "\r\n", "\n")
 		return strings.Split(decoded, "\n")
 	}
@@ -130,7 +122,7 @@ func extractProtocol(raw string) string {
 	return strings.ToLower(proto)
 }
 
-func base64Decode(s string) (string, error) {
+func Base64Decode(s string) (string, error) {
 	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.URLEncoding} {
 		if decoded, err := enc.DecodeString(s); err == nil {
 			return string(decoded), nil
@@ -194,7 +186,7 @@ func parseShadowsocks(raw string) *ProxyConfig {
 
 	userinfoB64, hostPart, found := strings.Cut(rest, "@")
 	if found {
-		userinfo, err := base64Decode(userinfoB64)
+		userinfo, err := Base64Decode(userinfoB64)
 		if err != nil {
 			return nil
 		}
@@ -210,7 +202,7 @@ func parseShadowsocks(raw string) *ProxyConfig {
 		return &ProxyConfig{Server: host, Port: port}
 	}
 
-	decoded, err := base64Decode(rest)
+	decoded, err := Base64Decode(rest)
 	if err != nil {
 		return nil
 	}
@@ -233,7 +225,7 @@ func parseVMess(raw string) *ProxyConfig {
 	const prefix = "vmess://"
 	b64 := raw[len(prefix):]
 
-	data, err := base64Decode(b64)
+	data, err := Base64Decode(b64)
 	if err != nil {
 		return nil
 	}
@@ -358,7 +350,7 @@ func parseWireGuard(raw string) *ProxyConfig {
 		return &ProxyConfig{Server: host, Port: port}
 	}
 
-	data, err := base64Decode(rest)
+	data, err := Base64Decode(rest)
 	if err != nil {
 		return nil
 	}

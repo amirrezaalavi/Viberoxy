@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 type XrayConfig struct {
@@ -98,7 +99,7 @@ type RealitySettings struct {
 // amortizing the TLS/protocol handshake per connection. Mux is only emitted
 // on proxied outbounds (never on the freedom fallback, and never on socks5
 // outbounds whose plain-proxy remote cannot demultiplex smux).
-func BuildXrayConfig(cfg *ProxyConfig, inboundPort int, muxEnabled ...bool) ([]byte, error) {
+func BuildXrayConfig(cfg *proxycfg.ProxyConfig, inboundPort int, muxEnabled ...bool) ([]byte, error) {
 	mux := true
 	if len(muxEnabled) > 0 {
 		mux = muxEnabled[0]
@@ -127,7 +128,7 @@ func BuildXrayConfig(cfg *ProxyConfig, inboundPort int, muxEnabled ...bool) ([]b
 	return json.MarshalIndent(conf, "", "  ")
 }
 
-func buildOutbound(cfg *ProxyConfig, muxEnabled bool) []OutboundConfig {
+func buildOutbound(cfg *proxycfg.ProxyConfig, muxEnabled bool) []OutboundConfig {
 	mux := (*MuxConfig)(nil)
 	if muxEnabled {
 		mux = &MuxConfig{Enabled: true, Concurrency: 8}
@@ -422,7 +423,7 @@ func extractSIP002(raw string) (method, password string) {
 
 	userinfoB64, _, found := strings.Cut(rest, "@")
 	if found {
-		userinfo, err := base64Decode(userinfoB64)
+		userinfo, err := proxycfg.Base64Decode(userinfoB64)
 		if err != nil {
 			return "", ""
 		}
@@ -430,7 +431,7 @@ func extractSIP002(raw string) (method, password string) {
 		return method, password
 	}
 
-	decoded, err := base64Decode(rest)
+	decoded, err := proxycfg.Base64Decode(rest)
 	if err != nil {
 		return "", ""
 	}
@@ -450,7 +451,7 @@ func extractVMessRaw(raw string) map[string]interface{} {
 		rest = rest[:idx]
 	}
 
-	data, err := base64Decode(rest)
+	data, err := proxycfg.Base64Decode(rest)
 	if err != nil {
 		return nil
 	}
@@ -547,7 +548,7 @@ func getInt(v map[string]interface{}, key string) int {
 	return 0
 }
 
-func StartXray(cfg *ProxyConfig, inboundPort int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+func StartXray(cfg *proxycfg.ProxyConfig, inboundPort int, muxEnabled ...bool) (*exec.Cmd, string, error) {
 	configBytes, err := BuildXrayConfig(cfg, inboundPort, muxEnabled...)
 	if err != nil {
 		return nil, "", fmt.Errorf("build xray config: %w", err)

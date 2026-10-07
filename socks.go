@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 // socksHandshakeTimeout bounds the SOCKS5 greeting/request phase so a client
@@ -28,7 +29,7 @@ type SocksServer struct {
 }
 
 // NewSocksServer creates a SOCKS5 front-end listener on the given port.
-func NewSocksServer(port int, pool *WANPool, router ...*Router) *SocksServer {
+func NewSocksServer(port int, pool *WANPool, router ...*proxycfg.Router) *SocksServer {
 	s := &SocksServer{
 		port: port,
 		wanRelay: wanRelay{
@@ -120,7 +121,7 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	}
 
 	// Split routing: a direct-route target bypasses the WAN pool entirely.
-	if s.decideRoute(targetHost) == RouteDirect {
+	if s.decideRoute(targetHost) == proxycfg.RouteDirect {
 		dialCtx, cancel := context.WithTimeout(context.Background(), socksDialTimeout)
 		defer cancel()
 		upstream, err := s.directDial(dialCtx, targetHost, start, "socks5")

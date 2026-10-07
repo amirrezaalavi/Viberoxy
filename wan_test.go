@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 func TestNewWANPool(t *testing.T) {
@@ -31,7 +32,7 @@ func TestNewWANPool(t *testing.T) {
 
 func TestStartTesting(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	cfg := &ProxyConfig{Server: "1.2.3.4", Port: 443}
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
 	err := pool.StartTesting(0, cfg)
 	if err != nil {
 		t.Fatalf("StartTesting error: %v", err)
@@ -46,7 +47,7 @@ func TestStartTesting(t *testing.T) {
 
 func TestStartTesting_NonEmpty(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	cfg := &ProxyConfig{Server: "1.2.3.4", Port: 443}
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
 	if err := pool.StartTesting(0, cfg); err != nil {
 		t.Fatalf("first StartTesting error: %v", err)
 	}
@@ -58,7 +59,7 @@ func TestStartTesting_NonEmpty(t *testing.T) {
 
 func TestSetActive(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	cfg := &ProxyConfig{Server: "1.2.3.4", Port: 443}
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
 	if err := pool.StartTesting(0, cfg); err != nil {
 		t.Fatalf("StartTesting error: %v", err)
 	}
@@ -93,7 +94,7 @@ func TestSetActive_WrongState(t *testing.T) {
 
 func TestMarkDraining(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	cfg := &ProxyConfig{Server: "1.2.3.4", Port: 443}
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
 	if err := pool.StartTesting(0, cfg); err != nil {
 		t.Fatalf("StartTesting error: %v", err)
 	}
@@ -129,7 +130,7 @@ func TestMarkDraining_WrongState(t *testing.T) {
 
 func TestResetEmpty(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	cfg := &ProxyConfig{Server: "1.2.3.4", Port: 443}
+	cfg := &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443}
 
 	pool.StartTesting(0, cfg)
 	cmd := exec.Command("sleep", "9999")
@@ -168,7 +169,7 @@ func TestGetState(t *testing.T) {
 	if pool.GetState(0) != StateEmpty {
 		t.Error("expected empty")
 	}
-	pool.StartTesting(0, &ProxyConfig{})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{})
 	if pool.GetState(0) != StateTesting {
 		t.Error("expected testing")
 	}
@@ -176,8 +177,8 @@ func TestGetState(t *testing.T) {
 
 func TestGetSlotsByState(t *testing.T) {
 	pool := NewWANPool(4, 10700)
-	pool.StartTesting(0, &ProxyConfig{})
-	pool.StartTesting(1, &ProxyConfig{})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{})
+	pool.StartTesting(1, &proxycfg.ProxyConfig{})
 
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
@@ -211,7 +212,7 @@ func TestActiveCount(t *testing.T) {
 		t.Errorf("expected 0, got %d", pool.ActiveCount())
 	}
 
-	pool.StartTesting(0, &ProxyConfig{})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{})
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
@@ -235,7 +236,7 @@ func TestHasServerPort(t *testing.T) {
 	}
 
 	// Active slot matches its own server:port.
-	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443})
 	cmd := exec.Command("sleep", "9999")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
@@ -268,7 +269,7 @@ func TestHasServerPort(t *testing.T) {
 	if err := pool.ResetEmpty(0); err != nil {
 		t.Fatalf("ResetEmpty error: %v", err)
 	}
-	pool.StartTesting(0, &ProxyConfig{Server: "9.9.9.9", Port: 9999})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{Server: "9.9.9.9", Port: 9999})
 	if pool.HasServerPort("9.9.9.9", 9999) {
 		t.Error("HasServerPort(testing slot) = true, want false")
 	}
@@ -283,7 +284,7 @@ func TestHasServerPort(t *testing.T) {
 
 	// Empty slots with a leftover config pointer are ignored.
 	pool.Slots[1].State = StateEmpty
-	pool.Slots[1].Config = &ProxyConfig{Server: "1.1.1.1", Port: 80}
+	pool.Slots[1].Config = &proxycfg.ProxyConfig{Server: "1.1.1.1", Port: 80}
 	if pool.HasServerPort("1.1.1.1", 80) {
 		t.Error("HasServerPort(empty slot with stale config) = true, want false")
 	}
@@ -293,7 +294,7 @@ func TestGetLeastLoaded(t *testing.T) {
 	pool := NewWANPool(3, 10700)
 
 	for i := 0; i < 2; i++ {
-		pool.StartTesting(i, &ProxyConfig{})
+		pool.StartTesting(i, &proxycfg.ProxyConfig{})
 		cmd := exec.Command("sleep", "9999")
 		cmd.Start()
 		defer cmd.Process.Kill()
@@ -320,7 +321,7 @@ func TestGetLeastLoaded_AllEmpty(t *testing.T) {
 func TestGetLeastLoaded_SkipsUnhealthy(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	for i := 0; i < 2; i++ {
-		pool.StartTesting(i, &ProxyConfig{})
+		pool.StartTesting(i, &proxycfg.ProxyConfig{})
 		cmd := exec.Command("sleep", "9999")
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start cmd: %v", err)
@@ -354,7 +355,7 @@ func TestGetLeastLoaded_SkipsUnhealthy(t *testing.T) {
 func TestGetLeastLoaded_AllUnhealthy_FallsBack(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	for i := 0; i < 2; i++ {
-		pool.StartTesting(i, &ProxyConfig{})
+		pool.StartTesting(i, &proxycfg.ProxyConfig{})
 		cmd := exec.Command("sleep", "9999")
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start cmd: %v", err)
@@ -379,7 +380,7 @@ func TestGetLeastLoaded_AllUnhealthy_FallsBack(t *testing.T) {
 func TestGetLeastLoaded_ThresholdOne(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 	for i := 0; i < 2; i++ {
-		pool.StartTesting(i, &ProxyConfig{})
+		pool.StartTesting(i, &proxycfg.ProxyConfig{})
 		cmd := exec.Command("sleep", "9999")
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start cmd: %v", err)
@@ -417,7 +418,7 @@ func TestIncDecConnCount(t *testing.T) {
 func TestDrainExpired(t *testing.T) {
 	pool := NewWANPool(3, 10700)
 	for i := 0; i < 2; i++ {
-		pool.StartTesting(i, &ProxyConfig{})
+		pool.StartTesting(i, &proxycfg.ProxyConfig{})
 		cmd := exec.Command("sleep", "9999")
 		cmd.Start()
 		defer cmd.Process.Kill()
@@ -437,7 +438,7 @@ func TestDrainExpired(t *testing.T) {
 
 func TestDrainExpired_NotYet(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	pool.StartTesting(0, &ProxyConfig{})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{})
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
@@ -455,7 +456,7 @@ func TestDrainExpired_NotYet(t *testing.T) {
 func TestHealthCheckAll(t *testing.T) {
 	pool := NewWANPool(3, 10700)
 
-	pool.StartTesting(0, &ProxyConfig{})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{})
 	cmdAlive := exec.Command("sleep", "9999")
 	if err := cmdAlive.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
@@ -463,13 +464,13 @@ func TestHealthCheckAll(t *testing.T) {
 	defer cmdAlive.Process.Kill()
 	pool.SetActive(0, cmdAlive, "/tmp/cfg1.json")
 
-	pool.StartTesting(1, &ProxyConfig{})
+	pool.StartTesting(1, &proxycfg.ProxyConfig{})
 	cmdDead := exec.Command("sleep", "0")
 	cmdDead.Start()
 	cmdDead.Wait()
 	pool.SetActive(1, cmdDead, "/tmp/cfg2.json")
 
-	pool.StartTesting(2, &ProxyConfig{})
+	pool.StartTesting(2, &proxycfg.ProxyConfig{})
 	cmdAlive2 := exec.Command("sleep", "9999")
 	if err := cmdAlive2.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
@@ -487,7 +488,7 @@ func TestShutdownAll(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 
 	for i := 0; i < 2; i++ {
-		pool.StartTesting(i, &ProxyConfig{})
+		pool.StartTesting(i, &proxycfg.ProxyConfig{})
 		cmd := exec.Command("sleep", "9999")
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start cmd: %v", err)
@@ -540,7 +541,7 @@ func TestConcurrentConnCount(t *testing.T) {
 func TestHealthyActiveCount(t *testing.T) {
 	pool := NewWANPool(3, 10700)
 
-	pool.StartTesting(0, &ProxyConfig{})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{})
 	cmdAlive := exec.Command("sleep", "9999")
 	if err := cmdAlive.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
@@ -548,7 +549,7 @@ func TestHealthyActiveCount(t *testing.T) {
 	defer cmdAlive.Process.Kill()
 	pool.SetActive(0, cmdAlive, "/tmp/cfg1.json")
 
-	pool.StartTesting(1, &ProxyConfig{})
+	pool.StartTesting(1, &proxycfg.ProxyConfig{})
 	cmdDead := exec.Command("sleep", "0")
 	cmdDead.Start()
 	cmdDead.Wait()
@@ -747,7 +748,7 @@ func TestExitIPAndLastProbe(t *testing.T) {
 
 func TestResetEmpty_FromTesting(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443})
 
 	if err := pool.ResetEmpty(0); err != nil {
 		t.Fatalf("ResetEmpty error: %v", err)
@@ -759,7 +760,7 @@ func TestResetEmpty_FromTesting(t *testing.T) {
 
 func TestResetEmpty_FromDraining(t *testing.T) {
 	pool := NewWANPool(2, 10700)
-	pool.StartTesting(0, &ProxyConfig{})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{})
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
@@ -812,7 +813,7 @@ func TestOrphanedProcessReap(t *testing.T) {
 	pool := NewWANPool(2, 10700)
 
 	// Put slot 0 into StateActive with a long-running command.
-	pool.StartTesting(0, &ProxyConfig{Server: "1.2.3.4", Port: 443})
+	pool.StartTesting(0, &proxycfg.ProxyConfig{Server: "1.2.3.4", Port: 443})
 	cmd := exec.Command("sleep", "3600")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"testing"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 // startSocksServer runs a SocksServer on an ephemeral port and returns its
@@ -325,7 +326,7 @@ func TestSocks_DialFailureCounted(t *testing.T) {
 func TestSocksConnect_DirectRoute(t *testing.T) {
 	// WAN pool with NO active slots: only the direct route can succeed.
 	pool := NewWANPool(1, 0)
-	router := NewRouter(RouteProxyDefault, []string{".127.0.0.1"}, nil)
+	router := proxycfg.NewRouter(proxycfg.RouteProxyDefault, []string{".127.0.0.1"}, nil)
 
 	port := freePort(t)
 	srv := NewSocksServer(port, pool, router)

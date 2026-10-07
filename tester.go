@@ -13,10 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 type TestResult struct {
-	Config *ProxyConfig
+	Config *proxycfg.ProxyConfig
 	Speed  float64
 	// StabilityScore is the number of distinct exit IPs observed across
 	// STABILITY_PROBES probes minus one: 0 means a single stable exit IP
@@ -28,7 +29,7 @@ type TestResult struct {
 
 // TestSpeed speed-tests one config through a temp xray. It never runs
 // stability probes (see TestSpeedWithStability).
-func TestSpeed(cfg *ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64) *TestResult {
+func TestSpeed(cfg *proxycfg.ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64) *TestResult {
 	return TestSpeedWithStability(cfg, testPort, timeout, downloadURL, downloadSize, 0)
 }
 
@@ -38,7 +39,7 @@ func TestSpeed(cfg *ProxyConfig, testPort int, timeout time.Duration, downloadUR
 // torn down) and the distinct IP count becomes the result's
 // StabilityScore. With stabilityProbes == 0 the behavior is identical to
 // TestSpeed.
-func TestSpeedWithStability(cfg *ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
+func TestSpeedWithStability(cfg *proxycfg.ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
 	start := time.Now()
 	defer func() { metricTestDuration.Observe(time.Since(start).Seconds()) }()
 
@@ -65,7 +66,7 @@ func TestSpeedWithStability(cfg *ProxyConfig, testPort int, timeout time.Duratio
 	return result
 }
 
-func TestAll(configs []*ProxyConfig, testPortBase int, timeout time.Duration, downloadURL string, downloadSize int64) []*TestResult {
+func TestAll(configs []*proxycfg.ProxyConfig, testPortBase int, timeout time.Duration, downloadURL string, downloadSize int64) []*TestResult {
 	results := make([]*TestResult, len(configs))
 	for i, cfg := range configs {
 		results[i] = TestSpeed(cfg, testPortBase+i, timeout, downloadURL, downloadSize)
@@ -315,7 +316,7 @@ func measureStability(socksAddr string, probes int, timeout time.Duration) int {
 // StabilityScore (more stable), then earlier test order. Returns nil when
 // no candidate qualifies. Speed-first: a slower but more stable config is
 // never preferred over a faster one.
-func bestNewCandidate(results []*TestResult, minimumSpeed float64, alreadyActive func(*ProxyConfig) bool) *TestResult {
+func bestNewCandidate(results []*TestResult, minimumSpeed float64, alreadyActive func(*proxycfg.ProxyConfig) bool) *TestResult {
 	var best *TestResult
 	for _, r := range results {
 		if r.Error != nil || r.Speed < minimumSpeed {

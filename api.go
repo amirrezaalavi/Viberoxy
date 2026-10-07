@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/proxycfg"
 )
 
 // WANSlotInfo is the JSON-serializable view of a WAN slot's state,
@@ -97,8 +98,8 @@ func handleTriggerCycle() http.HandlerFunc {
 // WAN drop/replacement, cycle timing, the manual cycle trigger, and the
 // candidate pool. A Config is supplied by startup; it is variadic to preserve
 // compatibility with callers that only use the read-only endpoints.
-func NewAPIHandler(pool *WANPool, configs ...*Config) http.Handler {
-	var cfg *Config
+func NewAPIHandler(pool *WANPool, configs ...*proxycfg.Config) http.Handler {
+	var cfg *proxycfg.Config
 	if len(configs) > 0 {
 		cfg = configs[0]
 	}
