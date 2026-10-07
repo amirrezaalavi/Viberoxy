@@ -527,3 +527,72 @@ pre-test `ResetEmpty` fails `TestRed_RT10_...`; removing it turns RT-10 green ag
 - Spare sizing (2xWanCount) and the TestBasePort/Spare range overlap check live in `startup`;
   a config task that adds env knobs should validate `TEST_BASE_PORT..+MAX_TEST_PER_CYCLE` not
   colliding with `WAN_BASE_PORT+WAN_COUNT..`.
+
+## task-2-7: draining semantics — selection exclusion, inflight/DRAIN_MAX completion, un-drain (F-02, D-03)
+
+One commit on `task-2-7-drain`: `fix(wan): draining excludes selection, inflight-based drain
+completion, un-drain (F-02); RT-01 green`.
+
+The F-02 contract is now: **draining = no new connections, existing flows finish, then it
+stops** (or DRAIN_MAX hard-kills it); a health drain may reverse, a replacement drain may not.
+
+- **Selection (`wan.go`)**: `GetLeastLoadedExcluding`'s routable pass selects `StateActive`
+  only — `StateDraining` is skipped exactly like a tried/over-threshold path. The degraded
+  fallback walks ACTIVE slots first (byte-for-byte body of the old loop) and only when no
+  active path is available considers draining slots, in a new third pass with its own
+  `slog.Warn("no active WAN: draining slot selected as last resort")`; the existing
+  "no routable WAN" WARN stays where it was. Everything else in the rule (least-loaded, ties
+  to lowest index, Suspect skip, tried exclusion) is untouched.
+- **`RoutableCount` counts ACTIVE routable slots only (D-03)**: `/readyz` is ready iff >= 1
+  active routable path; a draining-only pool is 503.
+- **Drain completion (`DrainExpired(maxDrain)`)**: a draining slot completes when its current
+  path's `Conns() == 0` (flows finished) OR `now-DrainAt >= maxDrain`, whichever first —
+  replacing the fixed `max(60s, 2×FETCH_INTERVAL)` timer. `runCycle`'s reap step keeps its
+  shape and now receives **DRAIN_MAX** (`DefaultDrainMax = 600s`, env `DRAIN_MAX` in seconds,
+  invalid/absent → default with a warning, read by `drainMaxFromEnv()` in `main.go`).
+- **Drain reason + un-drain**: `WANSlot.drainReason` (`DrainReplace`/`DrainHealth`, zero value
+  = replace so hand-built draining fixtures are never un-drained). `MarkDraining` keeps its
+  signature and now means the REPLACEMENT flavor (runCycle's frozen replacement block calls
+  it); the canary's marking switched to the new `MarkDrainingHealth`. `UnDrainIfRecovered(idx,
+  halfOpenRecovery)` returns a health-drained slot to Active when `Path.NoteCanary` reported
+  half-open re-admission or the consecutive canary-success streak reaches
+  `health.HalfOpenSuccesses`; it is called from `runCanaries` (fast return) and from
+  `DrainExpired` (reap-time guard: recovery beats the kill). Replacement drains and Swap's
+  retired generation are never un-drained.
+- **`internal/health` (small hook)**: `State.NoteCanary` now increments `canaryOK` on a
+  success for a NON-suspect path too (it already reset it on failure/ejection, and half-open
+  counting is unchanged), and `State.CanaryStreak()` exposes it; `Path.CanaryStreak()`
+  (nil-safe) forwards it. That was the missing "recovery streak" the un-drain hooks.
+
+**Tests:** new `drain_test.go` — T-DRAIN-01 (real SOCKS front + testutil FakeWAN: a paced
+2s transfer through a slot that goes Draining mid-flight completes with zero resets while 12
+new connections all land on the active WAN, and `DrainExpired` refuses to reap it until
+inflight hits 0), T-DRAIN-02 (`DefaultDrainMax == 600s`; inflight==0 completes, 601s age
+hard-kills inflight>0, 100s age with flows stays), T-DRAIN-03 (`runCanaries` against a local
+endpoint through a real SOCKS relay: streak 1 stays draining, streak 2 un-drains to Active
+and selectable; the replacement-marked slot survives the same recovery and is reaped
+normally; reap-time guard un-drains a pre-recovered health drain instead of killing it),
+selection property (GetLeastLoaded + GetLeastLoadedExcluding tried variants + degraded-active
+beats healthy-draining + draining-only last resort + RoutableCount D-03 both ways) and
+`drainMaxFromEnv`. `wan_test.go`'s `TestDrainExpired`/`TestDrainExpired_NotYet` gained an
+in-flight reservation each so the age rule still decides them (assertion lines unchanged).
+
+**Red suite / gate:** `TestRed_RT01_DrainingSlotNotSelected` passes and was removed from
+`DEFAULT_ALLOW` — `scripts/red_gate.sh` exit 0 with **1 entry (RT-11, owned by a parallel
+task)**; full red suite **1 FAIL (RT-11) / 10 PASS / 0 SKIP**. `red_test.go` untouched
+(assertion grep diff vs HEAD empty).
+
+**Mutation sanity (evidence):** (1) re-including `StateDraining` in the routable pass fails
+`TestRed_RT01_DrainingSlotNotSelected` ("GetLeastLoaded picked draining slot 0; want active
+slot 1") and the selection property (5 assertion lines incl. every `GetLeastLoadedExcluding`
+case); restoring turns both green. (2) killing the `inflight == 0` completion (pure timer)
+fails all three T-DRAIN tests ("DrainExpired(600s) = [1], want [1 2]" etc.); restoring turns
+them green. `gofmt -l .` empty, `go vet ./...` clean, `go test -race -shuffle=on -count=1
+./...` green (13/13).
+
+**Stale AGENTS.md/README pointers for whoever consolidates:** the WAN state machine line
+("draining → (kill after max(60, 2×FETCH_INTERVAL))" → now "inflight==0 or DRAIN_MAX, 600s
+default"), "Routable WANs" condition 1 ("StateActive or StateDraining" → active only for
+selection/readiness; draining only as last-resort fallback), the "Load-balancer fallback"
+paragraph, `RoutableCount`'s Key-Functions row, `runCycle(cfg, pool, candidates, grace)` →
+`drainMax`, and the README env table needs `DRAIN_MAX` (seconds, default 600).

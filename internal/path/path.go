@@ -303,6 +303,16 @@ func (p *Path) Ejected() bool {
 	return p.hc.Ejected()
 }
 
+// CanaryStreak reports this generation's consecutive canary successes
+// since the last failed canary (nil-safe; 0 for a nil path). The pool
+// uses it as the recovery signal for a health-drained slot (F-02).
+func (p *Path) CanaryStreak() int {
+	if p == nil {
+		return 0
+	}
+	return p.hc.CanaryStreak()
+}
+
 // HealthSnapshot returns the path's window/backoff snapshot as of now,
 // for diagnostics and tests.
 func (p *Path) HealthSnapshot(now time.Time) health.Snapshot {
