@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"testing"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 func TestReadyzRequiresRoutableWAN_Unhealthy(t *testing.T) {
@@ -20,7 +21,7 @@ func TestReadyzRequiresRoutableWAN_Unhealthy(t *testing.T) {
 	}
 	defer cmd.Process.Kill()
 
-	if err := pool.SetActive(0, cmd, "/tmp/test-config.json"); err != nil {
+	if err := pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/test-config.json"), "/tmp/test-config.json"); err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 
@@ -54,7 +55,7 @@ func TestReadyzRequiresRoutableWAN_Healthy(t *testing.T) {
 	}
 	defer cmd.Process.Kill()
 
-	if err := pool.SetActive(0, cmd, "/tmp/test-config.json"); err != nil {
+	if err := pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/test-config.json"), "/tmp/test-config.json"); err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 

@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 // ---------- helpers ----------
@@ -83,7 +84,7 @@ func rtMarkRoutable(p *WANPool, i, port int) {
 	s.mu.Lock()
 	s.State = StateActive
 	s.ServicePort = port
-	s.Cmd = &exec.Cmd{} // non-nil => routable; no real process needed
+	s.Cmd = xrayproc.Wrap(&exec.Cmd{}, "") // non-nil => routable; no real process needed
 	s.mu.Unlock()
 }
 
@@ -208,7 +209,8 @@ func TestRed_RT04_HealthCheckDetectsExitedProcess(t *testing.T) {
 		t.Skip("sh unavailable")
 	}
 	time.Sleep(300 * time.Millisecond)
-	if HealthCheckXray(cmd) {
+	proc := xrayproc.Wrap(cmd, "")
+	if HealthCheckXray(proc) {
 		t.Fatal("HealthCheckXray reports an exited (zombie) process as healthy")
 	}
 }
@@ -341,7 +343,7 @@ func TestRed_RT10_DropAndReplaceKeepsOldWANUntilCandidateValidated(t *testing.T)
 	}
 	pool := NewWANPool(1, 20000)
 	pool.Slots[0].State = StateActive
-	pool.Slots[0].Cmd = old
+	pool.Slots[0].Cmd = xrayproc.Wrap(old, "")
 	pool.Slots[0].Config = &proxycfg.ProxyConfig{Raw: "a", Server: "1.1.1.1", Port: 1}
 	defer pool.ShutdownAll()
 
@@ -355,9 +357,9 @@ func TestRed_RT10_DropAndReplaceKeepsOldWANUntilCandidateValidated(t *testing.T)
 			stateDuringTest = pool.GetState(0)
 			return &TestResult{Config: cfg, Speed: 20}
 		},
-		StartCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ ...bool) (*xrayproc.Handle, string, error) {
 			c := exec.Command("sleep", "30")
-			return c, "", c.Start()
+			return xrayproc.Wrap(c, ""), "", c.Start()
 		},
 	}
 	if _, err := pool.DropAndReplace(0, opts); err != nil {
@@ -384,7 +386,7 @@ func TestRed_RT11_FullPoolStillEvaluatesCandidates(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	defer cmd.Process.Kill()
 	pool.Slots[0].State = StateActive
-	pool.Slots[0].Cmd = cmd
+	pool.Slots[0].Cmd = xrayproc.Wrap(cmd, "")
 	pool.Slots[0].Config = &proxycfg.ProxyConfig{Protocol: "ss", Server: "1.1.1.1", Port: 1}
 	pool.Slots[0].SpeedMbps = 5.1
 

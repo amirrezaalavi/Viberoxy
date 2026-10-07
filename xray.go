@@ -5,13 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 type XrayConfig struct {
@@ -548,67 +545,28 @@ func getInt(v map[string]interface{}, key string) int {
 	return 0
 }
 
-func StartXray(cfg *proxycfg.ProxyConfig, inboundPort int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+// StartXray renders the xray config for cfg and starts the process under a
+// lifecycle handle (see internal/xrayproc). The second result is the temp
+// config file the child was started with.
+func StartXray(cfg *proxycfg.ProxyConfig, inboundPort int, muxEnabled ...bool) (*xrayproc.Handle, string, error) {
 	configBytes, err := BuildXrayConfig(cfg, inboundPort, muxEnabled...)
 	if err != nil {
 		return nil, "", fmt.Errorf("build xray config: %w", err)
 	}
 
-	tmpFile, err := os.CreateTemp("", "xray-config-*.json")
+	h, err := xrayproc.Start(configBytes)
 	if err != nil {
-		return nil, "", fmt.Errorf("create temp file: %w", err)
+		return nil, "", err
 	}
-
-	if _, err := tmpFile.Write(configBytes); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
-		return nil, "", fmt.Errorf("write config: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpFile.Name())
-		return nil, "", fmt.Errorf("close config: %w", err)
-	}
-
-	cmd := exec.Command("xray", "-c", tmpFile.Name())
-	if err := cmd.Start(); err != nil {
-		os.Remove(tmpFile.Name())
-		return nil, "", fmt.Errorf("start xray: %w", err)
-	}
-
-	return cmd, tmpFile.Name(), nil
+	return h, h.ConfigPath(), nil
 }
 
-func StopXray(cmd *exec.Cmd, configPath string) error {
-	if cmd == nil || cmd.Process == nil {
-		if configPath != "" {
-			os.Remove(configPath)
-		}
-		return nil
-	}
-
-	cmd.Process.Signal(syscall.SIGTERM)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		cmd.Process.Kill()
-		<-done
-	}
-
-	if configPath != "" {
-		os.Remove(configPath)
-	}
-	return nil
+// StopXray stops the process behind h and removes configPath.
+func StopXray(h *xrayproc.Handle, configPath string) error {
+	return h.Stop(configPath)
 }
 
-func HealthCheckXray(cmd *exec.Cmd) bool {
-	if cmd == nil || cmd.Process == nil {
-		return false
-	}
-	return cmd.Process.Signal(syscall.Signal(0)) == nil
+// HealthCheckXray reports whether the xray process behind h is alive.
+func HealthCheckXray(h *xrayproc.Handle) bool {
+	return h.Alive()
 }
