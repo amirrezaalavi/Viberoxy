@@ -1,0 +1,42 @@
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "port": 10800,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "trojan",
+      "settings": {
+        "servers": [
+          {
+            "address": "1.2.3.4",
+            "password": "password123",
+            "port": 443
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "sni.example.com"
+        },
+        "wsSettings": {
+          "path": "/ws",
+          "headers": {
+            "Host": "h.example"
+          }
+        }
+      }
+    }
+  ]
+}

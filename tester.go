@@ -27,6 +27,11 @@ type TestResult struct {
 	Error          error
 }
 
+// startTestXray starts the temp xray for a speed test. It is a variable so
+// tests can observe the flags a test instance is started with without
+// spawning a process (F-11 test/prod mux parity).
+var startTestXray = StartXray
+
 // TestSpeed speed-tests one config through a temp xray. It never runs
 // stability probes (see TestSpeedWithStability).
 func TestSpeed(cfg *proxycfg.ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64) *TestResult {
@@ -43,7 +48,10 @@ func TestSpeedWithStability(cfg *proxycfg.ProxyConfig, testPort int, timeout tim
 	start := time.Now()
 	defer func() { metricTestDuration.Observe(time.Since(start).Seconds()) }()
 
-	cmd, configPath, err := StartXray(cfg, testPort)
+	// The speed-test instance must use the same mux setting as production
+	// (F-11 test/prod parity): without the explicit flag it would always
+	// fall back to BuildXrayConfig's default and diverge from cfg.XrayMux.
+	cmd, configPath, err := startTestXray(cfg, testPort, xrayMuxForRun())
 	if err != nil {
 		return &TestResult{Config: cfg, Error: fmt.Errorf("start xray: %w", err)}
 	}

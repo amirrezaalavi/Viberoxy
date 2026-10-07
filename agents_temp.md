@@ -85,3 +85,60 @@ from `DEFAULT_ALLOW` (it now passes); allow list is 10 entries, gate exit 0.
 Stale AGENTS.md pointers (for whoever consolidates): "Health-check / stop a
 running xray → `xray.go`" (now `internal/xrayproc`), and any Directory Map row
 naming `StartXray`/`StopXray`/`HealthCheckXray` as living in `xray.go`.
+
+## task-1-3: xray config generation extracted to `internal/xraycfg` (F-11, F-17-builder, D-04)
+
+Three commits on `task-1-3-xraycfg`:
+
+1. `refactor(xraycfg): extract xray config generation (behavior-identical)` —
+   `XrayConfig`/`OutboundConfig`/`StreamSettings` types, `BuildXrayConfig`,
+   `buildOutbound`, `buildStreamSettings`, `getXrayProtocol`, `extract*` and
+   `marshalRaw`/`getInt` moved verbatim from `xray.go` into
+   `internal/xraycfg/{types.go,build.go}`. `xray.go` keeps a thin
+   `BuildXrayConfig` wrapper plus a `type XrayConfig = xraycfg.XrayConfig`
+   alias, so `red_test.go` and most of `xray_test.go` needed no edits; the
+   tests of unexported helpers (`TestExtractSIP002`, `TestExtractSocksParams`,
+   `TestStreamSettings_*`) moved with their targets into
+   `internal/xraycfg/build_test.go`.
+2. `fix(xraycfg): no mux with flow (F-11), error-returning builders (F-17),
+   test/prod mux parity; RT-05 green, red gate shrinks to 9` —
+   * **F-11**: a non-empty `flow` (e.g. `xtls-rprx-vision`) now suppresses the
+     `mux` block on the outbound even when the caller requests mux on, next to
+     the existing freedom-fallback and socks5 no-mux rules.
+   * **F-17 (builder half)**: builders return `(..., error)` end to end —
+     undecodable/empty vmess JSON (no more zero-UUID outbound), undecodable ss
+     userinfo (no more `method: none`), xhttp missing path/host/mode (mirrors
+     proxycfg's parse-time `checkXHTTP`). `buildStreamSettings` gained a `mode`
+     parameter (`extractVLessParams`/`extractTrojanParams`/vmess raw now plumb
+     `mode`).
+   * **test/prod mux parity**: `tester.go` starts its speed-test xray through
+     `startTestXray(cfg, testPort, xrayMuxForRun())` — `xrayMuxForRun()` in
+     `xray.go` re-parses `XRAY_MUX` exactly like `proxycfg.ParseConfig`, so the
+     temp xray always matches `cfg.XrayMux`. `TestSpeedTestXrayMuxMatchesProduction`
+     (xray_test.go) pins this across XRAY_MUX unset/true/false and also checks
+     byte-identical renders plus the T-XRAY-01 golden.
+   * **T-XRAY-01 golden tests**: `internal/xraycfg/golden_test.go` renders
+     ss, vmess+ws, vless ws/grpc/tcp/reality+vision, trojan and socks5 into
+     `internal/xraycfg/testdata/<case>.mux-{on,off}.json`, asserting structure,
+     no-mux-with-flow, and that mux-suppressed cases render byte-identical
+     with the flag on or off. Regenerate with
+     `go test ./internal/xraycfg -run TestBuildXrayConfig_Golden -update`.
+   * `scripts/red_gate.sh`: `TestRed_RT05_NoMuxWithVisionFlow` removed from
+     `DEFAULT_ALLOW` (it passes now); allow list is 9 entries, gate exit 0.
+3. `feat(proxycfg): D-04 — XRAY_MUX defaults to off` —
+   `proxycfg.ParseConfig` now defaults `XrayMux` to **false**
+   (`XRAY_MUX=true` still opts in); `config_test.go`'s default assertion
+   flipped accordingly. **`xrayMuxForRun()`'s fallback default flipped in the
+   same commit** — it is a deliberate mirror of proxycfg's default and must
+   always be changed together with it, or speed tests and production diverge
+   (the parity test fails loudly if they ever do). `BuildXrayConfig`'s
+   omitted-argument default stays `true`: production and the tester both pass
+   the flag explicitly, and the omitted default is only used by tests.
+   README.md/AGENTS.md are frozen for this campaign, so the README table row
+   (`XRAY_MUX` default `true`) is stale until consolidation.
+
+Stale AGENTS.md pointers (for whoever consolidates): any Directory Map /
+Key Functions row still naming the config-generation types, `BuildXrayConfig`
+or the `extract*` helpers as living in `xray.go` — they are in
+`internal/xraycfg` now; `xray.go` is a thin wrapper around them plus the
+process-lifecycle wrappers.

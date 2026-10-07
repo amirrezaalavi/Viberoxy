@@ -1,0 +1,34 @@
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "port": 10800,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "1.2.3.4",
+            "port": 1080,
+            "users": [
+              {
+                "pass": "pass",
+                "user": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
