@@ -10,6 +10,7 @@ import (
 	"time"
 	"viberoxy/internal/cands"
 	"viberoxy/internal/path"
+	"viberoxy/internal/ports"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
@@ -66,6 +67,14 @@ type WANSlot struct {
 	// Zero when never probed.
 	LastProbe time.Time
 
+	// releasePort hands ServicePort back to the allocator it was checked
+	// out of, or nil when the slot serves on its own base port. Non-nil
+	// implies ServicePort is a held spare (F-13 make-before-break): the
+	// spare is released only after its listener is down — by the swap that
+	// retires it or by ResetEmpty — and the slot then returns to its base
+	// port. Guarded by mu.
+	releasePort func()
+
 	mu sync.Mutex
 }
 
@@ -73,11 +82,51 @@ type WANPool struct {
 	Slots    []*WANSlot
 	BasePort int
 
-	// replaceMu serializes user-requested drop operations. A replacement
-	// temporarily clears a slot while testing and starting a candidate; without
-	// this guard, concurrent requests could start multiple xray processes for
-	// the same service port.
+	// replaceMu serializes the two short critical sections of a make-
+	// before-break replacement — the candidate pick and the Swap cutover —
+	// so concurrent drops cannot interleave their slot bookkeeping. It is
+	// deliberately NOT held across the speed test or the process start
+	// (F-13): replacements of different slots test in parallel and the old
+	// occupant serves throughout. Listener collisions are prevented by the
+	// port allocators now, not by this lock.
 	replaceMu sync.Mutex
+
+	// testPorts and sparePorts are the shared F-13 port budgets, wired
+	// once by startup (SetPortAllocators) before any goroutine that reads
+	// them starts: every speed test — the cycle's and the drop/replace
+	// API's — checks its port out of testPorts, and make-before-break
+	// replacements boot on ports from sparePorts. Both stay nil on
+	// hand-built pools (unit tests), which keeps the legacy fixed-port
+	// behavior. Read through the nil-safe accessors.
+	testPorts  *ports.Allocator
+	sparePorts *ports.Allocator
+}
+
+// SetPortAllocators wires the shared port budgets (F-13): the speed-test
+// allocator used by runCycle/startup/DropAndReplace alike, and the spare
+// service-port allocator replacements boot on. Call it once at wiring time
+// (startup); nil means "no allocator" (legacy fixed-port behavior).
+func (p *WANPool) SetPortAllocators(test, spare *ports.Allocator) {
+	p.testPorts = test
+	p.sparePorts = spare
+}
+
+// TestPorts returns the shared speed-test port allocator, or nil when the
+// pool was built without one. Nil-receiver safe.
+func (p *WANPool) TestPorts() *ports.Allocator {
+	if p == nil {
+		return nil
+	}
+	return p.testPorts
+}
+
+// SparePorts returns the spare service-port allocator replacements boot on,
+// or nil when the pool was built without one. Nil-receiver safe.
+func (p *WANPool) SparePorts() *ports.Allocator {
+	if p == nil {
+		return nil
+	}
+	return p.sparePorts
 }
 
 var (
@@ -107,6 +156,19 @@ type DropAndReplaceOptions struct {
 	XrayMux         bool
 	TestCandidate   ReplacementTester
 	StartCandidate  ReplacementStarter
+	// TestPorts is the shared speed-test port budget (F-13): when wired,
+	// each candidate test checks a port out of it and returns it when the
+	// test ends, so a cycle test and an API-triggered replacement test can
+	// never collide on one listener port; exhaustion is a clean
+	// ErrNoReplacementCandidate-family error, never a reused port. Nil
+	// falls back to TestPort.
+	TestPorts *ports.Allocator
+	// SparePorts holds the spare service ports (WAN_BASE_PORT+WAN_COUNT..)
+	// an occupied slot boots its replacement on, so the old process keeps
+	// listening on its own port until the cutover. Nil makes an occupied
+	// slot start on its own service port (legacy callers / tests with
+	// injected starters).
+	SparePorts *ports.Allocator
 }
 
 func NewWANPool(count int, basePort int) *WANPool {
@@ -126,39 +188,60 @@ func NewWANPool(count int, basePort int) *WANPool {
 	return &WANPool{Slots: slots, BasePort: basePort}
 }
 
-// DropAndReplace removes the current config from a WAN slot, excludes it from
-// future selection, re-tests the best remaining candidate, and starts it on
-// the slot's existing service port. The slot remains empty whenever no
-// candidate is available or promotion fails.
+// DropAndReplace replaces the config serving a WAN slot make-before-break
+// (F-13): the candidate is picked, speed-tested and started while the OLD
+// occupant keeps serving, and only a validated, running replacement is
+// swapped in (Swap). The retired occupant is stopped strictly AFTER that
+// cutover — never before it — so no traffic is dropped while the
+// replacement's test runs. Every failure path (no candidate, exhausted port
+// budget, failed test, failed start, lost swap race) leaves the slot exactly
+// as it was: the old path keeps serving and a failed replacement never
+// empties the slot.
+//
+// Locking: replaceMu guards only the two short critical sections — the pick
+// below and the Swap cutover — and is deliberately not held across the
+// speed test or the process start, so concurrent replacements of different
+// slots test in parallel (the review's lock complaint).
+//
+// Ports: the test port comes from opts.TestPorts when wired (the shared
+// TEST_BASE_PORT allocator the cycle's tests draw from, so the two can
+// never collide); an occupied slot starts its replacement on a spare
+// service port from opts.SparePorts (WAN_BASE_PORT+WAN_COUNT..), never on
+// the slot's own port while the old process still listens there. Without
+// allocators (unit tests, hand-wired callers) it falls back to opts.TestPort
+// and the slot's own port.
 func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestResult, error) {
 	if index < 0 || index >= len(p.Slots) {
 		return nil, errors.New("slot index out of range")
 	}
 
+	// Critical section 1: snapshot the occupant and pick the candidate.
+	// Nothing below mutates the slot until the Swap cutover, so the old
+	// occupant stays Active and serving for the whole test (RT-10).
 	p.replaceMu.Lock()
-	defer p.replaceMu.Unlock()
-
 	slot := p.Slots[index]
 	slot.mu.Lock()
+	state := slot.State
 	current := slot.Config
+	expected := slot.Current.Load()
 	servicePort := slot.ServicePort
+	oldCmd := slot.Cmd
+	oldConfigPath := slot.ConfigPath
+	oldRelease := slot.releasePort
 	slot.mu.Unlock()
 
-	if opts.Candidates != nil && current != nil && current.Raw != "" {
-		opts.Candidates.Exclude(current.Raw)
-	}
-	if err := p.ResetEmpty(index); err != nil {
-		return nil, fmt.Errorf("drop WAN: %w", err)
-	}
-
 	if opts.Candidates == nil {
+		p.replaceMu.Unlock()
 		return nil, ErrNoReplacementCandidate
 	}
-	// F-12: never hand back the config just dropped (Exclude above covers
+	// F-12: never hand back the config just dropped (Exclude below covers
 	// its Raw; the identity checks below also cover an empty Raw), and
 	// never a config whose server:port is already serving another slot —
 	// the same rule runCycle applies before promoting a config
 	// (HasServerPort: active or draining slots own their server:port).
+	if current != nil && current.Raw != "" {
+		opts.Candidates.Exclude(current.Raw)
+	}
 	candidate := opts.Candidates.Best(func(cfg *proxycfg.ProxyConfig) bool {
 		if current != nil && cfg == current {
 			return true
@@ -168,15 +251,31 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 		}
 		return p.HasServerPort(cfg.Server, cfg.Port)
 	})
+	p.replaceMu.Unlock()
 	if candidate == nil || candidate.Config == nil {
 		return nil, ErrNoReplacementCandidate
 	}
 
+	// Validate the candidate on a port checked out of the shared allocator
+	// (F-13 port discipline): exhaustion is a clean retry-later error, and
+	// the port goes back the moment the test ends — never reused while
+	// another test still holds it.
+	testPort := opts.TestPort
+	releaseTest := func() {}
+	if opts.TestPorts != nil {
+		tp, err := opts.TestPorts.Acquire()
+		if err != nil {
+			return nil, fmt.Errorf("%w: no free speed-test port", ErrNoReplacementCandidate)
+		}
+		testPort = tp
+		releaseTest = func() { _ = opts.TestPorts.Release(tp) }
+	}
 	testCandidate := opts.TestCandidate
 	if testCandidate == nil {
 		testCandidate = TestSpeedWithStability
 	}
-	result := testCandidate(candidate.Config, opts.TestPort, opts.Timeout, opts.DownloadURL, opts.DownloadSize, opts.StabilityProbes)
+	result := testCandidate(candidate.Config, testPort, opts.Timeout, opts.DownloadURL, opts.DownloadSize, opts.StabilityProbes)
+	releaseTest()
 	if result == nil || result.Error != nil {
 		if result != nil && result.Error != nil {
 			return nil, fmt.Errorf("%w: %v", ErrReplacementTestFailed, result.Error)
@@ -184,27 +283,123 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 		return nil, ErrReplacementTestFailed
 	}
 
-	if err := p.StartTesting(index, candidate.Config); err != nil {
-		return nil, fmt.Errorf("prepare replacement slot: %w", err)
+	// Start the replacement. An occupied slot starts on a SPARE service
+	// port so the old process keeps listening on its own port until the
+	// cutover; an empty slot has no occupant to protect and reuses its own
+	// (free) port.
+	startPort := servicePort
+	var releaseSpare func()
+	if state != StateEmpty && opts.SparePorts != nil {
+		sp, err := opts.SparePorts.Acquire()
+		if err != nil {
+			return nil, fmt.Errorf("%w: no free spare service port", ErrNoReplacementCandidate)
+		}
+		startPort = sp
+		releaseSpare = func() { _ = opts.SparePorts.Release(sp) }
 	}
-
 	startCandidate := opts.StartCandidate
 	if startCandidate == nil {
 		startCandidate = StartXray
 	}
-	cmd, path, err := startCandidate(candidate.Config, servicePort, opts.XrayMux)
+	cmd, configPath, err := startCandidate(candidate.Config, startPort, opts.XrayMux)
 	if err != nil {
-		_ = p.ResetEmpty(index)
+		if releaseSpare != nil {
+			releaseSpare()
+		}
 		return nil, fmt.Errorf("start replacement xray: %w", err)
 	}
-	if err := p.SetActive(index, cmd, path); err != nil {
-		_ = StopXray(cmd, path)
-		_ = p.ResetEmpty(index)
-		return nil, fmt.Errorf("activate replacement slot: %w", err)
+
+	// Critical section 2: the atomic cutover. Swap refuses when the slot no
+	// longer holds the path this replacement was validated against (another
+	// replacement won, or the slot was reset while we tested); the loser
+	// simply discards the process it started — the slot's current occupant
+	// keeps serving.
+	newPath := path.New(candidate.Config, cmd, index, startPort)
+	p.replaceMu.Lock()
+	_, swapErr := p.Swap(index, expected, newPath, configPath, releaseSpare)
+	p.replaceMu.Unlock()
+	if swapErr != nil {
+		_ = StopXray(cmd, configPath)
+		if releaseSpare != nil {
+			releaseSpare()
+		}
+		return nil, swapErr
 	}
+
+	// Post-cutover teardown of the retired occupant: stop its process
+	// first, then hand its spare port back (the listener must be down
+	// before the port can be re-issued). This is the first moment any part
+	// of the old WAN is touched — that ordering is the F-13 fix.
+	if oldCmd != nil {
+		_ = StopXray(oldCmd, oldConfigPath)
+	} else if expected != nil && expected.Proc != nil {
+		_ = expected.Stop()
+	}
+	if oldRelease != nil {
+		oldRelease()
+	}
+
 	p.SetSlotSpeedMbps(index, result.Speed)
 	p.SetSlotStability(index, result.StabilityScore)
 	return result, nil
+}
+
+// Swap is the make-before-break cutover (F-13): it atomically installs
+// newPath as the occupant of slot index — config, process handle, temp
+// config path, service port (front-end dials follow the new listener) and
+// spare-port ownership all move to the replacement — and retires the
+// previous occupant's Path to Draining so its counters stay intact for
+// handlers still in flight. The slot lands StateActive with cleared
+// speed/stability/probe bookkeeping; the caller re-records what it
+// measured.
+//
+// expected is the Path the caller observed before validating the
+// replacement. If the slot no longer holds it — another replacement won
+// the race, or the slot was reset while the candidate was tested — Swap
+// fails with an ErrNoReplacementCandidate-wrapped error and changes
+// NOTHING, so the caller can discard the process it started.
+//
+// Swap performs no I/O: the caller stops the retired occupant strictly
+// after Swap returns, never before it — that ordering is the whole point
+// of make-before-break.
+func (p *WANPool) Swap(index int, expected, newPath *path.Path, configPath string, releasePort func()) (*path.Path, error) {
+	if index < 0 || index >= len(p.Slots) {
+		return nil, errors.New("slot index out of range")
+	}
+	if newPath == nil {
+		return nil, errors.New("nil replacement path")
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	old := slot.Current.Load()
+	if old == nil || old != expected {
+		slot.mu.Unlock()
+		return nil, fmt.Errorf("%w: slot changed while the replacement was being validated", ErrNoReplacementCandidate)
+	}
+	// The generation being replaced goes Draining: it keeps its own
+	// counters for in-flight handlers until its teardown. A vacant
+	// placeholder (fixture-built slot) stays as it is.
+	if old.Cfg != nil || old.Proc != nil {
+		old.SetState(path.Draining)
+	}
+	slot.State = StateActive
+	slot.Config = newPath.Cfg
+	slot.Cmd = newPath.Proc
+	slot.ConfigPath = configPath
+	// The slot adopts the replacement's listener port: relay and probe
+	// dials read ServicePort, so it must follow the cutover — the
+	// replacement boots on a spare port while the old process keeps its
+	// own until it is stopped after this point.
+	slot.ServicePort = newPath.Port
+	slot.releasePort = releasePort
+	slot.SpeedMbps = 0
+	slot.StabilityScore = 0
+	slot.DrainAt = time.Time{}
+	slot.ExitIP = ""
+	slot.LastProbe = time.Time{}
+	slot.Current.Store(newPath)
+	slot.mu.Unlock()
+	return old, nil
 }
 
 func (p *WANPool) StartTesting(index int, cfg *proxycfg.ProxyConfig) error {
@@ -269,6 +464,7 @@ func (p *WANPool) ResetEmpty(index int) error {
 	old := slot.Current.Load()
 	cmd := slot.Cmd
 	configPath := slot.ConfigPath
+	release := slot.releasePort
 	slot.mu.Unlock()
 
 	// Stop the retired occupant. For an activated slot old.Proc and cmd are
@@ -278,6 +474,13 @@ func (p *WANPool) ResetEmpty(index int) error {
 		StopXray(cmd, configPath)
 	} else if old != nil && old.Proc != nil {
 		_ = old.Stop()
+	}
+
+	// F-13: a slot serving on a spare service port hands the port back only
+	// after its listener is down, and returns to its own base port so the
+	// next activation binds exactly what runCycle/startup expect.
+	if release != nil {
+		release()
 	}
 
 	slot.mu.Lock()
@@ -290,6 +493,10 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.DrainAt = time.Time{}
 	slot.ExitIP = ""
 	slot.LastProbe = time.Time{}
+	if release != nil {
+		slot.ServicePort = p.BasePort + index
+		slot.releasePort = nil
+	}
 	// Retire the old generation and swap in a fresh vacant one. The retired
 	// Path keeps its own counters for handlers still in flight — they can no
 	// longer touch whatever occupies this slot next (F-04).

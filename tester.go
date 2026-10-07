@@ -32,6 +32,27 @@ type TestResult struct {
 // spawning a process (F-11 test/prod mux parity).
 var startTestXray = StartXray
 
+// acquireCycleTestPort hands out the port for one cycle/startup speed test
+// (F-13 port discipline). When the pool carries the shared test-port
+// allocator the port is checked out of it — the SAME allocator the
+// drop/replace API draws from — so a cycle test and an API-triggered
+// replacement test can never fight over one listener port. Without an
+// allocator (hand-built test pools) it falls back to the historical
+// TEST_BASE_PORT+seq numbering. ok=false means the whole range is checked
+// out: the caller must skip the test — a port that is not held must never
+// be reused. When ok, release must be called after the test returns (the
+// temp xray stops inside the test, before its port goes back).
+func acquireCycleTestPort(pool *WANPool, base, seq int) (port int, release func(), ok bool) {
+	if a := pool.TestPorts(); a != nil {
+		p, err := a.Acquire()
+		if err != nil {
+			return 0, nil, false
+		}
+		return p, func() { _ = a.Release(p) }, true
+	}
+	return base + seq, func() {}, true
+}
+
 // TestSpeed speed-tests one config through a temp xray. It never runs
 // stability probes (see TestSpeedWithStability).
 func TestSpeed(cfg *proxycfg.ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64) *TestResult {

@@ -14,6 +14,7 @@ import (
 	"time"
 	"viberoxy/internal/auth"
 	"viberoxy/internal/cands"
+	"viberoxy/internal/ports"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/subs"
 )
@@ -193,6 +194,29 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
 	candidatePool = cands.NewPool(50)
 
+	// F-13 port discipline: one shared allocator for every speed-test port
+	// (the cycle's tests and the drop/replace API draw from the same pool,
+	// so they can never fight over one listener port) plus spare service
+	// ports for make-before-break replacements (an occupied slot holds its
+	// own port while its replacement boots on a spare). Sizing: the cycle
+	// tests sequentially (MaxTestPerCycle) plus one in-flight test per
+	// concurrent API replacement (WanCount); 2xWanCount spares because an
+	// occupied slot still holds one while its replacement checks out the
+	// next, so one full round of concurrent swaps needs two per slot.
+	// An invalid range (leaving the valid port space) must not refuse to
+	// boot: log loudly and fall back to the legacy fixed-port behavior.
+	testPorts, err := ports.NewTestPorts(cfg.TestBasePort, cfg.MaxTestPerCycleVal()+cfg.WanCount)
+	if err != nil {
+		slog.Error("speed-test port range invalid; falling back to fixed test ports", "error", err)
+		testPorts = nil
+	}
+	sparePorts, err := ports.NewSpareWANPorts(cfg.WanBasePort, cfg.WanCount, 2*cfg.WanCount)
+	if err != nil {
+		slog.Error("spare service port range invalid; replacements fall back to the slot's own port", "error", err)
+		sparePorts = nil
+	}
+	pool.SetPortAllocators(testPorts, sparePorts)
+
 	var (
 		proxy        *ProxyServer
 		obsSrv       *http.Server
@@ -306,7 +330,14 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 				slog.Info("skipping duplicate wan", "server", c.Server, "port", c.Port)
 				continue
 			}
-			result := TestSpeedWithStability(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
+			testPort, releaseTest, ok := acquireCycleTestPort(pool, cfg.TestBasePort, tested)
+			if !ok {
+				slog.Warn("startup: no free speed-test port, retrying...",
+					"active", pool.ActiveCount(), "needed", cfg.WanCount)
+				break
+			}
+			result := TestSpeedWithStability(c, testPort, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
+			releaseTest()
 			tested++
 			if result.Error != nil || result.Speed < cfg.MinimumSpeed {
 				continue
@@ -426,7 +457,15 @@ func keepaliveLoop(cfg *proxycfg.Config, pool *WANPool, ctx context.Context) {
 func probeAllWANs(cfg *proxycfg.Config, pool *WANPool) {
 	timeout := time.Duration(cfg.TestTimeout) * time.Second
 	for _, idx := range pool.GetSlotsByState(StateActive, StateDraining) {
-		socksAddr := fmt.Sprintf("127.0.0.1:%d", pool.Slots[idx].ServicePort)
+		// Read the service port under the slot lock: a make-before-break
+		// swap moves it (F-13), and the probe must see one consistent
+		// value — the front-end relay's unlocked read is the known
+		// remaining spot (flagged for the relay/drain task).
+		slot := pool.Slots[idx]
+		slot.mu.Lock()
+		port := slot.ServicePort
+		slot.mu.Unlock()
+		socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
 		if err := ProbeWAN(socksAddr, timeout); err != nil {
 			pool.RecordFailure(idx)
 			fails := pool.SlotConsecutiveFails(idx)
@@ -524,7 +563,16 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, gr
 			slog.Info("skipping duplicate wan", "server", c.Server, "port", c.Port)
 			continue
 		}
-		result := TestSpeedWithStability(c, cfg.TestBasePort+tested, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
+		testPort, releaseTest, ok := acquireCycleTestPort(pool, cfg.TestBasePort, tested)
+		if !ok {
+			// Whole shared range checked out (an API replacement is mid-
+			// test): skip the rest of this cycle's tests rather than reuse
+			// a port we don't hold (F-13).
+			slog.Warn("cycle: no free speed-test port, skipping the rest of this cycle's tests")
+			break
+		}
+		result := TestSpeedWithStability(c, testPort, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
+		releaseTest()
 		tested++
 		results = append(results, result)
 

@@ -234,8 +234,11 @@ func TestHandleDropWAN_NoCandidatesTriggersCycle(t *testing.T) {
 	if response["status"] != "replacing" || response["message"] != "no candidates, fetching..." {
 		t.Errorf("response = %#v", response)
 	}
-	if pool.GetState(0) != StateEmpty || pool.Slots[0].Config != nil {
-		t.Error("dropped slot was not cleared")
+	// F-13 make-before-break: with no candidate available nothing is
+	// dropped — the old WAN keeps serving and the cycle trigger fetches
+	// fresh candidates for a later attempt.
+	if pool.GetState(0) != StateActive || pool.Slots[0].Config != current {
+		t.Errorf("slot = %v/%v, want the old WAN still active and serving", pool.GetState(0), pool.Slots[0].Config)
 	}
 	select {
 	case <-trigger:
@@ -246,7 +249,8 @@ func TestHandleDropWAN_NoCandidatesTriggersCycle(t *testing.T) {
 
 func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 	pool := NewWANPool(1, 10700)
-	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
+	old := &proxycfg.ProxyConfig{Raw: "ss://old"}
+	activeTestSlot(t, pool, 0, old)
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
 	candidates := cands.NewPool(1)
 	candidates.Update([]*cands.Entry{{Config: replacement, Speed: 50}})
@@ -279,8 +283,11 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 	if started {
 		t.Error("StartCandidate called after failed test")
 	}
-	if pool.GetState(0) != StateEmpty {
-		t.Errorf("slot state = %v, want empty", pool.GetState(0))
+	// F-13 make-before-break: a failed candidate test never touches the
+	// slot — the old WAN keeps serving (never emptied by a failed
+	// replacement).
+	if pool.GetState(0) != StateActive || pool.Slots[0].Config != old {
+		t.Errorf("slot = %v/%v, want the old WAN still active and serving", pool.GetState(0), pool.Slots[0].Config)
 	}
 }
 
@@ -317,9 +324,15 @@ func TestHandleDropWAN_RejectsInvalidRequests(t *testing.T) {
 	}
 }
 
-func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
+// F-13 make-before-break: when the replacement fails to START, the slot is
+// left exactly as it was — the old WAN keeps serving (an empty slot would
+// be the break-before-make bug: traffic dropped for a replacement that
+// never arrived).
+func TestWANPoolDropAndReplace_StartFailureKeepsOldWAN(t *testing.T) {
 	pool := NewWANPool(1, 10700)
-	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
+	old := &proxycfg.ProxyConfig{Raw: "ss://old"}
+	activeTestSlot(t, pool, 0, old)
+	oldPath := pool.Slots[0].Current.Load()
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
 	candidates := cands.NewPool(1)
 	candidates.Update([]*cands.Entry{{Config: replacement, Speed: 50}})
@@ -337,8 +350,11 @@ func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want wrapped %v", err, wantErr)
 	}
-	if pool.GetState(0) != StateEmpty || pool.Slots[0].Config != nil {
-		t.Error("slot should remain empty after start failure")
+	if pool.GetState(0) != StateActive || pool.Slots[0].Config != old {
+		t.Errorf("slot = %v/%v, want the old WAN still active and serving after the failed start", pool.GetState(0), pool.Slots[0].Config)
+	}
+	if pool.Slots[0].Current.Load() != oldPath {
+		t.Error("slot's Path generation changed despite the failed start; the old WAN must keep its identity")
 	}
 }
 
