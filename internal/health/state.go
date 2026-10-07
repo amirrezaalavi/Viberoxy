@@ -40,7 +40,10 @@ type State struct {
 	// healthySince marks the start of the current healthy streak; zero
 	// while suspect or after a HARD_FAIL.
 	healthySince time.Time
-	// canaryOK counts consecutive canary successes in half-open.
+	// canaryOK counts consecutive canary successes: the half-open streak
+	// while suspect, and — since it also accumulates on a healthy path —
+	// the recovery streak a health-drained path uses to come back (F-02).
+	// Any failed canary or ejection resets it to zero.
 	canaryOK int
 }
 
@@ -134,8 +137,23 @@ func (s *State) NoteCanary(now time.Time, ok bool) (recovered bool) {
 	if s.healthySince.IsZero() {
 		s.healthySince = now
 	}
+	// Consecutive successes accumulate on a healthy path too: that streak
+	// is the recovery signal for a drained path (F-02), exposed through
+	// CanaryStreak. Half-open re-admission above still owns its own count.
+	s.canaryOK++
 	s.decay(now)
 	return false
+}
+
+// CanaryStreak reports the number of consecutive canary successes since the
+// last failed canary (0 right after a failure or an ejection). It is the
+// streak behind half-open re-admission while suspect and, on a healthy
+// path, the recovery signal a health-drained path returns to Active on
+// (F-02 — "canary successes").
+func (s *State) CanaryStreak() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.canaryOK
 }
 
 // Ejected reports whether the path is currently ejected (not admitted for

@@ -407,19 +407,42 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	slog.Info("viberoxy stopped")
 }
 
+// DefaultDrainMax is the DRAIN_MAX default (F-02): a draining slot is
+// reaped no later than this long after it started draining, even with
+// in-flight connections. It replaces the old fixed
+// max(60s, 2×FETCH_INTERVAL) timer; the usual completion rule is
+// inflight == 0, DRAIN_MAX is the hard stop.
+const DefaultDrainMax = 600 * time.Second
+
+// drainMaxFromEnv reads DRAIN_MAX (seconds). Unset, invalid or
+// non-positive values yield DefaultDrainMax (with a warning for the
+// bad ones) — the dual-read pattern shared by the other env knobs.
+func drainMaxFromEnv() time.Duration {
+	v := os.Getenv("DRAIN_MAX")
+	if v == "" {
+		return DefaultDrainMax
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("invalid DRAIN_MAX, using default", "DRAIN_MAX", v, "default_s", int(DefaultDrainMax/time.Second))
+		return DefaultDrainMax
+	}
+	return time.Duration(n) * time.Second
+}
+
 func runLoop(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, proxy *ProxyServer, ctx context.Context) {
 	interval := time.Duration(cfg.FetchInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	markCycleComplete(time.Now(), interval)
 
-	gracePeriod := 2 * interval
-	if gracePeriod < 60*time.Second {
-		gracePeriod = 60 * time.Second
-	}
+	// F-02: the drain clock is DRAIN_MAX (default 600s), not a function
+	// of the fetch interval: runCycle reaps a draining slot when its
+	// in-flight flows finish, or at DRAIN_MAX as the hard stop.
+	drainMax := drainMaxFromEnv()
 
 	run := func() {
-		runCycle(cfg, pool, candidatePool, gracePeriod)
+		runCycle(cfg, pool, candidatePool, drainMax)
 		// A manual cycle restarts the interval so the exposed next-cycle time
 		// matches the ticker's actual schedule.
 		ticker.Reset(interval)
@@ -487,9 +510,10 @@ func canaryBaseInterval(keepaliveSeconds int) time.Duration {
 //     gauge moves and a warning is logged (T-HLT-03 / T-CHAOS-05);
 //   - otherwise a failing path records a failure exactly like the old
 //     keepalive did (counting toward WAN_FAIL_THRESHOLD, which marks the
-//     slot Draining for replacement — the existing MarkDraining
-//     machinery), and a passing path resets the counter, feeds its
-//     half-open/health streak and refreshes the exit IP through ipify
+//     slot Draining for health reasons — MarkDrainingHealth, so the
+//     drain is reversible), and a passing path resets the counter, feeds
+//     its half-open/health streak, un-drains the slot when that streak
+//     recovers it (F-02) and refreshes the exit IP through ipify
 //     (exit-IP reporting only — F-07's SPOF fix).
 func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
 	now := time.Now()
@@ -536,7 +560,14 @@ func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
 
 		if !failingSet[idx] {
 			pool.RecordSuccess(idx)
-			cur.NoteCanary(now, true)
+			recovered := cur.NoteCanary(now, true)
+			// F-02 un-drain: a HEALTH-drained slot whose canary streak
+			// recovered returns to Active here instead of waiting to be
+			// reaped. Replacement drains are never un-drained (the pool
+			// tells them apart by drain reason).
+			if pool.UnDrainIfRecovered(idx, recovered) {
+				slog.Info("canary: draining wan recovered, back to active", "index", idx)
+			}
 			if ip, err := probeExitIP(socksAddr, timeout); err == nil {
 				slot := pool.Slots[idx]
 				slot.mu.Lock()
@@ -556,7 +587,9 @@ func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
 		fails := pool.SlotConsecutiveFails(idx)
 		slog.Warn("canary: path failed all endpoints", "index", idx, "fails", fails)
 		if cfg.WanFailThreshold > 0 && fails >= int64(cfg.WanFailThreshold) && pool.GetState(idx) == StateActive {
-			if err := pool.MarkDraining(idx); err != nil {
+			// Health flavor (F-02): this drain reverses if the canary
+			// streak recovers before the drain completes.
+			if err := pool.MarkDrainingHealth(idx); err != nil {
 				slog.Warn("canary: failed to mark draining", "index", idx, "error", err)
 			} else {
 				slog.Warn("canary: wan unhealthy, marked draining", "index", idx, "fails", fails)
@@ -608,7 +641,11 @@ func toCands(results []*TestResult) []*cands.Entry {
 	return entries
 }
 
-func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, gracePeriod time.Duration) {
+// runCycle runs one fetch/test/replace cycle. drainMax is DRAIN_MAX
+// (default 600s): the hard-stop age at which a draining slot is reaped
+// even with in-flight connections; normally the drain completes earlier
+// (inflight == 0) — see WANPool.DrainExpired.
+func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, drainMax time.Duration) {
 	markCycleStarted(time.Now())
 	defer func() {
 		markCycleComplete(time.Now(), time.Duration(cfg.FetchInterval)*time.Second)
@@ -616,7 +653,10 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, gr
 
 	slog.Info("cycle: started")
 
-	for _, idx := range pool.DrainExpired(gracePeriod) {
+	// Reap completed drains (F-02): inflight == 0, or DRAIN_MAX elapsed;
+	// a health-drained slot whose canary streak recovered comes back to
+	// Active inside DrainExpired instead of being killed here.
+	for _, idx := range pool.DrainExpired(drainMax) {
 		slog.Info("cycle: draining expired", "index", idx)
 		pool.ResetEmpty(idx)
 	}

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 	"viberoxy/internal/cands"
+	"viberoxy/internal/health"
 	"viberoxy/internal/path"
 	"viberoxy/internal/ports"
 	"viberoxy/internal/proxycfg"
@@ -39,6 +40,23 @@ func (s WANState) String() string {
 	}
 }
 
+// DrainReason records WHY a slot went Draining (F-02). It decides whether
+// health recovery may bring the slot back (un-drain) or whether it stays
+// draining until the drain completes.
+type DrainReason int
+
+const (
+	// DrainReplace is a drain ordered because the slot is being replaced:
+	// the cycle's replacement marking (runCycle) and the generic
+	// MarkDraining callers. It stays draining until the drain completes —
+	// canary recovery never un-drains the retirement.
+	DrainReplace DrainReason = iota
+	// DrainHealth is a drain ordered because the slot's health failed
+	// (runCanaries at WAN_FAIL_THRESHOLD). When its canary streak
+	// recovers, the slot returns to Active instead of being reaped.
+	DrainHealth
+)
+
 type WANSlot struct {
 	Index       int
 	State       WANState
@@ -60,6 +78,11 @@ type WANSlot struct {
 	// only — a churny slot is never rejected on this alone.
 	StabilityScore int
 	DrainAt        time.Time
+	// drainReason is why DrainAt was set (DrainReplace/DrainHealth);
+	// meaningful only while State == StateDraining. Guarded by mu. The
+	// zero value is DrainReplace: a slot put into StateDraining by hand
+	// (fixtures) is never un-drained, only reaped.
+	drainReason DrainReason
 	// ExitIP is the last observed exit IP from a keepalive probe through
 	// this slot's SOCKS5 listener. Empty when never probed.
 	ExitIP string
@@ -395,6 +418,7 @@ func (p *WANPool) Swap(index int, expected, newPath *path.Path, configPath strin
 	slot.SpeedMbps = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
+	slot.drainReason = DrainReplace
 	slot.ExitIP = ""
 	slot.LastProbe = time.Time{}
 	slot.Current.Store(newPath)
@@ -434,10 +458,29 @@ func (p *WANPool) SetActive(index int, cmd *xrayproc.Handle, configPath string) 
 	// own Path with a fresh ID, so reservations and credits held on the
 	// previous occupant stay with that occupant.
 	slot.Current.Store(path.New(slot.Config, cmd, index, slot.ServicePort))
+	// Any drain bookkeeping belonged to the previous occupant.
+	slot.drainReason = DrainReplace
 	return nil
 }
 
+// MarkDraining moves an Active slot into StateDraining because it is
+// BEING REPLACED (the cycle's replacement marking, and the generic
+// callers): the slot serves its existing flows and is reaped when the
+// drain completes (inflight == 0 or DRAIN_MAX) — health recovery never
+// un-drains a retirement. See MarkDrainingHealth for the health flavor.
 func (p *WANPool) MarkDraining(index int) error {
+	return p.markDraining(index, DrainReplace)
+}
+
+// MarkDrainingHealth moves an Active slot into StateDraining because its
+// HEALTH failed (runCanaries at WAN_FAIL_THRESHOLD). Unlike MarkDraining,
+// this drain is reversible: when the path's canary streak recovers the
+// slot returns to Active instead of being reaped (F-02, un-drain).
+func (p *WANPool) MarkDrainingHealth(index int) error {
+	return p.markDraining(index, DrainHealth)
+}
+
+func (p *WANPool) markDraining(index int, reason DrainReason) error {
 	if index < 0 || index >= len(p.Slots) {
 		return errors.New("slot index out of range")
 	}
@@ -449,10 +492,43 @@ func (p *WANPool) MarkDraining(index int) error {
 	}
 	slot.State = StateDraining
 	slot.DrainAt = time.Now()
+	slot.drainReason = reason
 	if cur := slot.Current.Load(); cur != nil {
 		cur.SetState(path.Draining)
 	}
 	return nil
+}
+
+// UnDrainIfRecovered returns a HEALTH-drained slot (F-02) to Active when
+// its health has recovered: either this canary interval re-admitted the
+// path (halfOpenRecovery, the return of Path.NoteCanary) or its
+// consecutive canary-success streak reached health.HalfOpenSuccesses.
+// A slot marked Draining for replacement (DrainReplace) is never
+// un-drained — its drain is the retirement, not an ejection. Reports
+// whether the slot was un-drained. Safe on out-of-range indices.
+func (p *WANPool) UnDrainIfRecovered(index int, halfOpenRecovery bool) bool {
+	if index < 0 || index >= len(p.Slots) {
+		return false
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if slot.State != StateDraining || slot.drainReason != DrainHealth {
+		return false
+	}
+	cur := slot.Current.Load()
+	if !halfOpenRecovery && cur.CanaryStreak() < health.HalfOpenSuccesses {
+		return false
+	}
+	if cur.GetState() != path.Draining {
+		return false // retired/vacant generation: nothing to bring back
+	}
+	slot.State = StateActive
+	slot.DrainAt = time.Time{}
+	slot.drainReason = DrainReplace
+	cur.SetState(path.Active)
+	slog.Info("wan un-drained: health recovered, back to active", "index", index)
+	return true
 }
 
 func (p *WANPool) ResetEmpty(index int) error {
@@ -491,6 +567,7 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.SpeedMbps = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
+	slot.drainReason = DrainReplace
 	slot.ExitIP = ""
 	slot.LastProbe = time.Time{}
 	if release != nil {
@@ -701,10 +778,14 @@ func (p *WANPool) PickReplacementSlot(activeSlots []int) int {
 // balancing and the keepalive loop marks it draining for replacement.
 const DefaultFailThreshold = 2
 
-// RoutableCount returns the number of active/draining slots that are
-// routable: their ConsecutiveFails is strictly below the given threshold
-// and their Cmd (xray process handle) is non-nil. A slot with a nil Cmd
-// cannot serve traffic even if its state is active.
+// RoutableCount returns the number of ACTIVE slots that are routable:
+// their ConsecutiveFails is strictly below the given threshold and their
+// Cmd (xray process handle) is non-nil. A slot with a nil Cmd cannot
+// serve traffic even if its state is active.
+//
+// Draining slots never count (D-03, F-02): draining means "no NEW
+// connections", so /readyz is ready iff at least one ACTIVE routable
+// path exists — a pool whose only live paths are draining is not ready.
 func (p *WANPool) RoutableCount(threshold int) int {
 	count := 0
 	for _, slot := range p.Slots {
@@ -714,7 +795,7 @@ func (p *WANPool) RoutableCount(threshold int) int {
 		cur := slot.Current.Load()
 		slot.mu.Unlock()
 		fails := cur.ConsecutiveFails()
-		if s == StateActive || s == StateDraining {
+		if s == StateActive {
 			if fails < int64(threshold) && cmd != nil {
 				count++
 			}
@@ -723,23 +804,28 @@ func (p *WANPool) RoutableCount(threshold int) int {
 	return count
 }
 
-// GetLeastLoaded returns the *path.Path of the active/draining slot with the
-// fewest connections — nil when no active/draining slot exists. Slots whose
-// current path's ConsecutiveFails has reached the given threshold are skipped
-// as unhealthy; with no argument the default DefaultFailThreshold (2) applies.
+// GetLeastLoaded returns the *path.Path of the ACTIVE slot with the
+// fewest connections — nil when no selectable slot exists. A Draining
+// slot is NEVER selected while an Active routable path exists (F-02);
+// it is only handed out by the degraded last-resort fallback when no
+// active path is available at all. Slots whose current path's
+// ConsecutiveFails has reached the given threshold are skipped as
+// unhealthy; with no argument the default DefaultFailThreshold (2)
+// applies.
 //
-// The selection rule itself is unchanged: least-loaded wins, ties resolve to
-// the lowest slot index, load comes from the current occupant's clamped
+// The selection rule itself is unchanged: least-loaded wins, ties resolve
+// to the lowest slot index, load comes from the current occupant's clamped
 // connection count. What the callers hold is no longer the index but the
-// returned *Path: the handler reserves and releases that exact generation for
-// the connection's lifetime, which is what keeps slot-index accounting (and
-// the F-04 ABA bug) out of the relay.
+// returned *Path: the handler reserves and releases that exact generation
+// for the connection's lifetime, which is what keeps slot-index accounting
+// (and the F-04 ABA bug) out of the relay.
 //
-// If no routable slot exists (all active/draining slots are over the
-// threshold), it falls back to the least-loaded among all active/draining
-// slots and logs a warning so the degradation is visible. This prevents
-// the proxy from blackholing traffic when every WAN is degraded but at
-// least one is still alive.
+// If no routable slot exists (all active slots are over the threshold),
+// it falls back to the least-loaded among all active slots and logs a
+// warning so the degradation is visible; only when no active path is
+// available there either does the fallback consider draining slots. This
+// prevents the proxy from blackholing traffic when every WAN is degraded
+// but at least one is still alive.
 func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
 	return p.GetLeastLoadedExcluding(nil, thresholds...)
 }
@@ -749,8 +835,14 @@ func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
 // dial-stage failover) is skipped — in the routable pass AND in the degraded
 // fallback — so a retry always lands on a path not yet tried. Everything else
 // is the selection rule of GetLeastLoaded, byte-for-byte: least-loaded
-// active/draining under threshold, ties to the lowest index, degraded
-// fallback last. A nil or empty tried map is the plain GetLeastLoaded call.
+// active under threshold, ties to the lowest index, degraded fallback last.
+// A nil or empty tried map is the plain GetLeastLoaded call.
+//
+// Draining (F-02): StateDraining is skipped by the routable pass exactly
+// like a tried or over-threshold path, and the degraded fallback walks
+// ACTIVE slots first — a draining slot is considered only when no active
+// path is available (last resort, logged), so a drain never attracts NEW
+// connections while any Active routable path exists.
 //
 // Health ejection (SPEC-H.3, F-01): a path the outcome window ejected
 // (path state Suspect) is skipped in the routable pass exactly like an
@@ -766,7 +858,11 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 	var best *path.Path
 	var bestCount int64 = -1
 
-	// First pass: pick the least-loaded among routable slots.
+	// First pass: pick the least-loaded among routable ACTIVE slots.
+	// Draining slots are never eligible here (F-02): they serve their
+	// existing flows but take no new connections while any Active
+	// path is available — the degraded fallback below decides
+	// availability for the last-resort case.
 	for _, slot := range p.Slots {
 		slot.mu.Lock()
 		s := slot.State
@@ -777,7 +873,7 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 			continue // already attempted on this connection
 		}
 		fails := cur.ConsecutiveFails()
-		if s == StateActive || s == StateDraining {
+		if s == StateActive {
 			if fails < int64(threshold) && cmd != nil && cur.GetState() != path.Suspect {
 				c := cur.Conns()
 				if best == nil || c < bestCount {
@@ -793,7 +889,7 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 	}
 
 	// Fallback: no routable slot. Pick the least-loaded among ALL
-	// active/draining slots (even over threshold) to avoid blackhole.
+	// ACTIVE slots (even over threshold) to avoid blackhole.
 	slog.Warn("no routable WAN: falling back to degraded slots", "threshold", threshold)
 	for _, slot := range p.Slots {
 		slot.mu.Lock()
@@ -803,7 +899,31 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 		if tried[cur] {
 			continue // already attempted on this connection
 		}
-		if s == StateActive || s == StateDraining {
+		if s == StateActive {
+			c := cur.Conns()
+			if best == nil || c < bestCount {
+				best = cur
+				bestCount = c
+			}
+		}
+	}
+	if best != nil {
+		return best
+	}
+
+	// Last resort (F-02): NO active path is available, so a draining slot
+	// may take the connection rather than blackhole — logged so the
+	// degradation is visible alongside the "no routable WAN" warning.
+	slog.Warn("no active WAN: draining slot selected as last resort", "threshold", threshold)
+	for _, slot := range p.Slots {
+		slot.mu.Lock()
+		s := slot.State
+		cur := slot.Current.Load()
+		slot.mu.Unlock()
+		if tried[cur] {
+			continue // already attempted on this connection
+		}
+		if s == StateDraining {
 			c := cur.Conns()
 			if best == nil || c < bestCount {
 				best = cur
@@ -814,15 +934,37 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 	return best
 }
 
-func (p *WANPool) DrainExpired(graceDuration time.Duration) []int {
+// DrainExpired returns the indices of draining slots whose drain is
+// COMPLETE (F-02): the current path has no in-flight connections left
+// (existing flows finished) OR maxDrain — DRAIN_MAX — has elapsed since
+// the slot started draining, whichever comes first. The caller reaps what
+// it returns (ResetEmpty); a slot still carrying flows before DRAIN_MAX
+// keeps serving. Before that decision, a HEALTH-drained slot whose canary
+// streak has recovered is un-drained back to Active instead of being
+// killed (F-02 un-drain); a replacement drain is never un-drained.
+func (p *WANPool) DrainExpired(maxDrain time.Duration) []int {
 	var result []int
 	now := time.Now()
-	for i, slot := range p.Slots {
+	for i := range p.Slots {
+		// Recovery beats the kill: an un-drained slot is Active again
+		// and must not appear in the reap list.
+		if p.UnDrainIfRecovered(i, false) {
+			continue
+		}
+		slot := p.Slots[i]
 		slot.mu.Lock()
 		s := slot.State
 		drainAt := slot.DrainAt
+		cur := slot.Current.Load()
 		slot.mu.Unlock()
-		if s == StateDraining && !drainAt.IsZero() && now.Sub(drainAt) >= graceDuration {
+		if s != StateDraining {
+			continue
+		}
+		if cur.Conns() == 0 {
+			result = append(result, i)
+			continue
+		}
+		if !drainAt.IsZero() && now.Sub(drainAt) >= maxDrain {
 			result = append(result, i)
 		}
 	}

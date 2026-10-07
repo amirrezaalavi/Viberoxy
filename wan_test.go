@@ -469,6 +469,11 @@ func TestDrainExpired(t *testing.T) {
 
 	pool.Slots[0].DrainAt = time.Now().Add(-2 * time.Minute)
 	pool.Slots[1].DrainAt = time.Now().Add(-30 * time.Second)
+	// Both still carry an in-flight connection: completion by
+	// inflight == 0 must not fire, so the AGE rule (DRAIN_MAX clock)
+	// is what distinguishes them.
+	pool.Slots[0].Current.Load().Reserve()
+	pool.Slots[1].Current.Load().Reserve()
 
 	expired := pool.DrainExpired(time.Minute)
 	if len(expired) != 1 || expired[0] != 0 {
@@ -486,6 +491,9 @@ func TestDrainExpired_NotYet(t *testing.T) {
 	pool.MarkDraining(0)
 
 	pool.Slots[0].DrainAt = time.Now()
+	// The flow is still in flight: neither inflight == 0 nor the clock
+	// may complete the drain yet.
+	pool.Slots[0].Current.Load().Reserve()
 
 	expired := pool.DrainExpired(time.Minute)
 	if len(expired) != 0 {

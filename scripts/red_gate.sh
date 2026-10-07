@@ -20,7 +20,6 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 DEFAULT_ALLOW='
-TestRed_RT01_DrainingSlotNotSelected
 TestRed_RT11_FullPoolStillEvaluatesCandidates
 '
 
