@@ -1062,3 +1062,44 @@ Every stale pointer the campaign notes recorded, and where it now lives:
 | `viber-console` supervisor reference (F-21) | not in this repo — drop |
 | README env rows: `XRAY_MUX` default `true`, "SOCKS no auth", missing `DRAIN_MAX`/`LISTEN_ADDR`/`ALLOW_*`/`API_TOKEN`/`HEALTH_ENDPOINTS`/`ALLOW_HTTP_SUBSCRIPTION` | README.md rewritten; env table above at parity |
 | Red-gate allow list entries (RT-01…RT-11) | empty — all 11 red tests pass |
+
+## task-4-3: chaos + integrity verification suites (review §7 L2–L3)
+
+New files (all `package main`; nothing in `internal/` or production code changed):
+
+| File | Contents |
+|---|---|
+| `integrity_test.go` | T-INT-01 cross-talk-under-chaos (12 clients: 8 SOCKS5 `testutil.FakeClient` + 4 HTTPS-CONNECT `httpFakeClient`, 200 conns/iteration, seeded chaos: Die/Refuse/AcceptClose/SlowTTFB/Flaky/RstAfter flips + repairs, health-drain, forced SPEC-H.3 ejection, one quiesced make-before-break swap with a 96 KiB paced transfer held across it) and T-INT-02 (256 MiB SHA-256 stream survives a mid-stream swap of its own slot; 32 MiB under `-short`). Shared helpers: `startSocksFront` (explicit `WanFailThreshold`), `startIntegrityProxy`, `httpFakeClient`, `loadWorkers`, `integrityCollector`/`classifyExchange`, `streamTransfer`/`transferExpectedHash`, `coverServicePortReads`. |
+| `chaos_test.go` | `//go:build chaos`; T-CHAOS-01..09 with asserted budgets (2s selection exit, 20s window ejection, traffic-share drops, env_degraded, zero churn, ≤1 re-admit/60s via injected clocks, swap-under-load zero failures, mid-stream swap hash). |
+| `chaosbuild_test.go` / `chaosbuild_chaos_test.go` | the `chaosBuildTag` const pair (`!chaos` / `chaos`) — T-INT-01's iteration profile switch (2 normal, 25 behind the tag, `CHAOS_ITERATIONS` overrides both). |
+| `.github/workflows/ci.yml` | new `chaos` job: `go test -tags chaos -run 'TestChaos|TestIntegrity' -timeout 15m ./...`; `test` job untouched (it picks up the 2-iteration T-INT-01 + T-INT-02). |
+
+Layout decisions worth knowing:
+
+- `-race` swap ordering: `relay.go` reads `slot.ServicePort` without the slot lock
+  (by design, per swap_test.go), so a swap may only write it once every reader is
+  ordered before the write. Instead of swap_test's drain-to-zero (which cannot hold
+  while a transfer is in flight), T-INT-01 pauses new sends, waits 300 ms, then
+  acquires the metric mutexes handlers touch AFTER that read (byte callbacks,
+  retry/outcome events, latency sample) — one acquire of each orders all those
+  reads — and acquires `metricProxyConnections` after the write, before resuming,
+  ordering every future read. Validated green under `-race`.
+- FakeWAN `Blackhole` leaves handlers wedged until the idle timeout (outcome
+  recorded only at relay end), so `AcceptClose` is the black-hole flavor used in
+  chaos tests (probe: it classifies HardFail/`no_down` immediately); the front's
+  `IdleTimeout` is injected (6–60s) wherever a wedged backend could pin
+  reservations past a budget.
+- T-CHAOS-02/04 run the front with `WanFailThreshold = health.WindowSize` so the
+  consecutive-failure counter cannot remove a path before the SPEC-H.3 window
+  accumulates its evidence — the tests pin the window ejection itself — and use
+  `driveBurstsUntil` (relaunch a burst while the condition is unmet): a victim
+  whose scheduler weight has diverged earns too few picks for its window to fill
+  inside one fixed burst, and a starved wait is how the suite first went red.
+- T-CHAOS-07 drives `Path.RecordOutcome`/`NoteCanary` with an injected clock
+  (runCanaries has no clock knob); a successful re-admit also calls
+  `RecordSuccess()`, mirroring `runCanaries`.
+- Mutation sanity (reverted): making `endWAN` release the slot's CURRENT path is
+  caught by T-INT-01's per-generation balance assertion — retired generation
+  leaks `inflight=1`, replacement goes to `inflight=-1` on every iteration (no
+  cross-talk bytes: `Conns()` clamps at zero, so accounting — not routing — is
+  what this mutation breaks).
