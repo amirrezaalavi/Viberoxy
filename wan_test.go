@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 func TestNewWANPool(t *testing.T) {
@@ -69,14 +70,15 @@ func TestSetActive(t *testing.T) {
 	}
 	defer cmd.Process.Kill()
 
-	err := pool.SetActive(0, cmd, "/tmp/test-config.json")
+	proc := xrayproc.Wrap(cmd, "/tmp/test-config.json")
+	err := pool.SetActive(0, proc, "/tmp/test-config.json")
 	if err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 	if pool.Slots[0].State != StateActive {
 		t.Errorf("state = %v, want active", pool.Slots[0].State)
 	}
-	if pool.Slots[0].Cmd != cmd {
+	if pool.Slots[0].Cmd != proc {
 		t.Error("cmd not set")
 	}
 	if pool.Slots[0].ConfigPath != "/tmp/test-config.json" {
@@ -103,7 +105,7 @@ func TestMarkDraining(t *testing.T) {
 		t.Fatalf("start cmd: %v", err)
 	}
 	defer cmd.Process.Kill()
-	if err := pool.SetActive(0, cmd, "/tmp/test-config.json"); err != nil {
+	if err := pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/test-config.json"), "/tmp/test-config.json"); err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 
@@ -136,7 +138,7 @@ func TestResetEmpty(t *testing.T) {
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
-	pool.SetActive(0, cmd, "/tmp/test-config.json")
+	pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/test-config.json"), "/tmp/test-config.json")
 	pool.IncConnCount(0)
 
 	if err := pool.ResetEmpty(0); err != nil {
@@ -183,7 +185,7 @@ func TestGetSlotsByState(t *testing.T) {
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
-	pool.SetActive(0, cmd, "/tmp/cfg.json")
+	pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 
 	emptySlots := pool.GetSlotsByState(StateEmpty)
 	if len(emptySlots) != 2 || emptySlots[0] != 2 || emptySlots[1] != 3 {
@@ -216,7 +218,7 @@ func TestActiveCount(t *testing.T) {
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
-	pool.SetActive(0, cmd, "/tmp/cfg.json")
+	pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	if pool.ActiveCount() != 1 {
 		t.Errorf("expected 1, got %d", pool.ActiveCount())
 	}
@@ -242,7 +244,7 @@ func TestHasServerPort(t *testing.T) {
 		t.Fatalf("start cmd: %v", err)
 	}
 	defer cmd.Process.Kill()
-	if err := pool.SetActive(0, cmd, "/tmp/cfg.json"); err != nil {
+	if err := pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json"); err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 
@@ -298,7 +300,7 @@ func TestGetLeastLoaded(t *testing.T) {
 		cmd := exec.Command("sleep", "9999")
 		cmd.Start()
 		defer cmd.Process.Kill()
-		pool.SetActive(i, cmd, "/tmp/cfg.json")
+		pool.SetActive(i, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	}
 
 	atomic.StoreInt64(&pool.Slots[0].ConnCount, 10)
@@ -327,7 +329,7 @@ func TestGetLeastLoaded_SkipsUnhealthy(t *testing.T) {
 			t.Fatalf("start cmd: %v", err)
 		}
 		defer cmd.Process.Kill()
-		pool.SetActive(i, cmd, "/tmp/cfg.json")
+		pool.SetActive(i, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	}
 
 	// Slot 0 is unhealthy (2 fails >= threshold 2) despite fewer connections.
@@ -361,7 +363,7 @@ func TestGetLeastLoaded_AllUnhealthy_FallsBack(t *testing.T) {
 			t.Fatalf("start cmd: %v", err)
 		}
 		defer cmd.Process.Kill()
-		pool.SetActive(i, cmd, "/tmp/cfg.json")
+		pool.SetActive(i, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	}
 	pool.RecordFailure(0)
 	pool.RecordFailure(0)
@@ -386,7 +388,7 @@ func TestGetLeastLoaded_ThresholdOne(t *testing.T) {
 			t.Fatalf("start cmd: %v", err)
 		}
 		defer cmd.Process.Kill()
-		pool.SetActive(i, cmd, "/tmp/cfg.json")
+		pool.SetActive(i, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	}
 
 	// With threshold 1, a single failure excludes a slot.
@@ -422,7 +424,7 @@ func TestDrainExpired(t *testing.T) {
 		cmd := exec.Command("sleep", "9999")
 		cmd.Start()
 		defer cmd.Process.Kill()
-		pool.SetActive(i, cmd, "/tmp/cfg.json")
+		pool.SetActive(i, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	}
 	pool.MarkDraining(0)
 	pool.MarkDraining(1)
@@ -442,7 +444,7 @@ func TestDrainExpired_NotYet(t *testing.T) {
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
-	pool.SetActive(0, cmd, "/tmp/cfg.json")
+	pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	pool.MarkDraining(0)
 
 	pool.Slots[0].DrainAt = time.Now()
@@ -462,13 +464,13 @@ func TestHealthCheckAll(t *testing.T) {
 		t.Fatalf("start cmd: %v", err)
 	}
 	defer cmdAlive.Process.Kill()
-	pool.SetActive(0, cmdAlive, "/tmp/cfg1.json")
+	pool.SetActive(0, xrayproc.Wrap(cmdAlive, "/tmp/cfg1.json"), "/tmp/cfg1.json")
 
 	pool.StartTesting(1, &proxycfg.ProxyConfig{})
 	cmdDead := exec.Command("sleep", "0")
 	cmdDead.Start()
 	cmdDead.Wait()
-	pool.SetActive(1, cmdDead, "/tmp/cfg2.json")
+	pool.SetActive(1, xrayproc.Wrap(cmdDead, "/tmp/cfg2.json"), "/tmp/cfg2.json")
 
 	pool.StartTesting(2, &proxycfg.ProxyConfig{})
 	cmdAlive2 := exec.Command("sleep", "9999")
@@ -476,7 +478,7 @@ func TestHealthCheckAll(t *testing.T) {
 		t.Fatalf("start cmd: %v", err)
 	}
 	defer cmdAlive2.Process.Kill()
-	pool.SetActive(2, cmdAlive2, "/tmp/cfg3.json")
+	pool.SetActive(2, xrayproc.Wrap(cmdAlive2, "/tmp/cfg3.json"), "/tmp/cfg3.json")
 
 	dead := pool.HealthCheckAll()
 	if len(dead) != 1 || dead[0] != 1 {
@@ -494,7 +496,7 @@ func TestShutdownAll(t *testing.T) {
 			t.Fatalf("start cmd: %v", err)
 		}
 		defer cmd.Process.Kill()
-		pool.SetActive(i, cmd, "/tmp/cfg.json")
+		pool.SetActive(i, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	}
 
 	pool.ShutdownAll()
@@ -547,13 +549,13 @@ func TestHealthyActiveCount(t *testing.T) {
 		t.Fatalf("start cmd: %v", err)
 	}
 	defer cmdAlive.Process.Kill()
-	pool.SetActive(0, cmdAlive, "/tmp/cfg1.json")
+	pool.SetActive(0, xrayproc.Wrap(cmdAlive, "/tmp/cfg1.json"), "/tmp/cfg1.json")
 
 	pool.StartTesting(1, &proxycfg.ProxyConfig{})
 	cmdDead := exec.Command("sleep", "0")
 	cmdDead.Start()
 	cmdDead.Wait()
-	pool.SetActive(1, cmdDead, "/tmp/cfg2.json")
+	pool.SetActive(1, xrayproc.Wrap(cmdDead, "/tmp/cfg2.json"), "/tmp/cfg2.json")
 
 	if c := pool.HealthyActiveCount(); c != 1 {
 		t.Errorf("expected 1, got %d", c)
@@ -764,7 +766,7 @@ func TestResetEmpty_FromDraining(t *testing.T) {
 	cmd := exec.Command("sleep", "9999")
 	cmd.Start()
 	defer cmd.Process.Kill()
-	pool.SetActive(0, cmd, "/tmp/cfg.json")
+	pool.SetActive(0, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json")
 	pool.MarkDraining(0)
 	pool.IncConnCount(0)
 
@@ -781,17 +783,17 @@ func TestRoutableWANConcept(t *testing.T) {
 
 	// Slot 0: active but over fail threshold (3 >= 2).
 	pool.Slots[0].State = StateActive
-	pool.Slots[0].Cmd = exec.Command("sleep", "9999")
+	pool.Slots[0].Cmd = xrayproc.Wrap(exec.Command("sleep", "9999"), "")
 	atomic.StoreInt64(&pool.Slots[0].ConsecutiveFails, 3)
 
 	// Slot 1: active but over fail threshold (3 >= 2).
 	pool.Slots[1].State = StateActive
-	pool.Slots[1].Cmd = exec.Command("sleep", "9999")
+	pool.Slots[1].Cmd = xrayproc.Wrap(exec.Command("sleep", "9999"), "")
 	atomic.StoreInt64(&pool.Slots[1].ConsecutiveFails, 3)
 
 	// Slot 2: active, healthy (0 < 2), with running xray.
 	pool.Slots[2].State = StateActive
-	pool.Slots[2].Cmd = exec.Command("sleep", "9999")
+	pool.Slots[2].Cmd = xrayproc.Wrap(exec.Command("sleep", "9999"), "")
 	atomic.StoreInt64(&pool.Slots[2].ConsecutiveFails, 0)
 
 	// Only slot 2 is routable.
@@ -818,16 +820,20 @@ func TestOrphanedProcessReap(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
 	}
-	if err := pool.SetActive(0, cmd, "/tmp/test-config.json"); err != nil {
+	proc := xrayproc.Wrap(cmd, "/tmp/test-config.json")
+	if err := pool.SetActive(0, proc, "/tmp/test-config.json"); err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 
-	// Simulate the process exiting: kill it and reap the zombie.
+	// Simulate the process exiting: kill it; the handle's reaper reaps the
+	// zombie, so the test must wait on Exited instead of calling Wait.
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill cmd: %v", err)
 	}
-	if err := cmd.Wait(); err != nil {
-		t.Logf("cmd.Wait() returned (expected for killed process): %v", err)
+	select {
+	case <-proc.Exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child was not reaped within 2s")
 	}
 
 	// Confirm the process is truly gone (reaped via Wait).

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 func TestHandleGetWANSlots(t *testing.T) {
@@ -23,7 +24,7 @@ func TestHandleGetWANSlots(t *testing.T) {
 		t.Fatalf("start cmd: %v", err)
 	}
 	defer cmd.Process.Kill()
-	if err := pool.SetActive(1, cmd, "/tmp/cfg.json"); err != nil {
+	if err := pool.SetActive(1, xrayproc.Wrap(cmd, "/tmp/cfg.json"), "/tmp/cfg.json"); err != nil {
 		t.Fatalf("SetActive error: %v", err)
 	}
 	pool.SetSlotSpeedMbps(1, 42.5)
@@ -37,7 +38,7 @@ func TestHandleGetWANSlots(t *testing.T) {
 		t.Fatalf("start cmd2: %v", err)
 	}
 	defer cmd2.Process.Kill()
-	if err := pool.SetActive(2, cmd2, "/tmp/cfg2.json"); err != nil {
+	if err := pool.SetActive(2, xrayproc.Wrap(cmd2, "/tmp/cfg2.json"), "/tmp/cfg2.json"); err != nil {
 		t.Fatalf("SetActive(2) error: %v", err)
 	}
 	if err := pool.MarkDraining(2); err != nil {
@@ -161,7 +162,7 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 			}
 			return &TestResult{Config: cfg, Speed: 73.5, StabilityScore: 1}
 		},
-		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*xrayproc.Handle, string, error) {
 			startedConfig = cfg
 			startPort = port
 			if len(muxEnabled) != 1 || !muxEnabled[0] {
@@ -255,7 +256,7 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 		TestCandidate: func(cfg *proxycfg.ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
 			return &TestResult{Config: cfg, Error: errors.New("probe failed")}
 		},
-		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*xrayproc.Handle, string, error) {
 			started = true
 			return nil, "", nil
 		},
@@ -329,7 +330,7 @@ func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 		TestCandidate: func(cfg *proxycfg.ProxyConfig, port int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
 			return &TestResult{Config: cfg, Speed: 45}
 		},
-		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*exec.Cmd, string, error) {
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, port int, muxEnabled ...bool) (*xrayproc.Handle, string, error) {
 			return nil, "", wantErr
 		},
 	})

@@ -8,7 +8,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 func TestBuildXrayConfig_Shadowsocks(t *testing.T) {
@@ -778,15 +780,20 @@ func TestHealthCheckXray(t *testing.T) {
 		t.Fatalf("start sleep: %v", err)
 	}
 	defer cmd.Process.Kill()
+	proc := xrayproc.Wrap(cmd, "")
 
-	if !HealthCheckXray(cmd) {
+	if !HealthCheckXray(proc) {
 		t.Error("expected health check to return true for running process")
 	}
 
 	cmd.Process.Kill()
-	cmd.Wait()
+	select {
+	case <-proc.Exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child was not reaped within 2s")
+	}
 
-	if HealthCheckXray(cmd) {
+	if HealthCheckXray(proc) {
 		t.Error("expected health check to return false for killed process")
 	}
 }
@@ -812,7 +819,7 @@ func TestStopXray(t *testing.T) {
 		t.Fatalf("start sleep: %v", err)
 	}
 
-	if err := StopXray(cmd, configPath); err != nil {
+	if err := StopXray(xrayproc.Wrap(cmd, configPath), configPath); err != nil {
 		t.Errorf("StopXray error: %v", err)
 	}
 

@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 type WANState int
@@ -40,7 +40,7 @@ type WANSlot struct {
 	Index            int
 	State            WANState
 	Config           *proxycfg.ProxyConfig
-	Cmd              *exec.Cmd
+	Cmd              *xrayproc.Handle
 	ConfigPath       string
 	ServicePort      int
 	ConnCount        int64
@@ -85,7 +85,7 @@ var (
 type ReplacementTester func(*proxycfg.ProxyConfig, int, time.Duration, string, int64, int) *TestResult
 
 // ReplacementStarter starts the persistent xray process for a replacement.
-type ReplacementStarter func(*proxycfg.ProxyConfig, int, ...bool) (*exec.Cmd, string, error)
+type ReplacementStarter func(*proxycfg.ProxyConfig, int, ...bool) (*xrayproc.Handle, string, error)
 
 // DropAndReplaceOptions contains the candidate source, test settings, and
 // injectable process operations used by DropAndReplace.
@@ -196,7 +196,7 @@ func (p *WANPool) StartTesting(index int, cfg *proxycfg.ProxyConfig) error {
 	return nil
 }
 
-func (p *WANPool) SetActive(index int, cmd *exec.Cmd, configPath string) error {
+func (p *WANPool) SetActive(index int, cmd *xrayproc.Handle, configPath string) error {
 	if index < 0 || index >= len(p.Slots) {
 		return errors.New("slot index out of range")
 	}

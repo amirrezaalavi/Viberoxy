@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/xrayproc"
 )
 
 // isolateMetricSeries gives a test its own view of one series of a
@@ -199,11 +200,12 @@ func TestObservabilityHandler(t *testing.T) {
 
 	// /readyz is 200 with an active WAN that has a non-nil Cmd (routable).
 	pool.Slots[0].State = StateActive
-	pool.Slots[0].Cmd = exec.Command("sleep", "9999")
-	if err := pool.Slots[0].Cmd.Start(); err != nil {
+	sleepCmd := exec.Command("sleep", "9999")
+	if err := sleepCmd.Start(); err != nil {
 		t.Fatalf("start cmd: %v", err)
 	}
-	defer pool.Slots[0].Cmd.Process.Kill()
+	defer sleepCmd.Process.Kill()
+	pool.Slots[0].Cmd = xrayproc.Wrap(sleepCmd, "")
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
 	if rec.Code != 200 {
