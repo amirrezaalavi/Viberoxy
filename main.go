@@ -641,6 +641,218 @@ func toCands(results []*TestResult) []*cands.Entry {
 	return entries
 }
 
+// ---- F-03 / SPEC-R: continuous evaluation + hysteresis rotation ----
+
+// maxTestPerCycleFull bounds how many NEW candidate configs one cycle
+// speed-tests while the pool is already at WAN_COUNT (F-03): a full pool
+// keeps evaluating candidates instead of going deaf, but stays bounded
+// so a churny subscription cannot turn every cycle into a benchmarking
+// marathon. New = not already serving (HasServerPort) and not tested
+// within the candidate pool's TTL (cands.DefaultTTL ages the memory out).
+const maxTestPerCycleFull = 2
+
+const (
+	// rotationHysteresis is SPEC-R's swap bar: a candidate only
+	// displaces an incumbent when its score is at least
+	// (1+rotationHysteresis) times the incumbent's — equal or
+	// marginally-better configs never churn the pool.
+	rotationHysteresis = 0.30
+	// rotationMinDwell is how long an incumbent must have served
+	// (since its activation) before it may be rotated out, so a
+	// freshly-activated WAN is never immediately re-evaluated.
+	rotationMinDwell = 10 * time.Minute
+)
+
+// candidateExitIP resolves a not-yet-running candidate's exit IP for
+// SPEC-R's exit-IP dedupe. Until the scheduler task can carry observed
+// exit IPs over to candidates, the best available answer is the
+// candidate's own server address when it is an IP literal (a direct,
+// non-relayed config egresses there); a hostname means the exit IP is
+// UNKNOWN and the caller skips the gate. The served side of the
+// comparison is the ExitIP the canary loop records per slot.
+func candidateExitIP(cfg *proxycfg.ProxyConfig) string {
+	if cfg == nil || net.ParseIP(cfg.Server) == nil {
+		return ""
+	}
+	return cfg.Server
+}
+
+// rotationDecision is SPEC-R's verdict for one cycle: at most one swap
+// (Victim >= 0 plus the chosen Candidate), else Victim == -1 and Reason
+// names the gate that refused. Score = benchmark speed today; the live
+// goodput/TTFB EWMA score lands with the scheduler task.
+type rotationDecision struct {
+	Victim    int
+	Candidate *TestResult
+	Reason    string
+}
+
+// rotator carries SPEC-R's knobs, its injected clock and the swap
+// bookkeeping (cooldown). The process-wide instance is rotation; tests
+// construct their own via newRotator and inject now/exitIP/test/start.
+type rotator struct {
+	mu         sync.Mutex
+	hysteresis float64
+	minDwell   time.Duration
+	now        func() time.Time
+	exitIP     func(*proxycfg.ProxyConfig) string
+	// test/start override DropAndReplace's mandatory re-test and the
+	// process start in tests; nil keeps the production behavior.
+	test  ReplacementTester
+	start ReplacementStarter
+	// lastSwap is when the last successful rotation cut over (zero =
+	// never), the cooldown reference for "now - lastSwap >= FETCH_INTERVAL".
+	lastSwap time.Time
+}
+
+func newRotator() *rotator {
+	return &rotator{
+		hysteresis: rotationHysteresis,
+		minDwell:   rotationMinDwell,
+		now:        time.Now,
+		exitIP:     candidateExitIP,
+	}
+}
+
+// rotation is the process-wide SPEC-R rotator runCycle swaps through.
+var rotation = newRotator()
+
+// decide picks at most ONE SPEC-R swap for a cycle, or reports why
+// none may happen. Gates, in order: FETCH_INTERVAL cooldown; worst
+// incumbent (lowest score; PickReplacementSlot's instability preference
+// breaks ties); MIN_DWELL on the incumbent's age; per-candidate gates
+// (speed bar, no server:port already active/draining, no exit IP already
+// served by an active path — unknown exit IPs skip that check); and
+// finally hysteresis (candidate >= (1+hysteresis) x incumbent).
+func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64, cooldown time.Duration) rotationDecision {
+	r.mu.Lock()
+	nowFn, exitFn := r.now, r.exitIP
+	hyst, dwell := r.hysteresis, r.minDwell
+	lastSwap := r.lastSwap
+	r.mu.Unlock()
+
+	now := nowFn()
+	if !lastSwap.IsZero() && now.Sub(lastSwap) < cooldown {
+		return rotationDecision{Victim: -1, Reason: fmt.Sprintf("cooldown: last swap %s ago, need %s",
+			now.Sub(lastSwap).Round(time.Second), cooldown)}
+	}
+
+	active := pool.GetSlotsByState(StateActive)
+	if len(active) == 0 {
+		return rotationDecision{Victim: -1, Reason: "no active wan"}
+	}
+
+	// Worst incumbent: lowest score, with today's instability
+	// preference (PickReplacementSlot) breaking ties.
+	worst := pool.SlotSpeedMbps(active[0])
+	for _, idx := range active[1:] {
+		if s := pool.SlotSpeedMbps(idx); s < worst {
+			worst = s
+		}
+	}
+	tied := make([]int, 0, len(active))
+	for _, idx := range active {
+		if pool.SlotSpeedMbps(idx) == worst {
+			tied = append(tied, idx)
+		}
+	}
+	victim := pool.PickReplacementSlot(tied)
+
+	// MIN_DWELL: age = time since the incumbent's current occupant was
+	// activated (one *path.Path is minted per activation).
+	if age := now.Sub(pool.Slots[victim].Current.Load().CreatedAt); age < dwell {
+		return rotationDecision{Victim: -1, Reason: fmt.Sprintf("dwell: incumbent served %s, need %s",
+			age.Round(time.Second), dwell)}
+	}
+
+	// Exit IPs the canary loop recorded for the active paths ("" =
+	// never probed = unknown).
+	activeExit := make(map[string]bool, len(active))
+	for _, idx := range active {
+		slot := pool.Slots[idx]
+		slot.mu.Lock()
+		ip := slot.ExitIP
+		slot.mu.Unlock()
+		if ip != "" {
+			activeExit[ip] = true
+		}
+	}
+	blocked := func(c *proxycfg.ProxyConfig) bool {
+		if c == nil {
+			return true
+		}
+		if pool.HasServerPort(c.Server, c.Port) {
+			return true // already serving another active/draining path
+		}
+		ip := exitFn(c)
+		return ip != "" && activeExit[ip] // exit-IP duplicate
+	}
+	cand := bestNewCandidate(results, minSpeed, blocked)
+	if cand == nil {
+		return rotationDecision{Victim: -1, Reason: "no candidate cleared the speed bar, wan dedupe and exit-ip dedupe"}
+	}
+
+	// Hysteresis: only a clear win rotates an incumbent.
+	incumbent := pool.SlotSpeedMbps(victim)
+	if cand.Speed < (1+hyst)*incumbent {
+		return rotationDecision{Victim: -1, Reason: fmt.Sprintf(
+			"hysteresis: candidate %.2f < %.2f (1+%.2f) x incumbent %.2f",
+			cand.Speed, (1+hyst)*incumbent, hyst, incumbent)}
+	}
+	return rotationDecision{Victim: victim, Candidate: cand, Reason: "swap"}
+}
+
+// maybeSwap runs SPEC-R's rotation for one cycle: decide, then perform
+// the single chosen swap through the make-before-break DropAndReplace
+// path (the old occupant keeps serving until the candidate is tested
+// and started on a spare port). At most one DropAndReplace ever runs
+// per call, so a cycle can never swap twice; a successful cutover
+// stamps lastSwap to start the cooldown. Returns true iff a swap cut
+// over.
+func (r *rotator) maybeSwap(pool *WANPool, cfg *proxycfg.Config, results []*TestResult) bool {
+	d := r.decide(pool, results, cfg.MinimumSpeed, time.Duration(cfg.FetchInterval)*time.Second)
+	if d.Victim < 0 {
+		slog.Info("cycle: rotation skipped", "reason", d.Reason)
+		return false
+	}
+
+	// DropAndReplace picks its candidate through a cands pool: hand it
+	// one holding exactly the candidate the gates above approved, so
+	// the decision and the swap can never disagree (it still re-tests
+	// and re-validates make-before-break on its own).
+	only := cands.NewPool(1)
+	only.Update(toCands([]*TestResult{d.Candidate}))
+
+	opts := DropAndReplaceOptions{
+		Candidates:      only,
+		TestPort:        cfg.TestBasePort,
+		Timeout:         time.Duration(cfg.TestTimeout) * time.Second,
+		DownloadURL:     buildDownloadURL(cfg, cfg.DownloadSize),
+		DownloadSize:    cfg.DownloadSize,
+		StabilityProbes: cfg.StabilityProbes,
+		XrayMux:         cfg.XrayMux,
+		TestPorts:       pool.TestPorts(),
+		SparePorts:      pool.SparePorts(),
+	}
+	r.mu.Lock()
+	opts.TestCandidate, opts.StartCandidate = r.test, r.start
+	r.mu.Unlock()
+
+	slog.Info("cycle: rotating wan",
+		"index", d.Victim,
+		"server", d.Candidate.Config.Server,
+		"speed", d.Candidate.Speed,
+		"incumbent_speed", pool.SlotSpeedMbps(d.Victim))
+	if _, err := pool.DropAndReplace(d.Victim, opts); err != nil {
+		slog.Warn("cycle: rotation swap failed", "index", d.Victim, "error", err)
+		return false
+	}
+	r.mu.Lock()
+	r.lastSwap = r.now()
+	r.mu.Unlock()
+	return true
+}
+
 // runCycle runs one fetch/test/replace cycle. drainMax is DRAIN_MAX
 // (default 600s): the hard-stop age at which a draining slot is reaped
 // even with in-flight connections; normally the drain completes earlier
@@ -674,16 +886,33 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 
 	// The subscription is latency-sorted (viberayd serves best configs first).
 	// Test in that order and promote the first configs that clear the
-	// MINIMUM_SPEED bar — no need to test the entire list. This bounds each
-	// cycle to roughly WAN_COUNT tests plus the candidates we actually use.
+	// MINIMUM_SPEED bar — no need to test the entire list. When the pool
+	// is FULL the cycle does not go deaf (F-03): it keeps testing up to
+	// maxTestPerCycleFull NEW candidates per cycle — deduped against the
+	// active/draining WANs (HasServerPort) and against everything the
+	// candidate pool still remembers within its TTL — which is exactly
+	// what feeds SPEC-R's hysteresis rotation below.
 	results := []*TestResult{}
 	tested := 0
+	evaluated := 0
 	skippedUnsupported := map[string]bool{}
-	for _, c := range configs {
-		if pool.ActiveCount() >= cfg.WanCount && len(pool.GetSlotsByState(StateEmpty)) == 0 {
-			break
+	recentlyTested := make(map[string]bool, len(results))
+	if candidatePool != nil {
+		for _, e := range candidatePool.List() {
+			if e != nil && e.Config != nil {
+				recentlyTested[e.Config.Raw] = true
+			}
 		}
-		if tested >= cfg.MaxTestPerCycleVal() {
+	}
+	for _, c := range configs {
+		poolFull := pool.ActiveCount() >= cfg.WanCount && len(pool.GetSlotsByState(StateEmpty)) == 0
+		if poolFull {
+			// F-03: a full pool still evaluates NEW candidates, bounded
+			// by MAX_TEST_PER_CYCLE_FULL instead of stopping dead.
+			if evaluated >= maxTestPerCycleFull {
+				break
+			}
+		} else if tested >= cfg.MaxTestPerCycleVal() {
 			break
 		}
 		// Leak guard: never speed-test or promote protocols that map to a
@@ -697,6 +926,11 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 			slog.Info("skipping duplicate wan", "server", c.Server, "port", c.Port)
 			continue
 		}
+		// F-03 full-pool dedupe: a config tested within the candidate
+		// pool's TTL is not NEW — its result already lives there.
+		if poolFull && recentlyTested[c.Raw] {
+			continue
+		}
 		testPort, releaseTest, ok := acquireCycleTestPort(pool, cfg.TestBasePort, tested)
 		if !ok {
 			// Whole shared range checked out (an API replacement is mid-
@@ -708,6 +942,12 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		result := TestSpeedWithStability(c, testPort, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
 		releaseTest()
 		tested++
+		if poolFull {
+			evaluated++
+		}
+		if c.Raw != "" {
+			recentlyTested[c.Raw] = true
+		}
 		results = append(results, result)
 
 		// Fill empty slots immediately as soon as a config passes.
@@ -716,6 +956,10 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		}
 		emptySlots := pool.GetSlotsByState(StateEmpty)
 		if len(emptySlots) == 0 {
+			if poolFull {
+				// Full: keep spending the F-03 evaluation budget.
+				continue
+			}
 			break
 		}
 		slotIdx := emptySlots[0]
@@ -740,35 +984,16 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		candidatePool.Update(toCands(results))
 	}
 
-	// Replacement: only consider candidates tested this cycle, and only when
-	// the pool is already full — replace a WAN with the best new config we
-	// actually measured (fastest; speed ties broken by lower stability
-	// score). The slot replaced is the least stable active WAN when scores
-	// are known, else the first active slot (historical behavior).
+	// SPEC-R rotation (F-03's second half): the evaluations above feed
+	// the candidate pool, and a FULL pool may rotate — at most ONE
+	// make-before-break swap per cycle, only when a candidate is
+	// clearly better (hysteresis + MIN_DWELL + cooldown + exit-IP
+	// dedupe, all in rotator.decide). This used to be unreachable dead
+	// code: the loop head above stopped all evaluation when the pool
+	// was full, so len(results) was always 0 here.
 	activeSlots := pool.GetSlotsByState(StateActive)
 	if len(activeSlots) == cfg.WanCount && len(results) > 0 {
-		alreadyActive := func(cfg *proxycfg.ProxyConfig) bool {
-			for _, idx := range activeSlots {
-				activeCfg := pool.Slots[idx].Config
-				if activeCfg != nil && activeCfg.Server == cfg.Server && activeCfg.Port == cfg.Port {
-					return true
-				}
-			}
-			return false
-		}
-		best := bestNewCandidate(results, cfg.MinimumSpeed, alreadyActive)
-
-		if best != nil {
-			replaceIdx := pool.PickReplacementSlot(activeSlots)
-			slog.Info("cycle: replacing wan",
-				"index", replaceIdx,
-				"new_server", best.Config.Server,
-				"new_speed", best.Speed,
-				"new_stability", best.StabilityScore)
-			if err := pool.MarkDraining(replaceIdx); err != nil {
-				slog.Warn("cycle: failed to mark draining", "index", replaceIdx, "error", err)
-			}
-		}
+		rotation.maybeSwap(pool, cfg, results)
 	}
 
 	slog.Info("cycle: complete", "active", pool.ActiveCount(), "tested", tested)

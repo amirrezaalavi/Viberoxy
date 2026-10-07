@@ -1,0 +1,14 @@
+diff a/main.go b/main.go	(rejected hunks)
+@@ -608,7 +641,11 @@ func toCands(results []*TestResult) []*cands.Entry {
+ 	return entries
+ }
+ 
+-func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, gracePeriod time.Duration) {
++// runCycle runs one fetch/test/replace cycle. drainMax is DRAIN_MAX
++// (default 600s): the hard-stop age at which a draining slot is reaped
++// even with in-flight connections; normally the drain completes earlier
++// (inflight == 0) — see WANPool.DrainExpired.
++func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, drainMax time.Duration) {
+ 	markCycleStarted(time.Now())
+ 	defer func() {
+ 		markCycleComplete(time.Now(), time.Duration(cfg.FetchInterval)*time.Second)
