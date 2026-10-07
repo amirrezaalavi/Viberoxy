@@ -51,6 +51,14 @@ func TestDrain_TDRAIN01_LongTransferCompletesWhileNewConnsAvoidDrainingWAN(t *te
 	const slowID = "drain-long-transfer-client-identity-abcdefghijklmnop"
 	const fastID = "fastactive"
 
+	// This test pins WHICH slot receives the first transfer (slot 0, the
+	// slow WAN), so its synthetic target opts out of per-(client, site)
+	// stickiness (F-05): with NO_AFFINITY_DOMAINS the selection falls
+	// back to load-based P2C, whose slow-start ramp prefers the older
+	// generation — slot 0, activated first — exactly the premise the
+	// fixture comment below documents.
+	t.Setenv("NO_AFFINITY_DOMAINS", "1.2.3.4")
+
 	// The slow WAN delays the first response byte AND paces the payload
 	// across two chunks, so the transfer spans the whole mark-drain +
 	// burst window with bytes actually in flight.

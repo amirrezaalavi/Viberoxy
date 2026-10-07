@@ -112,6 +112,9 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// startup): fail closed — no usable users, so every request 407s.
 		slog.Error("invalid PROXY_USERS, rejecting proxy connections", "error", err)
 	}
+	// authUser feeds the affinity client key (F-05): only meaningful when
+	// auth actually identified this connection.
+	var authUser string
 	if required {
 		user, pass, ok := auth.ParseBasic(r.Header.Get("Proxy-Authorization"))
 		if !ok || !auth.CheckUsers(users, user, pass) {
@@ -119,6 +122,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
 			return
 		}
+		authUser = user
 	}
 
 	targetHost := r.Host
@@ -165,8 +169,8 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// several distinct WAN paths within the retry policy's attempt cap and
 	// budget before this connection gives up. Final-failure semantics are
 	// unchanged: 503 when no WAN is eligible at all, 502 when every
-	// attempt failed.
-	conn, wanPath, err := p.dialWANFailover(r.Context(), targetHost, start, "connect")
+	// attempt failed. clientID keys the (client, site) affinity (F-05).
+	conn, wanPath, err := p.dialWANFailover(r.Context(), targetHost, clientIdentity(r.RemoteAddr, authUser), start, "connect")
 	if err != nil {
 		if errors.Is(err, retry.ErrNoCandidate) {
 			http.Error(w, "No WAN Available", 503)

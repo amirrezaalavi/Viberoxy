@@ -79,6 +79,25 @@ func (r *wanRelay) endWAN(wanPath *path.Path) {
 	wanPath.Release()
 }
 
+// clientIdentity is the affinity client key the front-ends build for one
+// connection (F-05): the authenticated proxy username when PROXY_USERS
+// auth identified the connection, otherwise the client IP with the
+// ephemeral port stripped. NAT CAVEAT: without PROXY_USERS, many clients
+// behind one NAT share an IP and therefore share one affinity bucket —
+// their (client, site) keys coincide, which spreads stickiness per SITE
+// rather than per client; configuring PROXY_USERS (usernames) restores
+// per-user keys. An empty result (no remote address at all) disables
+// stickiness for the connection: the scheduler falls back to pure P2C.
+func clientIdentity(remoteAddr, authUser string) string {
+	if authUser != "" {
+		return authUser
+	}
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
+}
+
 // dialWAN connects to the slot's local SOCKS5 listener and completes the
 // SOCKS5 handshake to targetHost. On failure it records the failure on the
 // held path, writes the access-log line and returns the error; the caller
@@ -121,13 +140,18 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanPath *path.Path, targetHost s
 // dials). The per-attempt connection metric is recorded here instead of
 // beginWAN so the reservation is never counted twice.
 //
+// AFFINITY KEY (F-05): clientID is the connection's affinity identity the
+// front-end extracted (authenticated proxy username, else client IP — see
+// clientIdentity); together with targetHost it keys the per-(client, site)
+// HRW stickiness inside pool.Select.
+//
 // SAFETY (T-RETRY-03/04): this is a DIAL-stage retry only. Every attempt
 // happens before the relay splices a single application byte, and the retry
 // helper (retry.Run) terminates on the first successful dial — there is no
 // code here, deliberately, that could re-dial or replay once the relay has
 // started. Direct-route dials never come through here: a direct failure is a
 // direct failure.
-func (r *wanRelay) dialWANFailover(ctx context.Context, targetHost string, start time.Time, proto string) (net.Conn, *path.Path, error) {
+func (r *wanRelay) dialWANFailover(ctx context.Context, targetHost, clientID string, start time.Time, proto string) (net.Conn, *path.Path, error) {
 	pol := r.Retry
 	if pol == nil {
 		pol = defaultDialRetry
@@ -148,6 +172,8 @@ func (r *wanRelay) dialWANFailover(ctx context.Context, targetHost string, start
 		cand, release := r.pool.Select(SelectOptions{
 			Tried:     tried,
 			Threshold: r.WanFailThreshold,
+			ClientID:  clientID,
+			Hostport:  targetHost,
 		})
 		if cand == nil {
 			return nil, false

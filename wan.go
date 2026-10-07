@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/affinity"
 	"viberoxy/internal/cands"
 	"viberoxy/internal/health"
 	"viberoxy/internal/path"
@@ -933,28 +934,47 @@ func (p *WANPool) eligibleTries(tried map[*path.Path]bool, threshold int, strict
 
 // SelectOptions carries one connection's selection inputs: the tried set
 // and fail threshold the pool applies (identical to
-// GetLeastLoadedExcluding's).
+// GetLeastLoadedExcluding's), plus the affinity key the front-end built
+// for this connection (F-05). An empty ClientID or Hostport selects
+// without stickiness (pure P2C).
 type SelectOptions struct {
 	// Tried excludes paths this connection already attempted (F-08).
 	Tried map[*path.Path]bool
 	// Threshold is the ConsecutiveFails cutoff for the routable tier,
 	// used exactly as given (callers pass WanFailThreshold).
 	Threshold int
+	// ClientID is the affinity client identity: the SOCKS5/CONNECT
+	// username when PROXY_USERS auth identified the connection, else the
+	// client IP (NAT caveat: many clients behind one NAT share an IP and
+	// therefore one affinity bucket — configuring PROXY_USERS with
+	// usernames restores per-user keys).
+	ClientID string
+	// Hostport is the target authority as the front-end received it
+	// ("host:port"): it is reduced to a registrable-domain (or IP) site
+	// key, unless NO_AFFINITY_DOMAINS opts the host out of stickiness.
+	Hostport string
 }
 
-// Select is the production selection entry point (F-15): eligibility
+// Select is the production selection entry point (F-15/F-05): eligibility
 // comes from eligibleTries with the strict routable rule, ranking and the
 // atomic reservation come from internal/sched (power-of-two-choices over
-// the peak-EWMA cost, random tie-breaks, slow-start ramp). The returned
-// release must be called exactly once by the winner's owner; (nil, nil)
-// means no candidate at all, which callers map to their historical
-// no-candidate semantics (503 / REP 0x01).
+// the peak-EWMA cost, random tie-breaks, slow-start ramp; per-(client,
+// site) HRW stickiness with bulk spill when the key is present). The
+// returned release must be called exactly once by the winner's owner;
+// (nil, nil) means no candidate at all, which callers map to their
+// historical no-candidate semantics (503 / REP 0x01).
 func (p *WANPool) Select(opts SelectOptions) (*path.Path, func()) {
 	routable, degraded, lastResort := p.eligibleTries(opts.Tried, opts.Threshold, true)
+	siteKey := ""
+	if opts.ClientID != "" && affinity.Sticky(opts.Hostport) {
+		siteKey = affinity.SiteKey(opts.Hostport)
+	}
 	return sched.Select(sched.Request{
 		Routable:   routable,
 		Degraded:   degraded,
 		LastResort: lastResort,
+		ClientID:   opts.ClientID,
+		SiteKey:    siteKey,
 	})
 }
 

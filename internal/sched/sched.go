@@ -16,6 +16,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"viberoxy/internal/affinity"
 	"viberoxy/internal/path"
 )
 
@@ -38,6 +39,14 @@ type Request struct {
 	// tiers are empty, so a drain never attracts a new connection while
 	// any Active path exists (F-02).
 	LastResort []*path.Path
+
+	// ClientID and SiteKey are the F-05 affinity key: when both are
+	// non-empty the HRW (rendezvous) pick over the chosen tier is tried
+	// first and only spilled to P2C when that path carries more than
+	// AffinitySpillFactor x the tier's median inflight. Either empty
+	// selects with pure P2C.
+	ClientID string
+	SiteKey  string
 }
 
 // Select picks one candidate from req's tiers and reserves it BEFORE
@@ -51,8 +60,8 @@ type Request struct {
 // two distinct candidates are sampled, the cheaper one wins, and a tie is
 // broken by a seeded coin — never by slot index (T-SEL-06). With an
 // affinity key (F-05) the HRW pick is tried first and only spilled to
-// P2C when it carries more than AFFINITY_BULK_SPILL_FACTOR x the tier's
-// median inflight (availability over stickiness).
+// P2C when it carries more than AffinitySpillFactor x the tier's median
+// inflight (availability over stickiness).
 func Select(req Request) (*path.Path, func()) {
 	selMu.Lock()
 	defer selMu.Unlock()
@@ -111,6 +120,11 @@ const (
 	// path's outlier goodput cannot dominate the cost of the tier.
 	MinWeight = 0.25
 	MaxWeight = 4.0
+
+	// AffinitySpillFactor is AFFINITY_BULK_SPILL (F-05): a sticky HRW
+	// pick carrying more than this multiple of the eligible tier's
+	// median inflight spills to P2C — availability over stickiness.
+	AffinitySpillFactor = 3.0
 )
 
 // cost is (Inflight+1) x max(ewmaTTFB, 50ms floor) / weight: expected
@@ -207,10 +221,37 @@ func medianOf(vals []float64) float64 {
 	return (vals[n/2-1] + vals[n/2]) / 2
 }
 
-// pickLocked ranks the tier. Caller holds selMu. (Commit 1: pure P2C;
-// the F-05 affinity key hooks in here in the affinity commit.)
+// pickLocked ranks the tier: with an affinity key (F-05) the HRW pick is
+// tried first and accepted while it is within AffinitySpillFactor x the
+// tier's median inflight; otherwise — and always without a key — the tier
+// goes through P2C. Caller holds selMu.
 func pickLocked(tier []*path.Path, req Request) *path.Path {
+	if req.ClientID != "" && req.SiteKey != "" {
+		if stick := affinity.Pick(req.ClientID, req.SiteKey, tier); stick != nil {
+			if float64(stick.Conns()) <= AffinitySpillFactor*medianConns(tier) {
+				return stick
+			}
+			// AFFINITY_BULK_SPILL: the sticky path carries more than
+			// AffinitySpillFactor x the eligible tier's median —
+			// availability over stickiness; fall through to P2C.
+		}
+	}
 	return p2c(tier)
+}
+
+// medianConns is the tier's median clamped connection count (even-length
+// averages the two middle values) — the reference load the sticky path is
+// compared against in the bulk-spill rule.
+func medianConns(cands []*path.Path) float64 {
+	if len(cands) == 0 {
+		return 0
+	}
+	vals := make([]float64, 0, len(cands))
+	for _, p := range cands {
+		vals = append(vals, float64(p.Conns()))
+	}
+	sort.Float64s(vals)
+	return medianOf(vals)
 }
 
 // p2c samples two distinct candidates and returns the cheaper one; exactly
