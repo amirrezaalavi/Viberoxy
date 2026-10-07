@@ -122,7 +122,7 @@ All configuration is environment-variable driven; invalid values hard-exit at st
 |---|---|---|
 | `XRAY_MUX` | `false` | Multiplex client connections over one upstream xray connection per WAN (mux concurrency 8). Amortizes the per-connection TLS/protocol handshake — the biggest lever on setup latency. **Incompatible with `flow=xtls-rprx-vision`** (automatically suppressed there). Keep off for very large single transfers |
 
-> There is no `NO_AFFINITY_DOMAINS` knob (or any affinity/scheduler env): site affinity is not implemented yet.
+> Selection is P2C with session affinity; the only affinity env knob is `NO_AFFINITY_DOMAINS` (comma/suffix list, default empty — hosts listed there are exempt from stickiness). The scheduler's tuning knobs (hysteresis 0.30, `MIN_DWELL` 10m, `MAX_TEST_PER_CYCLE_FULL` 2, spill factor 3x) are code constants for now.
 
 ### Quick start
 
@@ -296,7 +296,7 @@ ROUTE_MODE=direct-default PROXY_DOMAINS=".google.com,.youtube.com,.instagram.com
 - **Split routing matches the host string** — see the caveats above (IP-literal targets bypass domain rules; direct-route DNS is local).
 - **Unix only** (Linux/macOS). Windows is untested (process liveness/stop is not build-tagged per OS).
 - **No proxy authentication by default** — set `PROXY_USERS` (the loopback default bind is the baseline protection).
-- Site affinity (`AFFINITY=site|client`) and the P2C scheduler are **not implemented** yet; selection is least-connections over health-gated active paths.
+- Session affinity (HRW per `(client, site)`) and the P2C scheduler **are implemented**; the site key is an embedded eTLD+1 heuristic (not a full public-suffix list), client identity is the SOCKS/CONNECT username when `PROXY_USERS` is set (else client IP — NAT caveat), and a sticky pick carrying >3x the median load spills back to P2C.
 
 ---
 
