@@ -113,7 +113,7 @@ func TestSpecM_PathSeriesRefresh(t *testing.T) {
 	for _, want := range []string{
 		`viberoxy_path_state{path="` + id + `",slot="0"} 1`,
 		`viberoxy_path_inflight{path="` + id + `",slot="0"} 1`,
-		`viberoxy_path_goodput_bps{path="` + id + `",slot="0"} 500000`,
+		`viberoxy_path_goodput_bps{path="` + id + `",slot="0"} 2e+06`, // peak-EWMA (SPEC-S): first sample establishes the estimate; %g formatting
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("exposition missing %q\n%s", want, out)
@@ -362,14 +362,26 @@ func TestSpecM_SelectionLastResort(t *testing.T) {
 	idle := func(i int) {
 		pool.Slots[i].State = StateActive
 		pool.Slots[i].Cmd = swpDummyHandle()
+		// The path generation must be Active too: strict eligibility
+		// (post drain-semantics) requires slot Active AND path Active.
+		pool.Slots[i].Current.Load().SetState(path.Active)
 	}
 	idle(0)
 	idle(1)
 
-	// Routable pick: no increment.
+	// Routable pick: no increment. The production entry (WANPool.Select)
+	// is what owns the metric wiring — pin that, not the test-only
+	// legacy wrapper.
+	pick := func() *path.Path {
+		p, release := pool.Select(SelectOptions{Threshold: 2})
+		if release != nil {
+			release()
+		}
+		return p
+	}
 	before := metricSelectionLastResort.Value()
-	if p := pool.GetLeastLoaded(2); p == nil {
-		t.Fatal("GetLeastLoaded returned nil for a healthy pool")
+	if p := pick(); p == nil {
+		t.Fatal("Select returned nil for a healthy pool")
 	}
 	if v := metricSelectionLastResort.Value(); v != before {
 		t.Errorf("last_resort_total = %v after a routable pick, want %v (unchanged)", v, before)
@@ -378,7 +390,7 @@ func TestSpecM_SelectionLastResort(t *testing.T) {
 	// Both active but over the threshold: the degraded fallback fires.
 	setFails(pool, 0, 5)
 	setFails(pool, 1, 5)
-	if p := pool.GetLeastLoaded(2); p == nil {
+	if p := pick(); p == nil {
 		t.Fatal("degraded fallback must still hand back a path (no blackhole)")
 	}
 	if v := metricSelectionLastResort.Value(); v != before+1 {
@@ -393,7 +405,7 @@ func TestSpecM_SelectionLastResort(t *testing.T) {
 		t.Fatalf("MarkDraining: %v", err)
 	}
 	before = metricSelectionLastResort.Value()
-	if p := pool.GetLeastLoaded(2); p == nil {
+	if p := pick(); p == nil {
 		t.Fatal("draining last resort must still hand back a path")
 	}
 	if v := metricSelectionLastResort.Value(); v != before+1 {
