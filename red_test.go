@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
@@ -334,13 +335,13 @@ func TestRed_RT08_FailoverOnDialFailure(t *testing.T) {
 
 // ---------- RT-09  (F-12) candidate pool must not accumulate duplicates ----------
 func TestRed_RT09_CandidatePoolDedupes(t *testing.T) {
-	cp := NewCandidatePool(10)
-	r := func() *TestResult {
-		return &TestResult{Config: &proxycfg.ProxyConfig{Raw: "ss://same", Server: "1.1.1.1", Port: 1}, Speed: 10}
+	cp := cands.NewPool(10)
+	r := func() *cands.Entry {
+		return &cands.Entry{Config: &proxycfg.ProxyConfig{Raw: "ss://same", Server: "1.1.1.1", Port: 1}, Speed: 10}
 	}
-	cp.Update([]*TestResult{r()})
-	cp.Update([]*TestResult{r()})
-	cp.Update([]*TestResult{r()})
+	cp.Update([]*cands.Entry{r()})
+	cp.Update([]*cands.Entry{r()})
+	cp.Update([]*cands.Entry{r()})
 	if n := len(cp.List()); n != 1 {
 		t.Fatalf("pool holds %d entries for one config; want 1 (merge by Raw, keep newest)", n)
 	}
@@ -358,8 +359,8 @@ func TestRed_RT10_DropAndReplaceKeepsOldWANUntilCandidateValidated(t *testing.T)
 	pool.Slots[0].Config = &proxycfg.ProxyConfig{Raw: "a", Server: "1.1.1.1", Port: 1}
 	defer pool.ShutdownAll()
 
-	cp := NewCandidatePool(5)
-	cp.Update([]*TestResult{{Config: &proxycfg.ProxyConfig{Raw: "b", Server: "2.2.2.2", Port: 2}, Speed: 20}})
+	cp := cands.NewPool(5)
+	cp.Update([]*cands.Entry{{Config: &proxycfg.ProxyConfig{Raw: "b", Server: "2.2.2.2", Port: 2}, Speed: 20}})
 
 	var stateDuringTest WANState = -1
 	opts := DropAndReplaceOptions{
@@ -409,7 +410,7 @@ func TestRed_RT11_FullPoolStillEvaluatesCandidates(t *testing.T) {
 	defer os.Chdir(wd)
 	cfg := &proxycfg.Config{SubscriberURL: srv.URL, WanCount: 1, MinimumSpeed: 5, FetchInterval: 30, TestTimeout: 3,
 		TestBasePort: rtFreePort(t), WanBasePort: 20000, DownloadSize: 1000000}
-	runCycle(cfg, pool, NewCandidatePool(10), time.Minute)
+	runCycle(cfg, pool, cands.NewPool(10), time.Minute)
 
 	b, _ := os.ReadFile("sorted.txt")
 	if len(b) == 0 {

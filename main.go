@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 	"viberoxy/internal/auth"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/subs"
 )
@@ -22,7 +23,7 @@ var (
 	lastCycle     time.Time
 	nextCycle     time.Time
 	triggerCycle  = make(chan struct{}, 1)
-	candidatePool *CandidatePool
+	candidatePool *cands.Pool
 )
 
 func resetCycleTiming() {
@@ -190,7 +191,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	slog.Info("starting viberoxy...")
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
-	candidatePool = NewCandidatePool(50)
+	candidatePool = cands.NewPool(50)
 
 	var (
 		proxy        *ProxyServer
@@ -372,7 +373,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	slog.Info("viberoxy stopped")
 }
 
-func runLoop(cfg *proxycfg.Config, pool *WANPool, candidatePool *CandidatePool, proxy *ProxyServer, ctx context.Context) {
+func runLoop(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, proxy *ProxyServer, ctx context.Context) {
 	interval := time.Duration(cfg.FetchInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -457,7 +458,24 @@ func probeAllWANs(cfg *proxycfg.Config, pool *WANPool) {
 	}
 }
 
-func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *CandidatePool, gracePeriod time.Duration) {
+// toCands converts speed-test results into cands.Entry values for the
+// candidate pool. The pool lives in internal/cands and cannot see main's
+// TestResult, so the value fields are copied here and Config stays shared
+// by pointer.
+func toCands(results []*TestResult) []*cands.Entry {
+	entries := make([]*cands.Entry, len(results))
+	for i, r := range results {
+		entries[i] = &cands.Entry{
+			Config:         r.Config,
+			Speed:          r.Speed,
+			StabilityScore: r.StabilityScore,
+			Error:          r.Error,
+		}
+	}
+	return entries
+}
+
+func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, gracePeriod time.Duration) {
 	markCycleStarted(time.Now())
 	defer func() {
 		markCycleComplete(time.Now(), time.Duration(cfg.FetchInterval)*time.Second)
@@ -537,7 +555,7 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *CandidatePool,
 	// Populate the candidate pool with tested configs for use by the
 	// drop-and-replace API and future cycles.
 	if candidatePool != nil {
-		candidatePool.Update(results)
+		candidatePool.Update(toCands(results))
 	}
 
 	// Replacement: only consider candidates tested this cycle, and only when

@@ -29,6 +29,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/proxycfg"
 )
 
@@ -666,10 +667,10 @@ func TestCandidatesRedactCredentials(t *testing.T) {
 		},
 	}
 
-	p := NewCandidatePool(10)
-	results := make([]*TestResult, 0, len(fixtures))
+	p := cands.NewPool(10)
+	results := make([]*cands.Entry, 0, len(fixtures))
 	for i, f := range fixtures {
-		results = append(results, &TestResult{
+		results = append(results, &cands.Entry{
 			Config: &proxycfg.ProxyConfig{
 				Name:     fmt.Sprintf("cfg-%d", i),
 				Protocol: f.protocol,

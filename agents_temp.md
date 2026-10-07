@@ -274,3 +274,45 @@ compiler also forced out of `api_test.go`/`proxy_test.go`).
 Stale pointers for whoever consolidates: docs/rows referencing `WANSlot.ConnCount`,
 `WANSlot.ConsecutiveFails`, `IncConnCount`/`DecConnCount`, or an index-returning
 `GetLeastLoaded`; the red-gate allow list is now 6 entries (RT-03 fixed by this task).
+
+## task-3-2: candidate pool extracted to `internal/cands` (F-12)
+
+Two commits on `task-3-2-cands`:
+
+1. `refactor(cands): extract candidate pool (behavior-identical)` —
+   `candidate.go` → `internal/cands/pool.go`, `candidate_test.go` →
+   `internal/cands/pool_test.go` (the test file is byte-identical to the
+   old one modulo `package cands`, `TestResult`→`Entry`, and the
+   constructor rename). The type is now `cands.Pool` (`cands.NewPool(maxLen)`),
+   storing `cands.Entry` — a mirror of main's `TestResult`
+   (Config/Speed/StabilityScore/Error) because the tester stays in
+   `package main` and `internal/cands` cannot import it. `runCycle`
+   converts with `toCands(results)`; `Config` is shared by pointer, so
+   identity assertions in the drop-and-replace tests still hold.
+2. `fix(cands): dedupe by Raw, TTL aging, Best(exclude) (F-12); RT-09 green` —
+   dedupe by `Config.Raw` (newest wins), `Entry.TestedAt` + `DefaultTTL`
+   (30 min; stale entries purged lazily in Update/Best/List/Len), `Best`
+   takes an exclusion predicate over `*proxycfg.ProxyConfig`, and
+   `DropAndReplace` now excludes both the just-dropped config and any
+   server:port that is active/draining (same rule as runCycle's
+   `HasServerPort` dedupe). Per-server cap: `DefaultMaxPerServer = 5`
+   entries per server:port (fastest kept) so one flaky upstream cannot
+   flood the pool.
+
+Call-site changes in package `main` (all mechanical): `*CandidatePool` →
+`*cands.Pool`, `NewCandidatePool(...)` → `cands.NewPool(...)`, pool-entry
+literals `[]*TestResult` → `[]*cands.Entry` in tests. `red_test.go` kept
+its `t.Fatal*`/`t.Error*` lines byte-identical (grep diff vs baseline 8858e58
+empty); only plumbing changed.
+
+New tests: `internal/cands/pool_test.go` gained the T-CAND-01/02/03 units
+(TTL aging with explicit `TestedAt` + injected clock, `Best(exclude)`,
+per-server cap) and the RT-09 dedupe unit; `api_test.go` gained
+`TestWANPoolDropAndReplace_SkipsActiveAndDroppedConfigs` (F-12 part 2).
+`scripts/red_gate.sh`: `TestRed_RT09_CandidatePoolDedupes` removed from
+`DEFAULT_ALLOW` (it passes now); allow list is 5 entries, gate exit 0;
+full red suite 5 FAIL / 6 PASS / 0 SKIP.
+
+Stale pointers for whoever consolidates: the AGENTS.md/README Directory Map
+row "`candidate.go` — candidate pool of tested configs" (now
+`internal/cands/pool.go`, package `cands`).

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
 )
@@ -137,8 +138,8 @@ func TestHandleDropWAN_ReplacesFromCandidatePool(t *testing.T) {
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 8443, Raw: "ss://new"}
 	activeTestSlot(t, pool, 0, current)
 
-	candidates := NewCandidatePool(10)
-	candidates.Update([]*TestResult{
+	candidates := cands.NewPool(10)
+	candidates.Update([]*cands.Entry{
 		{Config: current, Speed: 100},
 		{Config: replacement, Speed: 80},
 	})
@@ -215,8 +216,8 @@ func TestHandleDropWAN_NoCandidatesTriggersCycle(t *testing.T) {
 	pool := NewWANPool(1, 10700)
 	current := &proxycfg.ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
 	activeTestSlot(t, pool, 0, current)
-	candidates := NewCandidatePool(1)
-	candidates.Update([]*TestResult{{Config: current, Speed: 50}})
+	candidates := cands.NewPool(1)
+	candidates.Update([]*cands.Entry{{Config: current, Speed: 50}})
 
 	trigger := make(chan struct{}, 1)
 	rec := httptest.NewRecorder()
@@ -247,8 +248,8 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 	pool := NewWANPool(1, 10700)
 	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
-	candidates := NewCandidatePool(1)
-	candidates.Update([]*TestResult{{Config: replacement, Speed: 50}})
+	candidates := cands.NewPool(1)
+	candidates.Update([]*cands.Entry{{Config: replacement, Speed: 50}})
 	started := false
 	opts := DropAndReplaceOptions{
 		Candidates: candidates,
@@ -284,7 +285,7 @@ func TestHandleDropWAN_ReplacementTestFailure(t *testing.T) {
 }
 
 func TestHandleDropWAN_RejectsInvalidRequests(t *testing.T) {
-	handler := handleDropWAN(NewWANPool(1, 10700), DropAndReplaceOptions{Candidates: NewCandidatePool(1)}, make(chan struct{}, 1))
+	handler := handleDropWAN(NewWANPool(1, 10700), DropAndReplaceOptions{Candidates: cands.NewPool(1)}, make(chan struct{}, 1))
 	tests := []struct {
 		name   string
 		method string
@@ -320,8 +321,8 @@ func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 	pool := NewWANPool(1, 10700)
 	activeTestSlot(t, pool, 0, &proxycfg.ProxyConfig{Raw: "ss://old"})
 	replacement := &proxycfg.ProxyConfig{Protocol: "ss", Server: "new.example", Port: 443, Raw: "ss://new"}
-	candidates := NewCandidatePool(1)
-	candidates.Update([]*TestResult{{Config: replacement, Speed: 50}})
+	candidates := cands.NewPool(1)
+	candidates.Update([]*cands.Entry{{Config: replacement, Speed: 50}})
 	wantErr := errors.New("start failed")
 
 	_, err := pool.DropAndReplace(0, DropAndReplaceOptions{
@@ -338,5 +339,46 @@ func TestWANPoolDropAndReplace_StartFailureLeavesSlotEmpty(t *testing.T) {
 	}
 	if pool.GetState(0) != StateEmpty || pool.Slots[0].Config != nil {
 		t.Error("slot should remain empty after start failure")
+	}
+}
+
+// F-12 part 2 (T-CAND-02): DropAndReplace must not promote a config that
+// is already serving in another slot (active/draining — the same rule as
+// runCycle's HasServerPort dedupe), nor the config it just dropped, even
+// when those are the fastest entries in the pool.
+func TestWANPoolDropAndReplace_SkipsActiveAndDroppedConfigs(t *testing.T) {
+	pool := NewWANPool(2, 10700)
+	dropped := &proxycfg.ProxyConfig{Protocol: "ss", Server: "old.example", Port: 443, Raw: "ss://old"}
+	busy := &proxycfg.ProxyConfig{Protocol: "ss", Server: "busy.example", Port: 8443, Raw: "ss://busy"}
+	activeTestSlot(t, pool, 0, dropped)
+	activeTestSlot(t, pool, 1, busy)
+
+	fresh := &proxycfg.ProxyConfig{Protocol: "ss", Server: "free.example", Port: 9000, Raw: "ss://free"}
+	candidates := cands.NewPool(10)
+	candidates.Update([]*cands.Entry{
+		{Config: busy, Speed: 100},   // fastest, but busy.example:8443 already serves slot 1
+		{Config: dropped, Speed: 90}, // the config just dropped from slot 0
+		{Config: fresh, Speed: 80},   // the only eligible one
+	})
+
+	var tested *proxycfg.ProxyConfig
+	_, err := pool.DropAndReplace(0, DropAndReplaceOptions{
+		Candidates: candidates,
+		TestCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ time.Duration, _ string, _ int64, _ int) *TestResult {
+			tested = cfg
+			return &TestResult{Config: cfg, Speed: 42}
+		},
+		StartCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ ...bool) (*xrayproc.Handle, string, error) {
+			return nil, "", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("DropAndReplace: %v", err)
+	}
+	if tested != fresh {
+		t.Errorf("DropAndReplace promoted %s:%d; want the config not already serving another slot (%s:%d)", tested.Server, tested.Port, fresh.Server, fresh.Port)
+	}
+	if pool.Slots[0].Config != fresh || pool.GetState(0) != StateActive {
+		t.Errorf("slot 0 = %v/%v, want fresh config active", pool.Slots[0].Config, pool.GetState(0))
 	}
 }

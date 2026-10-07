@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/cands"
 	"viberoxy/internal/path"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/xrayproc"
@@ -97,7 +98,7 @@ type ReplacementStarter func(*proxycfg.ProxyConfig, int, ...bool) (*xrayproc.Han
 // DropAndReplaceOptions contains the candidate source, test settings, and
 // injectable process operations used by DropAndReplace.
 type DropAndReplaceOptions struct {
-	Candidates      *CandidatePool
+	Candidates      *cands.Pool
 	TestPort        int
 	Timeout         time.Duration
 	DownloadURL     string
@@ -153,7 +154,20 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 	if opts.Candidates == nil {
 		return nil, ErrNoReplacementCandidate
 	}
-	candidate := opts.Candidates.Best()
+	// F-12: never hand back the config just dropped (Exclude above covers
+	// its Raw; the identity checks below also cover an empty Raw), and
+	// never a config whose server:port is already serving another slot —
+	// the same rule runCycle applies before promoting a config
+	// (HasServerPort: active or draining slots own their server:port).
+	candidate := opts.Candidates.Best(func(cfg *proxycfg.ProxyConfig) bool {
+		if current != nil && cfg == current {
+			return true
+		}
+		if current != nil && current.Raw != "" && cfg.Raw == current.Raw {
+			return true
+		}
+		return p.HasServerPort(cfg.Server, cfg.Port)
+	})
 	if candidate == nil || candidate.Config == nil {
 		return nil, ErrNoReplacementCandidate
 	}
