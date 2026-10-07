@@ -60,6 +60,17 @@ jobs:
       - name: red gate (allow-fail list)
         run: bash scripts/red_gate.sh
 
+  chaos:
+    name: chaos + integrity suite (T-INT/T-CHAOS budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: go test -tags chaos (integrity + chaos budgets)
+        run: go test -tags chaos -run 'TestChaos|TestIntegrity' -timeout 15m ./...
+
   build:
     name: build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
