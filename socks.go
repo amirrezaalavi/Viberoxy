@@ -189,18 +189,18 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 		return
 	}
 
-	wanIndex := s.pool.GetLeastLoaded(s.WanFailThreshold)
-	if wanIndex < 0 {
+	wanPath := s.pool.GetLeastLoaded(s.WanFailThreshold)
+	if wanPath == nil {
 		writeSocksReply(clientConn, 0x01) // general failure
 		return
 	}
 
-	s.beginWAN(wanIndex, "socks5")
-	defer s.endWAN(wanIndex)
+	s.beginWAN(wanPath, "socks5")
+	defer s.endWAN(wanPath)
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), socksDialTimeout)
 	defer cancel()
-	upstream, err := s.dialWAN(dialCtx, wanIndex, targetHost, start, "socks5")
+	upstream, err := s.dialWAN(dialCtx, wanPath, targetHost, start, "socks5")
 	if err != nil {
 		writeSocksReply(clientConn, 0x01) // general failure
 		return
@@ -216,7 +216,7 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	// Handshake complete: drop the deadline before relaying.
 	clientConn.SetReadDeadline(time.Time{})
 
-	s.relayThroughWAN(wanIndex, targetHost, start, "socks5", clientConn, upstream, nil)
+	s.relayThroughWAN(wanPath, targetHost, start, "socks5", clientConn, upstream, nil)
 }
 
 // socksAuthenticate performs the RFC 1929 username/password subnegotiation

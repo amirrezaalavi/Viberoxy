@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 	"viberoxy/internal/proxycfg"
@@ -378,20 +377,20 @@ func TestHandleConnect_ConnectionCount(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c != 1 {
+	if c := slotInflight(pool, 0); c != 1 {
 		t.Errorf("expected ConnCount=1 during connection, got %d", c)
 	}
 
 	conn.Close()
 
 	for i := 0; i < 50; i++ {
-		if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c == 0 {
+		if c := slotInflight(pool, 0); c == 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if c := atomic.LoadInt64(&pool.Slots[0].ConnCount); c != 0 {
+	if c := slotInflight(pool, 0); c != 0 {
 		t.Errorf("expected ConnCount=0 after close, got %d", c)
 	}
 }
@@ -473,7 +472,7 @@ func TestHandleConnect_ByteCounting(t *testing.T) {
 	// which is signalled by ConnCount returning to 0.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt64(&pool.Slots[0].ConnCount) == 0 {
+		if slotInflight(pool, 0) == 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -507,7 +506,7 @@ func TestHandleConnect_DialFailureCounted(t *testing.T) {
 	waitForPort(fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
 
 	connsBefore := metricProxyConnections.Value("0", "connect")
-	failsBefore := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails)
+	failsBefore := pool.SlotConsecutiveFails(0)
 
 	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort))
 	if err != nil {
@@ -530,7 +529,7 @@ func TestHandleConnect_DialFailureCounted(t *testing.T) {
 	if conns := metricProxyConnections.Value("0", "connect") - connsBefore; conns != 1 {
 		t.Errorf("connections delta = %v, want 1 (failed attempt counted)", conns)
 	}
-	if fails := atomic.LoadInt64(&pool.Slots[0].ConsecutiveFails); fails != failsBefore+1 {
+	if fails := pool.SlotConsecutiveFails(0); fails != failsBefore+1 {
 		t.Errorf("ConsecutiveFails = %d, want %d", fails, failsBefore+1)
 	}
 }

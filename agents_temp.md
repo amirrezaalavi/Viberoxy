@@ -232,3 +232,45 @@ Stale README/AGENTS rows for whoever consolidates: the `SOCKS_PORT` row ("No aut
 implemented)") is now conditional on `PROXY_USERS`, and the README env table needs `LISTEN_ADDR`,
 `PROXY_USERS`, `API_TOKEN`, `ALLOW_PUBLIC`, `ALLOW_PRIVATE_TARGETS` plus a "loopback by default"
 note on the `PROXY_PORT`/`SOCKS_PORT`/`API_PORT`/`METRICS_PORT` bindings.
+
+## task-2-1: `internal/path` — Path-owned accounting (F-04 root fix, RT-03 green)
+
+New package `internal/path`. A `Path` is one xray process lifetime: `ID` (process-wide
+monotonic, never reused), `Cfg`, `Proc`, `Port`, `Slot`, `Inflight atomic.Int64`,
+`State atomic.Int32` (`Probation|Active|Suspect|Draining|Dead` — only Active/Draining/Dead are
+assigned today), `CreatedAt`, plus placeholder `ewmaTTFB`/`goodputBps` fields documented as
+"populated by later health/scheduler tasks". Methods: `Reserve`/`Release` (release ALWAYS
+targets the receiver — that is the ABA guard), `Conns` (pool-facing read, clamps at 0),
+`RecordFailure`/`RecordSuccess`/`ConsecutiveFails`, `GetState`/`SetState`, `Alive`/`Stop` (via
+`Proc`); all methods are nil-safe.
+
+| Was | Now |
+|---|---|
+| `WANSlot.ConnCount int64` | gone — lives in `Path.Inflight` |
+| `WANSlot.ConsecutiveFails int64` | gone — lives in `Path` (unexported; `RecordFailure`/`RecordSuccess`/`ConsecutiveFails` methods) |
+| — | `WANSlot.Current *atomic.Pointer[path.Path]` (never nil: `NewWANPool`/`ResetEmpty` install a **vacant** path with a fresh ID; `SetActive` installs a new occupant path; `ResetEmpty` marks the old one `Dead`) |
+| `WANPool.IncConnCount(i)` / `DecConnCount(i)` | deleted — handlers call `Reserve`/`Release` on the `*Path` they selected |
+| `WANPool.GetLeastLoaded(...) int` | `GetLeastLoaded(...) *path.Path` (`nil` = no active/draining slot); selection rule byte-for-byte unchanged |
+| `WANPool.RecordFailure/RecordSuccess/SlotConsecutiveFails(i)` | unchanged signatures; they resolve the slot's **current** path (production probes only target active/draining slots, which always have a path) |
+| `relay.beginWAN/endWAN/dialWAN/relayThroughWAN(wanIndex int, ...)` | take the held `*path.Path`; dial failures and relay success credit that held path, never the slot's current occupant |
+
+`api.go`'s `WANSlotInfo` schema is unchanged (`conns`/`consecutive_fails` now read the current
+path). `dialWAN` still reads `ServicePort` from the slot (fixed per slot; tests reconfigure it
+in place after construction).
+
+TDD: `TestRed_RT03_ConnCountNeverNegative` passes (plumbing adapted, `t.Fatal*`/`t.Error*`
+lines byte-identical to HEAD); removed from `DEFAULT_ALLOW` in `scripts/red_gate.sh` (gate now
+6 entries, exit 0; full red suite 6 FAIL / 5 PASS / 0 SKIP). **T-PATH-01** is
+`TestPath_TPATH01_OldPathCannotMutateReplacement` in `wan_test.go` — it drives the real guard
+(`relay.beginWAN`/`endWAN` across reset + re-occupy), which lives in package main, so it cannot
+live in `internal/path`; `internal/path/path_test.go` additionally pins clamped visibility, ID
+monotonicity, concurrent `Reserve`/`Release` under `-race`, process `Alive`/`Stop`, and the
+object-level old-vs-replacement independence.
+
+Test plumbing added: `slotOf`, `slotInflight`, `setSlotInflight`, `setFails` helpers in
+`wan_test.go` (they replace the direct `slot.ConnCount`/`slot.ConsecutiveFails` pokes that the
+compiler also forced out of `api_test.go`/`proxy_test.go`).
+
+Stale pointers for whoever consolidates: docs/rows referencing `WANSlot.ConnCount`,
+`WANSlot.ConsecutiveFails`, `IncConnCount`/`DecConnCount`, or an index-returning
+`GetLeastLoaded`; the red-gate allow list is now 6 entries (RT-03 fixed by this task).

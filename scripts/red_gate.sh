@@ -22,7 +22,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 DEFAULT_ALLOW='
 TestRed_RT01_DrainingSlotNotSelected
 TestRed_RT02_DeadWANDoesNotAttractTraffic
-TestRed_RT03_ConnCountNeverNegative
 TestRed_RT08_FailoverOnDialFailure
 TestRed_RT09_CandidatePoolDedupes
 TestRed_RT10_DropAndReplaceKeepsOldWANUntilCandidateValidated

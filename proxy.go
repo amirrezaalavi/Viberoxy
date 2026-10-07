@@ -158,16 +158,16 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wanIndex := p.pool.GetLeastLoaded(p.WanFailThreshold)
-	if wanIndex < 0 {
+	wanPath := p.pool.GetLeastLoaded(p.WanFailThreshold)
+	if wanPath == nil {
 		http.Error(w, "No WAN Available", 503)
 		return
 	}
 
-	p.beginWAN(wanIndex, "connect")
-	defer p.endWAN(wanIndex)
+	p.beginWAN(wanPath, "connect")
+	defer p.endWAN(wanPath)
 
-	conn, err := p.dialWAN(r.Context(), wanIndex, targetHost, start, "connect")
+	conn, err := p.dialWAN(r.Context(), wanPath, targetHost, start, "connect")
 	if err != nil {
 		http.Error(w, "Bad Gateway", 502)
 		return
@@ -190,7 +190,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	p.relayThroughWAN(wanIndex, targetHost, start, "connect", clientConn, conn, relayio.PeekReader(rw, clientConn))
+	p.relayThroughWAN(wanPath, targetHost, start, "connect", clientConn, conn, relayio.PeekReader(rw, clientConn))
 }
 
 func (p *ProxyServer) handleDefault(w http.ResponseWriter, r *http.Request) {

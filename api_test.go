@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
-	"sync/atomic"
 	"testing"
 	"time"
 	"viberoxy/internal/proxycfg"
@@ -29,7 +28,7 @@ func TestHandleGetWANSlots(t *testing.T) {
 	}
 	pool.SetSlotSpeedMbps(1, 42.5)
 	pool.Slots[1].ExitIP = "203.0.113.1"
-	atomic.StoreInt64(&pool.Slots[1].ConnCount, 7)
+	pool.Slots[1].Current.Load().Inflight.Store(7)
 
 	// Slot 2: draining.
 	pool.StartTesting(2, &proxycfg.ProxyConfig{Server: "5.6.7.8", Port: 8443})
@@ -44,7 +43,7 @@ func TestHandleGetWANSlots(t *testing.T) {
 	if err := pool.MarkDraining(2); err != nil {
 		t.Fatalf("MarkDraining error: %v", err)
 	}
-	atomic.StoreInt64(&pool.Slots[2].ConsecutiveFails, 1)
+	pool.RecordFailure(2)
 
 	// Call the handler.
 	handler := handleGetWANSlots(pool)
