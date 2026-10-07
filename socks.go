@@ -124,6 +124,9 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 		// gets a status instead of a silent hang.
 		slog.Error("invalid PROXY_USERS, rejecting socks5 connections", "error", err)
 	}
+	// authUser feeds the affinity client key (F-05): set only when
+	// PROXY_USERS auth actually identified this connection.
+	var authUser string
 	if required {
 		if !bytes.Contains(methods, []byte{0x02}) {
 			// RFC 1928 §3: no acceptable method offered.
@@ -135,9 +138,11 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 		if _, err := clientConn.Write([]byte{0x05, 0x02}); err != nil {
 			return
 		}
-		if !socksAuthenticate(clientConn, users) {
+		user, ok := socksAuthenticate(clientConn, users)
+		if !ok {
 			return
 		}
+		authUser = user
 	} else if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
@@ -198,7 +203,9 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 	// several distinct WAN paths within the retry policy's attempt cap and
 	// budget. Both final outcomes keep the historical reply: no eligible
 	// WAN and exhausted attempts are each REP 0x01 (general failure).
-	upstream, wanPath, err := s.dialWANFailover(dialCtx, targetHost, start, "socks5")
+	// clientIdentity keys the (client, site) affinity (F-05): the SOCKS5
+	// username when PROXY_USERS auth identified it, else the client IP.
+	upstream, wanPath, err := s.dialWANFailover(dialCtx, targetHost, clientIdentity(clientConn.RemoteAddr().String(), authUser), start, "socks5")
 	if err != nil {
 		writeSocksReply(clientConn, 0x01) // general failure
 		return
@@ -219,38 +226,42 @@ func (s *SocksServer) handleSocksConn(clientConn net.Conn) {
 }
 
 // socksAuthenticate performs the RFC 1929 username/password subnegotiation
-// ([VER=0x01, ULEN, UNAME, PLEN, PASSWD]) and reports whether the
-// credentials matched. A failed exchange is answered with [0x01, 0x01]
-// (failure) and the caller drops the connection; success is [0x01, 0x00].
-// Credential comparison is constant-time (auth.CheckUsers).
-func socksAuthenticate(conn net.Conn, users []auth.UserCred) bool {
+// ([VER=0x01, ULEN, UNAME, PLEN, PASSWD]) and returns the AUTHENTICATED
+// USERNAME with ok=true on success — the username is the affinity client
+// identity when PROXY_USERS auth is configured (F-05). A failed exchange
+// is answered with [0x01, 0x01] (failure), ok=false and an empty user, and
+// the caller drops the connection; success is [0x01, 0x00]. Credential
+// comparison is constant-time (auth.CheckUsers).
+func socksAuthenticate(conn net.Conn, users []auth.UserCred) (user string, ok bool) {
 	sub := make([]byte, 2) // VER, ULEN
 	if _, err := io.ReadFull(conn, sub); err != nil {
-		return false
+		return "", false
 	}
 	if sub[0] != 0x01 {
-		return false
+		return "", false
 	}
 	uname := make([]byte, int(sub[1]))
 	if _, err := io.ReadFull(conn, uname); err != nil {
-		return false
+		return "", false
 	}
 	plen := make([]byte, 1)
 	if _, err := io.ReadFull(conn, plen); err != nil {
-		return false
+		return "", false
 	}
 	passwd := make([]byte, int(plen[0]))
 	if _, err := io.ReadFull(conn, passwd); err != nil {
-		return false
+		return "", false
 	}
 	if !auth.CheckUsers(users, string(uname), string(passwd)) {
 		if _, err := conn.Write([]byte{0x01, 0x01}); err != nil {
-			return false
+			return "", false
 		}
-		return false
+		return "", false
 	}
-	_, err := conn.Write([]byte{0x01, 0x00})
-	return err == nil
+	if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
+		return "", false
+	}
+	return string(uname), true
 }
 
 // writeSocksReply sends a fixed-shape SOCKS5 reply: VER 0x05, REP, RSV 0x00,

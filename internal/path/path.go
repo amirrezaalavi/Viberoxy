@@ -16,6 +16,7 @@
 package path
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -106,13 +107,18 @@ type Path struct {
 
 	// mu guards the health/performance samples below.
 	mu sync.Mutex
-	// ewmaTTFB is the time-to-first-byte EWMA in nanoseconds-ish
-	// duration form: populated from relay first-byte observations and
-	// canary RTTs (SPEC-H.5). Zero until the first sample.
+	// ewmaTTFB is the peak-EWMA time-to-first-byte: worse samples jump it
+	// up immediately, better samples decay it toward themselves with tau
+	// ttfbTau (SPEC-H.5/S). Zero until the first sample.
 	ewmaTTFB time.Duration
-	// goodputBps is the goodput EWMA in bits per second, populated at
-	// relay end from the bytes actually delivered (SPEC-H/SPEC-S input).
+	// goodputBps is the peak-EWMA goodput in bits per second (worse
+	// samples jump it down immediately, better ones decay up with tau
+	// goodputTau), populated at relay end from the bytes actually
+	// delivered (SPEC-H/SPEC-S input to the scheduler cost).
 	goodputBps float64
+	// healthAt is the timestamp of the last RecordHealth sample; the
+	// decay between samples is measured against it. Guarded by mu.
+	healthAt time.Time
 
 	// hc is this generation's SPEC-H health state: the sliding outcome
 	// window (60s/30 outcomes), ejection with exponential backoff and the
@@ -250,8 +256,13 @@ func (p *Path) Stop() error {
 	return p.Proc.Stop("")
 }
 
-// ewmaAlpha is the smoothing factor for the health EWMA fields below.
-const ewmaAlpha = 0.25
+// peak-EWMA time constants: a WORSE sample jumps the estimate
+// immediately, a BETTER sample only decays it toward itself with this
+// time constant (SPEC-H.5/S — see RecordHealth).
+const (
+	ttfbTau    = 10 * time.Second
+	goodputTau = 30 * time.Second
+)
 
 // RecordOutcome feeds one classified relay/dial outcome (SPEC-H.1) into
 // this path's health window (SPEC-H.2/H.3): OK clears the consecutive
@@ -324,24 +335,78 @@ func (p *Path) HealthSnapshot(now time.Time) health.Snapshot {
 
 // RecordHealth folds one observation into the path's performance EWMAs:
 // the time-to-first-byte observed for this connection (0 = unknown) and
-// the goodput in bits per second. Both are inputs to the later
-// scheduler/selector (SPEC-S); nothing selects on them yet.
+// the goodput in bits per second. Both feed the scheduler's cost function
+// (internal/sched).
+//
+// Semantics are peak-EWMA, adverse-direction-first:
+//
+//   - TTFB: a HIGHER sample (slower) replaces the estimate immediately;
+//     a lower one only decays the estimate toward it with tau
+//     ttfbTau (10s).
+//   - goodput: a LOWER sample (slower delivery) replaces the estimate
+//     immediately; a higher one decays toward it with tau goodputTau
+//     (30s).
+//
+// The decay is wall-clock based: between samples the stored estimate
+// moves a fraction 1-exp(-dt/tau) of the way to the better sample, so a
+// path that recovers earns its standing back gradually instead of on one
+// lucky relay, while a regression is priced in on the very next sample.
 func (p *Path) RecordHealth(ttfb time.Duration, goodputBps float64) {
+	p.recordHealthAt(time.Now(), ttfb, goodputBps)
+}
+
+// recordHealthAt is RecordHealth with an injected clock (tests drive the
+// decay deterministically); caller-facing semantics are identical.
+func (p *Path) recordHealthAt(now time.Time, ttfb time.Duration, goodputBps float64) {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if ttfb > 0 {
-		if p.ewmaTTFB == 0 {
+		switch {
+		case p.ewmaTTFB == 0:
 			p.ewmaTTFB = ttfb
-		} else {
-			p.ewmaTTFB = time.Duration(ewmaAlpha*float64(ttfb) + (1-ewmaAlpha)*float64(p.ewmaTTFB))
+		case ttfb > p.ewmaTTFB:
+			p.ewmaTTFB = ttfb // worse latency: jump up immediately
+		default:
+			p.ewmaTTFB = decayDur(p.ewmaTTFB, ttfb, now.Sub(p.healthAt), ttfbTau)
 		}
 	}
 	if goodputBps > 0 {
-		p.goodputBps = ewmaAlpha*goodputBps + (1-ewmaAlpha)*p.goodputBps
+		switch {
+		case p.goodputBps == 0:
+			p.goodputBps = goodputBps
+		case goodputBps < p.goodputBps:
+			p.goodputBps = goodputBps // worse goodput: jump down immediately
+		default:
+			p.goodputBps = decayF64(p.goodputBps, goodputBps, now.Sub(p.healthAt), goodputTau)
+		}
 	}
+	if now.After(p.healthAt) {
+		p.healthAt = now
+	}
+}
+
+// decayDur moves cur toward the better sample target by the fraction
+// 1-exp(-dt/tau) accumulated over dt (dt <= 0 moves nothing).
+func decayDur(cur, target time.Duration, dt, tau time.Duration) time.Duration {
+	if dt <= 0 {
+		return cur
+	}
+	f := 1 - math.Exp(-float64(dt)/float64(tau))
+	v := float64(target) + (float64(cur)-float64(target))*(1-f)
+	return time.Duration(v)
+}
+
+// decayF64 is decayDur for float64 samples (goodput bps).
+func decayF64(cur, target float64, dt, tau time.Duration) float64 {
+	if dt <= 0 {
+		return cur
+	}
+	f := 1 - math.Exp(-float64(dt)/float64(tau))
+	return target + (cur-target)*(1-f)
 }
 
 // TTFB returns the path's time-to-first-byte EWMA (0 = no sample yet).

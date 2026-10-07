@@ -8,11 +8,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"viberoxy/internal/affinity"
 	"viberoxy/internal/cands"
 	"viberoxy/internal/health"
 	"viberoxy/internal/path"
 	"viberoxy/internal/ports"
 	"viberoxy/internal/proxycfg"
+	"viberoxy/internal/sched"
 	"viberoxy/internal/xrayproc"
 )
 
@@ -813,12 +815,12 @@ func (p *WANPool) RoutableCount(threshold int) int {
 // unhealthy; with no argument the default DefaultFailThreshold (2)
 // applies.
 //
-// The selection rule itself is unchanged: least-loaded wins, ties resolve
-// to the lowest slot index, load comes from the current occupant's clamped
-// connection count. What the callers hold is no longer the index but the
-// returned *Path: the handler reserves and releases that exact generation
-// for the connection's lifetime, which is what keeps slot-index accounting
-// (and the F-04 ABA bug) out of the relay.
+// ELIGIBILITY is shared byte-for-byte with Select (eligibleTries), but
+// the RANKING here is the historical one: least-loaded wins, ties resolve
+// to the lowest slot index. Production traffic selects through Select
+// (power-of-two-choices over the peak-EWMA cost, atomic reservation —
+// F-15); this function remains for the legacy tests that pin the
+// least-loaded rule itself (wan_test.go, red_test.go RT-01).
 //
 // If no routable slot exists (all active slots are over the threshold),
 // it falls back to the least-loaded among all active slots and logs a
@@ -834,9 +836,9 @@ func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
 // present in tried (the paths a connection has already attempted on, F-08
 // dial-stage failover) is skipped — in the routable pass AND in the degraded
 // fallback — so a retry always lands on a path not yet tried. Everything else
-// is the selection rule of GetLeastLoaded, byte-for-byte: least-loaded
-// active under threshold, ties to the lowest index, degraded fallback last.
-// A nil or empty tried map is the plain GetLeastLoaded call.
+// is the legacy selection rule: least-loaded active under threshold, ties to
+// the lowest index, degraded fallback last. A nil or empty tried map is the
+// plain GetLeastLoaded call.
 //
 // Draining (F-02): StateDraining is skipped by the routable pass exactly
 // like a tried or over-threshold path, and the degraded fallback walks
@@ -854,15 +856,51 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 	if len(thresholds) > 0 {
 		threshold = thresholds[0]
 	}
+	routable, degraded, lastResort := p.eligibleTries(tried, threshold, false)
+	if best := leastLoaded(routable); best != nil {
+		return best
+	}
+	slog.Warn("no routable WAN: falling back to degraded slots", "threshold", threshold)
+	if best := leastLoaded(degraded); best != nil {
+		return best
+	}
+	slog.Warn("no active WAN: draining slot selected as last resort", "threshold", threshold)
+	return leastLoaded(lastResort)
+}
 
+// leastLoaded is the legacy ranking: fewest clamped connections, ties to
+// the first candidate (candidates arrive in slot order, so ties resolve
+// to the lowest slot index exactly as before).
+func leastLoaded(cands []*path.Path) *path.Path {
 	var best *path.Path
-	var bestCount int64 = -1
+	bestCount := int64(-1)
+	for _, c := range cands {
+		if cnt := c.Conns(); best == nil || cnt < bestCount {
+			best, bestCount = c, cnt
+		}
+	}
+	return best
+}
 
-	// First pass: pick the least-loaded among routable ACTIVE slots.
-	// Draining slots are never eligible here (F-02): they serve their
-	// existing flows but take no new connections while any Active
-	// path is available — the degraded fallback below decides
-	// availability for the last-resort case.
+// eligibleTries partitions every untried path of the pool into the three
+// fallback tiers, in slot order (shared by GetLeastLoadedExcluding's
+// legacy ranking and by Select's power-of-two-choices ranking so the
+// eligibility rules exist exactly once):
+//
+//   - Routable: StateActive slot, ConsecutiveFails < threshold, live
+//     process (non-nil Cmd), and — the only strict/legacy difference —
+//     an eligible path state: == Active for Select (this excludes
+//     Suspect exactly as before, and additionally Probation/Draining/
+//     Dead generations, none of which an Active slot ever holds in
+//     production: they are only reachable by hand-built fixtures), !=
+//     Suspect for the legacy call.
+//   - Degraded: every StateActive slot not tried — over-threshold and
+//     ejected paths live here (documented "no routable WAN" fallback).
+//   - LastResort: StateDraining slots not tried (documented F-02
+//     last resort, only reached when both other tiers are empty).
+//
+// A path in tried is skipped from all three tiers (F-08 retry exclusion).
+func (p *WANPool) eligibleTries(tried map[*path.Path]bool, threshold int, strictRoutable bool) (routable, degraded, lastResort []*path.Path) {
 	for _, slot := range p.Slots {
 		slot.mu.Lock()
 		s := slot.State
@@ -872,66 +910,72 @@ func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds 
 		if tried[cur] {
 			continue // already attempted on this connection
 		}
-		fails := cur.ConsecutiveFails()
-		if s == StateActive {
-			if fails < int64(threshold) && cmd != nil && cur.GetState() != path.Suspect {
-				c := cur.Conns()
-				if best == nil || c < bestCount {
-					best = cur
-					bestCount = c
-				}
+		switch s {
+		case StateActive:
+			// Degraded tier: every untried ACTIVE slot, exactly the
+			// legacy pass-2 membership (it only ever runs when the
+			// routable tier is empty, whose content is irrelevant
+			// then — see GetLeastLoadedExcluding).
+			degraded = append(degraded, cur)
+			st := cur.GetState()
+			routableState := st != path.Suspect
+			if strictRoutable {
+				routableState = st == path.Active
 			}
-		}
-	}
-
-	if best != nil {
-		return best
-	}
-
-	// Fallback: no routable slot. Pick the least-loaded among ALL
-	// ACTIVE slots (even over threshold) to avoid blackhole.
-	slog.Warn("no routable WAN: falling back to degraded slots", "threshold", threshold)
-	for _, slot := range p.Slots {
-		slot.mu.Lock()
-		s := slot.State
-		cur := slot.Current.Load()
-		slot.mu.Unlock()
-		if tried[cur] {
-			continue // already attempted on this connection
-		}
-		if s == StateActive {
-			c := cur.Conns()
-			if best == nil || c < bestCount {
-				best = cur
-				bestCount = c
+			if cur.ConsecutiveFails() < int64(threshold) && cmd != nil && routableState {
+				routable = append(routable, cur)
 			}
+		case StateDraining:
+			lastResort = append(lastResort, cur)
 		}
 	}
-	if best != nil {
-		return best
-	}
+	return routable, degraded, lastResort
+}
 
-	// Last resort (F-02): NO active path is available, so a draining slot
-	// may take the connection rather than blackhole — logged so the
-	// degradation is visible alongside the "no routable WAN" warning.
-	slog.Warn("no active WAN: draining slot selected as last resort", "threshold", threshold)
-	for _, slot := range p.Slots {
-		slot.mu.Lock()
-		s := slot.State
-		cur := slot.Current.Load()
-		slot.mu.Unlock()
-		if tried[cur] {
-			continue // already attempted on this connection
-		}
-		if s == StateDraining {
-			c := cur.Conns()
-			if best == nil || c < bestCount {
-				best = cur
-				bestCount = c
-			}
-		}
+// SelectOptions carries one connection's selection inputs: the tried set
+// and fail threshold the pool applies (identical to
+// GetLeastLoadedExcluding's), plus the affinity key the front-end built
+// for this connection (F-05). An empty ClientID or Hostport selects
+// without stickiness (pure P2C).
+type SelectOptions struct {
+	// Tried excludes paths this connection already attempted (F-08).
+	Tried map[*path.Path]bool
+	// Threshold is the ConsecutiveFails cutoff for the routable tier,
+	// used exactly as given (callers pass WanFailThreshold).
+	Threshold int
+	// ClientID is the affinity client identity: the SOCKS5/CONNECT
+	// username when PROXY_USERS auth identified the connection, else the
+	// client IP (NAT caveat: many clients behind one NAT share an IP and
+	// therefore one affinity bucket — configuring PROXY_USERS with
+	// usernames restores per-user keys).
+	ClientID string
+	// Hostport is the target authority as the front-end received it
+	// ("host:port"): it is reduced to a registrable-domain (or IP) site
+	// key, unless NO_AFFINITY_DOMAINS opts the host out of stickiness.
+	Hostport string
+}
+
+// Select is the production selection entry point (F-15/F-05): eligibility
+// comes from eligibleTries with the strict routable rule, ranking and the
+// atomic reservation come from internal/sched (power-of-two-choices over
+// the peak-EWMA cost, random tie-breaks, slow-start ramp; per-(client,
+// site) HRW stickiness with bulk spill when the key is present). The
+// returned release must be called exactly once by the winner's owner;
+// (nil, nil) means no candidate at all, which callers map to their
+// historical no-candidate semantics (503 / REP 0x01).
+func (p *WANPool) Select(opts SelectOptions) (*path.Path, func()) {
+	routable, degraded, lastResort := p.eligibleTries(opts.Tried, opts.Threshold, true)
+	siteKey := ""
+	if opts.ClientID != "" && affinity.Sticky(opts.Hostport) {
+		siteKey = affinity.SiteKey(opts.Hostport)
 	}
-	return best
+	return sched.Select(sched.Request{
+		Routable:   routable,
+		Degraded:   degraded,
+		LastResort: lastResort,
+		ClientID:   opts.ClientID,
+		SiteKey:    siteKey,
+	})
 }
 
 // DrainExpired returns the indices of draining slots whose drain is

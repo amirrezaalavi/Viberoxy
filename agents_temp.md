@@ -648,3 +648,124 @@ scripts/red_gate.sh` prints the empty-list note then fails with
 `unexpected failure: TestRed_RT01_DrainingSlotNotSelected` (exit 1), proving the empty
 path enforces all-pass rather than erroring on emptiness; default run exits 0 with
 1 entry (failing=1 passing=10 skipping=0).
+
+## task-245: P2C scheduling + (client, site) affinity (F-15, F-05)
+
+Two commits on `task-245-sched-affinity`:
+1. `feat(sched): P2C with peak-EWMA cost and atomic reservation (F-15)`
+2. `feat(affinity): HRW per (client, site) with bulk spill (F-05)`
+
+**Selection now lives in `internal/sched` (production path).** `WANPool.Select(SelectOptions)`
+is the entry point: `eligibleTries(tried, threshold, strict)` builds the three
+eligibility tiers ONCE (shared with the legacy `GetLeastLoadedExcluding`), then
+`sched.Select(Request)` ranks and reserves. `dialWANFailover.next()` in relay.go is the
+only production caller (front-ends pass `clientIdentity(...) + targetHost` through it).
+
+- **Cost** = `(Inflight+1) * max(ewmaTTFB, 50ms floor) / weight`; `weight =
+  clamp(goodputEWMA/medianGoodput, 0.25, 4) * ramp(age) * stateFactor` (Active 1.0,
+  Suspect 1.5, Draining 2.0, Probation/Dead 4.0 — penalize, never exclude, inside a
+  tier). Tier with no goodput signal (median 0) uses neutral weight 1.0. Zeros are
+  included in the median.
+- **P2C**: two distinct candidates sampled (`j=(i+1+Intn(n-1))%n`), cheaper cost wins;
+  ties are EXACT cost equality -> seeded coin (never slot index). No near-tie
+  tolerance: equal inputs are bitwise-equal, and the ramp's clamp to 1.0 past
+  `RampWindow` (60s) makes equal-age-class generations exactly tie, while a
+  sub-clamp age gradient is the slow-start's intended preference (this is also what
+  keeps the pre-existing fixtures whose comment says "tie -> lowest index" — they
+  activate slots in index order, so oldest == lowest index there — deterministic).
+- **Atomic select+reserve**: rank + `Inflight.Add(1)` + release closure happen inside
+  one package-wide `selMu` critical section; `SeedRand` reseeds under the same lock
+  (tests). `Select` returns `(nil, nil)` iff every tier is empty (503 / REP 0x01 kept).
+- **Slow-start ramp** `ramp(age)=min(1, 0.1+0.9*age/60s)` off `Path.CreatedAt`.
+- **peak-EWMA (`path.RecordHealth`)**: worse sample jumps immediately (TTFB up,
+  goodput down), better sample decays with tau 10s/30s via
+  `1-exp(-dt/tau)` between samples (new `healthAt` timestamp, injected-clock
+  `recordHealthAt` for tests). The old fixed `ewmaAlpha=0.25` smoothing is gone.
+- **relay.go feeds (stats only, `logAccess` untouched)**: goodput = OnBytes down
+  total over relay duration; TTFB = time-to-first-byte at the relay, with the
+  documented SIMPLIFICATION that a relay with no observable first down byte falls
+  back to the relay DURATION (coarse upper bound) instead of skipping the sample;
+  still fed only on `outcome == OK` (F-01 unchanged).
+
+**Affinity (`internal/affinity`, F-05).** `Pick(clientID, siteKey, cands)` = FNV-1a-64
+over `clientID NUL siteKey NUL LE(path.ID)`, max score wins (score tie -> first
+candidate, deterministic). `SiteKey(host)` strips port/brackets/root-dot, keys IP
+literals on `net.IP.String()`, hostnames on an embedded eTLD+1 heuristic (last two
+labels; last three under the embedded second-level exception list — co.uk, com.au,
+co.jp, com.br, co.kr, com.tr, com.cn, co.za + ~20 more pairs; NOT the full PSL —
+`x.github.io` reduces one label early, documented as the maintenance knob).
+`NO_AFFINITY_DOMAINS` is comma/whitespace-separated, case-insensitive, exact or
+parent-domain suffix match, read at REQUEST time (dual-read like
+`subs.AllowHTTPFromEnv`; startup validation in `proxycfg.ParseConfig` is a flag for a
+config task — proxycfg is outside this task's scope).
+`clientIdentity(remoteAddr, authUser)` (relay.go) = authenticated username when
+PROXY_USERS identified the connection (SOCKS5 subnegotiation now RETURNS the
+username; CONNECT captures it from Proxy-Authorization), else client IP with the
+ephemeral port stripped. **NAT caveat:** without PROXY_USERS, clients behind one NAT
+share one affinity bucket (per-SITE stickiness); usernames restore per-user keys.
+
+**AFFINITY_BULK_SPILL**: HRW pick accepted while `pick.Conns() <= 3 x medianConns(tier)`
+(median includes the pick; even-length averages the two middle values), otherwise
+fall through to P2C. Literal zero-median consequence (documented): with >=3 paths
+where the others are idle (median 0) ANY inflight on the sticky path spills — so
+parallel same-site opens spread across paths while sequential requests stick;
+two-path pools never spill (median = k/2 >= k/3 always). Availability over
+stickiness, as specified.
+
+**Retry loop (`relay.go dialWANFailover`)**: `next()` = `pool.Select` with the tried
+set; the path arrives ALREADY reserved, so the per-attempt
+`metricProxyConnections.Inc` moved out of `beginWAN` (beginWAN itself is unchanged
+and still reserves — red RT-03 / T-PATH-01 call it directly). A `pendingRelease`
+tracks the last handed-out reservation: consumed by that attempt's dial (failure ->
+release, success -> caller's `endWAN`), and released after `retry.Run` if the retry
+bucket made Run drop a candidate it never dialed — no reservation can leak.
+Eligibility of `GetLeastLoadedExcluding` and `Select` is byte-identical except the
+routable tier's path-state rule (Select requires `state == Active`, which excludes
+Probation/Draining/Dead generations an Active slot never holds in production —
+fixtures only; the legacy call keeps `!= Suspect`).
+
+**Legacy**: `GetLeastLoaded`/`GetLeastLoadedExcluding` keep the least-loaded ranking
+and are now TEST-ONLY (wan_test.go's TestGetLeastLoaded*, red RT-01, drain selection
+property all pin them; no production caller remains). Deliberately NOT reimplemented
+on top of P2C: their tie rule (lowest index) would flake.
+
+**TDD / evidence.** Red first against a naive tier[0]-only stub: T-SEL-02/03/04/06 all
+failed (`path 0 received 100000 of 100000`, `total inflight = 0`, `path 0 won 1000 of
+1000`); green after the real implementation. T-AFF-01/03/04 red before the affinity
+hook landed (`stickiness = 0.2424`, `fallback pick 1 = slot 3, want slot 2`, `sticky at
+exactly 3x median spilled to slot 1`), green after. Final suites —
+`internal/sched`: T-SEL-01 (root, 1e5 seeded picks: only healthy Active paths while a
+routable tier exists; degraded members incl. Suspect/Probation/vacant only after the
+healthy paths are tried; draining only as last resort), T-SEL-02 fair split
+(25000+-15% over 1e5 held picks), T-SEL-03 2x goodput -> ~2x load (ratio bounds
+1.6..2.5), T-SEL-04 (256 goroutines x 1000: exact 256000 inflight, per-pick
+visibility, drain to 0), T-SEL-05 ramp formula + fresh path <=5% of 1000 picks,
+T-SEL-06 ties 400..600; T-AFF-01 (600 sequential ticks, SLO >= 99.5%, 100% sticky, 10
+simulated ejection ticks fall back), T-AFF-02 (removing 1 of 8 moves exactly the
+victim's keys, <= 1/8 + 3% of 10000), T-AFF-03 deterministic next-HRW fallback,
+T-AFF-04 spill boundary (3x median sticks, 10>3 spills); affinity package unit tests
+(SiteKey matrix, NO_AFFINITY_DOMAINS, HRW determinism/distribution);
+root wiring tests (`clientIdentity`, `socksAuthenticate` returns the username, SOCKS
+e2e: two sequential same-key connections land on the same slot).
+**Mutation sanity:** (1) moving `chosen.Reserve()` out of `Select` (select+reserve
+split) -> T-SEL-04 FAIL (`total inflight after 256000 selects = 0`, then negative
+counts from the unbalanced releases); restore -> green. (2) tie-break -> lowest slot
+index -> T-SEL-06 FAIL (`path 0 won 1000 of 1000`); restore -> green.
+`gofmt -l .` empty, `go vet ./...` clean, `go test -race -shuffle=on -count=1 ./...`
+green (15/15), `bash scripts/red_gate.sh` exit 0 (failing=0 passing=11 skipping=0,
+empty allow list).
+
+**Existing-test touch (flag):** `drain_test.go` `TestDrain_TDRAIN01` pins WHICH slot
+receives the first transfer (its fixture comment relies on "tie -> lowest index").
+Affinity (F-05) makes the first pick HRW-determined, so that one test now sets
+`t.Setenv("NO_AFFINITY_DOMAINS", "1.2.3.4")` for its synthetic target — NO assertion
+line changed; selection falls back to ramp-biased P2C whose "oldest == slot 0"
+premise the comment already documents. No other existing test needed changes.
+
+**Stale AGENTS.md/README pointers for whoever consolidates:** the
+`GetLeastLoaded(thresholds...)` Key-Functions row (production selection is
+`WANPool.Select` -> `internal/sched` P2C + HRW affinity; GetLeastLoaded* is legacy
+test-support), the "Load-balancer fallback" paragraph (ranking is P2C/peak-EWMA cost,
+ties random, slow-start ramp; the fallback ORDER — routable -> degraded -> draining —
+is unchanged), the directory map needs `internal/sched/` + `internal/affinity/`, and
+the README env table needs `NO_AFFINITY_DOMAINS` (comma/suffix list, default empty).

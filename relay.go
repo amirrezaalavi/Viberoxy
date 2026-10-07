@@ -79,6 +79,25 @@ func (r *wanRelay) endWAN(wanPath *path.Path) {
 	wanPath.Release()
 }
 
+// clientIdentity is the affinity client key the front-ends build for one
+// connection (F-05): the authenticated proxy username when PROXY_USERS
+// auth identified the connection, otherwise the client IP with the
+// ephemeral port stripped. NAT CAVEAT: without PROXY_USERS, many clients
+// behind one NAT share an IP and therefore share one affinity bucket —
+// their (client, site) keys coincide, which spreads stickiness per SITE
+// rather than per client; configuring PROXY_USERS (usernames) restores
+// per-user keys. An empty result (no remote address at all) disables
+// stickiness for the connection: the scheduler falls back to pure P2C.
+func clientIdentity(remoteAddr, authUser string) string {
+	if authUser != "" {
+		return authUser
+	}
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
+}
+
 // dialWAN connects to the slot's local SOCKS5 listener and completes the
 // SOCKS5 handshake to targetHost. On failure it records the failure on the
 // held path, writes the access-log line and returns the error; the caller
@@ -113,40 +132,73 @@ func (r *wanRelay) dialWAN(ctx context.Context, wanPath *path.Path, targetHost s
 // eligible (front-ends answer 503 / their no-WAN reply), the last dial error
 // otherwise (502 / REP 0x01 — the pre-existing final-failure semantics).
 //
+// SELECTION (F-15): next() goes through pool.Select — power-of-two-choices
+// over the peak-EWMA cost with an ATOMIC reservation: the path arrives
+// already accounted in its inflight counter, and the failed attempt's
+// reservation is given back exactly once (endWAN on dial failure, the
+// pending release below when the retry policy drops a candidate it never
+// dials). The per-attempt connection metric is recorded here instead of
+// beginWAN so the reservation is never counted twice.
+//
+// AFFINITY KEY (F-05): clientID is the connection's affinity identity the
+// front-end extracted (authenticated proxy username, else client IP — see
+// clientIdentity); together with targetHost it keys the per-(client, site)
+// HRW stickiness inside pool.Select.
+//
 // SAFETY (T-RETRY-03/04): this is a DIAL-stage retry only. Every attempt
 // happens before the relay splices a single application byte, and the retry
 // helper (retry.Run) terminates on the first successful dial — there is no
 // code here, deliberately, that could re-dial or replay once the relay has
 // started. Direct-route dials never come through here: a direct failure is a
 // direct failure.
-func (r *wanRelay) dialWANFailover(ctx context.Context, targetHost string, start time.Time, proto string) (net.Conn, *path.Path, error) {
+func (r *wanRelay) dialWANFailover(ctx context.Context, targetHost, clientID string, start time.Time, proto string) (net.Conn, *path.Path, error) {
 	pol := r.Retry
 	if pol == nil {
 		pol = defaultDialRetry
 	}
 
 	// Paths already attempted on THIS connection. next() hands out the
-	// best path not in here and marks it, so every retry lands on a path
-	// not yet tried while the selection rule stays GetLeastLoaded's.
+	// next eligible path not in here (pool.Select: same eligibility as
+	// GetLeastLoadedExcluding, P2C ranking), marks it, and leaves its
+	// reservation held for the attempt.
 	tried := make(map[*path.Path]bool)
+	// pendingRelease is the reservation of the candidate next() last
+	// handed out. It is consumed by that attempt's dial (cleared at dial
+	// entry); if the retry policy abandons the candidate without dialing
+	// it (empty retry bucket — retry.Run's fail-fast path), the release
+	// happens here instead, so a selection can never leak a reservation.
+	var pendingRelease func()
 	next := func() (*path.Path, bool) {
-		cand := r.pool.GetLeastLoadedExcluding(tried, r.WanFailThreshold)
+		cand, release := r.pool.Select(SelectOptions{
+			Tried:     tried,
+			Threshold: r.WanFailThreshold,
+			ClientID:  clientID,
+			Hostport:  targetHost,
+		})
 		if cand == nil {
 			return nil, false
 		}
 		tried[cand] = true
+		pendingRelease = release
 		return cand, true
 	}
 
-	// One dial-stage attempt on one path: reserve around the dial exactly
-	// like the pre-failover code did, and give the reservation back when
-	// the dial fails (the connection never used that path). On success the
+	// One dial-stage attempt on one path: the path is ALREADY reserved
+	// (Select's atomic reservation), so this records the per-attempt
+	// connection metric and gives the reservation back only when the dial
+	// fails (the connection never used that path). On success the
 	// reservation stays held — the caller releases it via endWAN.
 	dial := func(actx context.Context, cand *path.Path) (net.Conn, error) {
-		r.beginWAN(cand, proto)
+		release := pendingRelease
+		pendingRelease = nil
+		metricProxyConnections.Inc(strconv.Itoa(cand.Slot), proto)
 		conn, err := r.dialWAN(actx, cand, targetHost, start, proto)
 		if err != nil {
-			r.endWAN(cand)
+			if release != nil {
+				release()
+			} else {
+				r.endWAN(cand)
+			}
 			return nil, err
 		}
 		return conn, nil
@@ -154,8 +206,15 @@ func (r *wanRelay) dialWANFailover(ctx context.Context, targetHost string, start
 
 	conn, wanPath, err := retry.Run(ctx, pol, next, dial)
 	if err != nil {
+		// A candidate selected but never dialed (retry budget empty)
+		// must not keep its reservation.
+		if pendingRelease != nil {
+			pendingRelease()
+			pendingRelease = nil
+		}
 		return nil, nil, err
 	}
+	pendingRelease = nil // success: the caller owns the held reservation
 	return conn, wanPath, nil
 }
 
@@ -237,14 +296,20 @@ func (r *wanRelay) logAccess(target string, wan int, up, down int64, start time.
 // owns both conns.
 func (r *wanRelay) relayThroughWAN(wanPath *path.Path, targetHost string, start time.Time, proto string, clientConn, upstream net.Conn, clientSrc io.Reader) {
 	opts := r.relayOptions(strconv.Itoa(wanPath.Slot))
-	// Capture the first down byte for the path's TTFB EWMA. Only the
-	// upstream->client goroutine writes firstDown, and Splice's WaitGroup
-	// establishes the happens-before edge with the read below.
+	// Capture the first down byte for the path's TTFB sample, and the
+	// OnBytes down total for goodput (F-15: the scheduler's EWMA inputs
+	// come from what this relay actually delivered). Only the
+	// upstream->client goroutine writes firstDown/downBytes, and Splice's
+	// WaitGroup establishes the happens-before edge with the reads below.
 	var firstDown int64
+	var downBytes int64
 	onBytes := opts.OnBytes
 	opts.OnBytes = func(d relayio.Direction, n int64) {
-		if d == relayio.UpstreamToClient && firstDown == 0 {
-			firstDown = time.Now().UnixNano()
+		if d == relayio.UpstreamToClient {
+			if firstDown == 0 {
+				firstDown = time.Now().UnixNano()
+			}
+			downBytes += n
 		}
 		onBytes(d, n)
 	}
@@ -266,13 +331,24 @@ func (r *wanRelay) relayThroughWAN(wanPath *path.Path, targetHost string, start 
 			"wan", wanPath.Slot, "target", targetHost, "outcome", outcome)
 	}
 	if outcome == health.OK {
-		var ttfb time.Duration
+		// Scheduler EWMA inputs (F-15). TTFB: the measured time from
+		// connection start to the first upstream->client byte — a true
+		// TTFB at the relay. SIMPLIFICATION: when no first down byte
+		// was observable (no OnBytes down callback fired, which cannot
+		// happen for OK but keeps the sample total), the relay DURATION
+		// is used as a coarse upper-bound approximation instead of
+		// skipping the sample; it over-states TTFB rather than leaving
+		// the path silent. Goodput: the OnBytes down total over the
+		// relay duration, in bits per second. Both feed
+		// path.RecordHealth's peak-EWMA (worse sample lands instantly,
+		// better decays with tau 10s/30s).
+		ttfb := duration // duration-based fallback (documented above)
 		if firstDown > 0 {
 			ttfb = time.Unix(0, firstDown).Sub(start)
 		}
 		goodput := 0.0
 		if duration > 0 {
-			goodput = float64(stats.Down) * 8 / duration.Seconds()
+			goodput = float64(downBytes) * 8 / duration.Seconds()
 		}
 		wanPath.RecordHealth(ttfb, goodput)
 	}
