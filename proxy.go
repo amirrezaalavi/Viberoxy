@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"viberoxy/internal/auth"
 	"viberoxy/internal/proxycfg"
 	"viberoxy/internal/relayio"
+	"viberoxy/internal/retry"
 )
 
 type ProxyServer struct {
@@ -35,6 +37,7 @@ func NewProxyServer(port int, pool *WANPool, router ...*proxycfg.Router) *ProxyS
 			pool:             pool,
 			AccessLog:        true,
 			WanFailThreshold: DefaultFailThreshold,
+			Retry:            retry.New(retry.Options{}),
 		},
 	}
 	if len(router) > 0 {
@@ -158,20 +161,21 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wanPath := p.pool.GetLeastLoaded(p.WanFailThreshold)
-	if wanPath == nil {
-		http.Error(w, "No WAN Available", 503)
-		return
-	}
-
-	p.beginWAN(wanPath, "connect")
-	defer p.endWAN(wanPath)
-
-	conn, err := p.dialWAN(r.Context(), wanPath, targetHost, start, "connect")
+	// Bounded dial-stage failover (F-08 stage 1): the dial phase may touch
+	// several distinct WAN paths within the retry policy's attempt cap and
+	// budget before this connection gives up. Final-failure semantics are
+	// unchanged: 503 when no WAN is eligible at all, 502 when every
+	// attempt failed.
+	conn, wanPath, err := p.dialWANFailover(r.Context(), targetHost, start, "connect")
 	if err != nil {
-		http.Error(w, "Bad Gateway", 502)
+		if errors.Is(err, retry.ErrNoCandidate) {
+			http.Error(w, "No WAN Available", 503)
+		} else {
+			http.Error(w, "Bad Gateway", 502)
+		}
 		return
 	}
+	defer p.endWAN(wanPath)
 	defer conn.Close()
 
 	hijacker, ok := w.(http.Hijacker)

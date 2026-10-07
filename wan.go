@@ -534,6 +534,17 @@ func (p *WANPool) RoutableCount(threshold int) int {
 // the proxy from blackholing traffic when every WAN is degraded but at
 // least one is still alive.
 func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
+	return p.GetLeastLoadedExcluding(nil, thresholds...)
+}
+
+// GetLeastLoadedExcluding is GetLeastLoaded with an exclusion set: any path
+// present in tried (the paths a connection has already attempted on, F-08
+// dial-stage failover) is skipped — in the routable pass AND in the degraded
+// fallback — so a retry always lands on a path not yet tried. Everything else
+// is the selection rule of GetLeastLoaded, byte-for-byte: least-loaded
+// active/draining under threshold, ties to the lowest index, degraded
+// fallback last. A nil or empty tried map is the plain GetLeastLoaded call.
+func (p *WANPool) GetLeastLoadedExcluding(tried map[*path.Path]bool, thresholds ...int) *path.Path {
 	threshold := DefaultFailThreshold
 	if len(thresholds) > 0 {
 		threshold = thresholds[0]
@@ -549,6 +560,9 @@ func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
 		cur := slot.Current.Load()
 		cmd := slot.Cmd
 		slot.mu.Unlock()
+		if tried[cur] {
+			continue // already attempted on this connection
+		}
 		fails := cur.ConsecutiveFails()
 		if s == StateActive || s == StateDraining {
 			if fails < int64(threshold) && cmd != nil {
@@ -573,6 +587,9 @@ func (p *WANPool) GetLeastLoaded(thresholds ...int) *path.Path {
 		s := slot.State
 		cur := slot.Current.Load()
 		slot.mu.Unlock()
+		if tried[cur] {
+			continue // already attempted on this connection
+		}
 		if s == StateActive || s == StateDraining {
 			c := cur.Conns()
 			if best == nil || c < bestCount {

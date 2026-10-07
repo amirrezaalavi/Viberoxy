@@ -316,3 +316,49 @@ full red suite 5 FAIL / 6 PASS / 0 SKIP.
 Stale pointers for whoever consolidates: the AGENTS.md/README Directory Map
 row "`candidate.go` — candidate pool of tested configs" (now
 `internal/cands/pool.go`, package `cands`).
+
+## task-2-6: bounded dial-stage failover (F-08 stage 1, RT-08 green)
+
+One commit on `task-2-6-retry`: `feat(retry): bounded dial-stage failover (F-08 stage 1); RT-08 green`.
+
+New package `internal/retry/` (`retry.go` + `retry_test.go`, stdlib only):
+
+| Piece | Behavior |
+|---|---|
+| `retry.New(Options{MaxAttempts, Budget, RetryRatio, Burst, Now})` | defaults: **3 total attempts (initial + max 2 extra)**, **5s shared dial budget**, per-request credit **0.10 tokens** (<=10% of requests), burst 10; non-positive option = default (`MaxAttempts: 1` disables retries) |
+| `retry.Bucket` | token-bucket retry budget (T-RETRY-05): every admitted request deposits `RetryRatio` tokens clamped to `Burst`, every retry debits 1; below one token the caller **fails fast on the first dial error**, so a correlated-failure storm costs <= `Burst + N*ratio` retries over N connections |
+| `retry.Run(ctx, policy, next, dial)` | the bounded loop: candidate from `next` (caller owns exclusion), one dial-stage attempt per candidate; stops at attempt cap / shared deadline / no candidate / empty bucket. Every attempt's ctx carries the budget deadline (a single hanging dial cannot blow the 5s). `ErrNoCandidate` distinguishes "no path eligible" (503) from "all dials failed" (502 / REP 0x01) |
+| safety (T-RETRY-03/04) | dial-stage ONLY: a successful dial is terminal — `Run` returns the conn untouched, does not even request another candidate, and exposes no post-dial/replay API. Pinned by `TestRetry_TRETRY0304_NeverSeesPostDialConnections` + package doc |
+
+Wiring (stage 1):
+
+- `relay.go`: `wanRelay.Retry *retry.Policy` (both front-end constructors install
+  a default; hand-built `&wanRelay{pool: p}` falls back to the shared
+  `defaultDialRetry`) and `dialWANFailover(ctx, targetHost, start, proto)` — holds
+  the per-connection `tried` set; `next()` = `GetLeastLoadedExcluding(tried,
+  WanFailThreshold)` marking each path it hands out; each attempt wraps the
+  existing `beginWAN`/`dialWAN` pair and releases via `endWAN` when that dial
+  fails (failed paths never keep a reservation). On success the caller receives
+  `(conn, wanPath)` and keeps its original `defer endWAN(wanPath)` contract.
+- `wan.go`: added `GetLeastLoadedExcluding(tried, thresholds...)`; `GetLeastLoaded`
+  now delegates with a nil map. Selection rule byte-for-byte unchanged — both
+  passes (routable + degraded fallback) merely skip tried paths. No drain/health/
+  state changes.
+- `proxy.go` / `socks.go`: call sites switched to `dialWANFailover`. CONNECT keeps
+  503 on `retry.ErrNoCandidate` and 502 on exhausted attempts; SOCKS5 keeps REP
+  `0x01` for both. Direct-route dials never retry through WANs.
+- `scripts/red_gate.sh`: `TestRed_RT08_FailoverOnDialFailure` removed from
+  `DEFAULT_ALLOW` — allow list **5 entries, gate exit 0**; full red suite
+  **5 FAIL / 6 PASS / 0 SKIP** (RT-03..08 green). `red_test.go` untouched:
+  RT-08's assertion-line grep diff vs HEAD is empty.
+
+TDD: T-RETRY-01 (refused -> transparent success on the healthy path, real
+sockets), T-RETRY-02 (attempt cap + budget, fake clock + ctx-deadline check),
+T-RETRY-05 (storm bound + fail-fast after bucket drain) were red with the retry
+loop stubbed out, green after implementation. Mutation sanity: disabling the
+loop fails `TestRed_RT08_FailoverOnDialFailure` and
+`TestRetry_TRETRY01_RefusedFailsOverToHealthyPath`; restoring turns both green.
+
+**Note (for a later config task):** the policy is configurable through
+`retry.Options` in code; there is no env var yet — plumbing one would touch
+`proxycfg.ParseConfig` + `main.go`, which are outside this task's scope guard.
