@@ -245,22 +245,19 @@ func TestChaos02_BlackholedBackendEjectedWithin20s(t *testing.T) {
 		clients[w].Target = integrityTargets[(seq+int64(w))%int64(len(integrityTargets))]
 		return clients[w].Send(fx.front, seq)
 	}
-	workers := startLoadWorkers(6, 180, 6*time.Millisecond, send, fx.col.record)
-	t.Cleanup(workers.stopAll)
 
 	t0 := time.Now()
-	if !waitUntil(20*time.Second, func() bool { return victim.Ejected() }) {
-		workers.stopAll()
-		t.Fatalf("black-holed path never ejected within 20s (state=%s, snapshot=%+v)",
-			victim.GetState(), victim.HealthSnapshot(time.Now()))
+	if !driveBurstsUntil(20*time.Second, victim.Ejected, func() *loadWorkers {
+		return startLoadWorkers(6, 180, 6*time.Millisecond, send, fx.col.record)
+	}) {
+		t.Fatalf("black-holed path never ejected within 20s (state=%s, snapshot=%+v, hits=%d)",
+			victim.GetState(), victim.HealthSnapshot(time.Now()), fx.wans[1].Hits())
 	}
 	ejectFor := time.Since(t0)
 	if routableReports(fx.pool, victim, fx.threshold) {
 		t.Errorf("path ejected after %v but still in the routable selection", ejectFor)
 	}
 
-	workers.stopAll()
-	<-workers.done
 	victimHits := fx.wans[1].Hits()
 	for seq := int64(1000); seq < 1012; seq++ {
 		fx.col.record(send(0, seq))
@@ -372,46 +369,46 @@ func TestChaos04_FlakyPathDeprioritized(t *testing.T) {
 		return clients[w].Send(fx.front, seq)
 	}
 	hitsAtStart := fx.wans[1].Hits()
-	workers := startLoadWorkers(6, 180, 6*time.Millisecond, send, fx.col.record)
-	t.Cleanup(workers.stopAll)
 
+	// Continuous bursts until the window ejects: an ended burst would
+	// starve the pool of the outcomes the ejection waits for (a victim
+	// whose weight already diverged gets few picks per burst).
 	t0 := time.Now()
-	if !waitUntil(15*time.Second, func() bool { return victim.Ejected() }) {
-		workers.stopAll()
-		t.Fatalf("flaky path never ejected within 15s (state=%s snapshot=%+v)",
-			victim.GetState(), victim.HealthSnapshot(time.Now()))
+	if !driveBurstsUntil(15*time.Second, victim.Ejected, func() *loadWorkers {
+		return startLoadWorkers(6, 180, 6*time.Millisecond, send, fx.col.record)
+	}) {
+		t.Fatalf("flaky path never ejected within 15s (state=%s snapshot=%+v hits=%d)",
+			victim.GetState(), victim.HealthSnapshot(time.Now()), fx.wans[1].Hits())
 	}
 	ejectFor := time.Since(t0)
 	hitsAtEject := fx.wans[1].Hits()
 
-	select {
-	case <-workers.done:
-	case <-time.After(60 * time.Second):
-		t.Fatal("traffic did not finish in 60s")
-	}
+	// A dedicated post-ejection burst: the ejected path must take NO fresh
+	// connection (driveBurstsUntil always drains its last burst first).
+	post := startLoadWorkers(6, 60, 6*time.Millisecond, send, fx.col.record)
+	<-post.done
 	hitsEnd := fx.wans[1].Hits()
 	fresh := hitsEnd - hitsAtEject
 	total := hitsEnd - hitsAtStart
 
-	// Deprioritization: the flaky path's total share is less than half of
-	// either healthy path's (healthy hits = total conns it did not take).
-	healthyShare := 180 - total
-	if total*2 >= healthyShare {
-		t.Errorf("flaky path took %d of ~%d connections — not deprioritized", total, healthyShare)
+	ok, clean, cross, tags, samples := fx.col.endIter()
+	attempts := ok + clean
+	// Deprioritization: the flaky path's share of ALL attempts stays below
+	// a third — i.e. less than half of what either healthy path carries.
+	if attempts > 0 && total*3 >= int64(attempts) {
+		t.Errorf("flaky path took %d of %d connections — not deprioritized", total, attempts)
 	}
 	if fresh > 6 {
 		t.Errorf("flaky path took %d fresh connections after ejection, want <= 6 (in-flight slack only)", fresh)
 	}
-	ok, clean, cross, tags, samples := fx.col.endIter()
 	if cross > 0 {
 		t.Fatalf("cross-talk during flaky chaos: samples: %s", strings.Join(samples, "; "))
 	}
 	if len(tags) < 2 {
 		t.Errorf("survivor traffic on tags %v, want >= 2 live WANs", tags)
 	}
-	_ = clean
-	t.Logf("T-CHAOS-04: flaky path ejected after %v (budget 15s), hits=%d (fresh after eject=%d); ok=%d tags=%v",
-		ejectFor, total, fresh, ok, tagKeys(tags))
+	t.Logf("T-CHAOS-04: flaky path ejected after %v (budget 15s), hits=%d/%d (fresh after eject=%d); ok=%d tags=%v",
+		ejectFor, total, attempts, fresh, ok, tagKeys(tags))
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1090,29 @@ func TestChaos09_SwapDuringLargeTransferSiblingChaosHashMatched(t *testing.T) {
 // ---------------------------------------------------------------------------
 // small shared helpers
 // ---------------------------------------------------------------------------
+
+// driveBurstsUntil launches consecutive bursts of load through launch()
+// until cond holds or the budget elapses, draining every burst before the
+// next decision. An ended burst would starve the pool of the very outcomes
+// a health-window condition waits on (a victim whose scheduler weight has
+// already diverged earns few picks per burst), so a fresh burst starts
+// whenever the previous one exhausts the condition. Returns cond's value.
+func driveBurstsUntil(budget time.Duration, cond func() bool, launch func() *loadWorkers) bool {
+	deadline := time.Now().Add(budget)
+	for !cond() && time.Now().Before(deadline) {
+		w := launch()
+		select {
+		case <-w.done:
+			// Trailing relay outcomes land just after the last send.
+			time.Sleep(50 * time.Millisecond)
+		case <-time.After(time.Until(deadline)):
+			w.stopAll()
+			<-w.done
+			return cond()
+		}
+	}
+	return cond()
+}
 
 // tagKeys renders a tag histogram for log lines.
 func tagKeys(tags map[string]int) []string {
