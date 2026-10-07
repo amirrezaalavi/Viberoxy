@@ -4,11 +4,17 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/url"
 	"strconv"
 	"strings"
 )
 
+// ParseConfigs parses a subscription body (base64-encoded or plain text).
+// Links that would build a broken xray outbound are rejected at parse time
+// and dropped; each rejection is logged exactly once with its per-config
+// reason. Only valid configs are returned.
 func ParseConfigs(body string) []*ProxyConfig {
 	body = strings.TrimSpace(body)
 	if body == "" {
@@ -22,11 +28,24 @@ func ParseConfigs(body string) []*ProxyConfig {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if c := ParseSingle(line); c != nil {
-			configs = append(configs, c)
+		cfg, err := ParseSingleErr(line)
+		if err != nil {
+			slog.Warn("skipping invalid config", "reason", err.Error(), "link", truncateForLog(line))
+			continue
 		}
+		configs = append(configs, cfg)
 	}
 	return configs
+}
+
+// truncateForLog bounds the link echoed in a rejection log line.
+func truncateForLog(s string) string {
+	const maxRunes = 120
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "..."
 }
 
 func decodeLines(body string) []string {
@@ -54,42 +73,59 @@ func IsXraySupported(cfg *ProxyConfig) bool {
 	return true
 }
 
+// ParseSingle parses one sharelink URI and returns nil when the link is
+// invalid (including links that parse but would build a broken xray
+// outbound). Use ParseSingleErr to get the rejection reason.
 func ParseSingle(raw string) *ProxyConfig {
+	cfg, _ := ParseSingleErr(raw)
+	return cfg
+}
+
+// ParseSingleErr parses one sharelink URI. On rejection it returns a nil
+// config and an error whose message is the specific reason ("vmess: missing
+// uuid", "vless: xhttp missing path", `unsupported scheme "foo"`, ...), so
+// callers can log exactly why a config never entered the pool. Valid links
+// return (cfg, nil).
+func ParseSingleErr(raw string) (*ProxyConfig, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil
+		return nil, errors.New("empty link")
 	}
 
 	before, fragment := extractFragment(raw)
 
 	proto := extractProtocol(before)
 	if proto == "" {
-		return nil
+		return nil, errors.New("missing scheme")
 	}
 
 	var cfg *ProxyConfig
+	var err error
 	switch proto {
 	case "ss":
-		cfg = parseShadowsocks(before)
+		cfg, err = parseShadowsocks(before)
 	case "vmess":
-		cfg = parseVMess(before)
+		cfg, err = parseVMess(before)
 	case "vless":
-		cfg = parseVLess(before)
+		cfg, err = parseVLess(before)
 	case "trojan":
-		cfg = parseTrojan(before)
+		cfg, err = parseTrojan(before)
 	case "hysteria2", "hy2":
-		cfg = parseHysteria2(before)
+		cfg, err = parseHysteria2(before)
 	case "tuic":
-		cfg = parseTUIC(before)
+		cfg, err = parseTUIC(before)
 	case "wireguard":
-		cfg = parseWireGuard(before)
+		cfg, err = parseWireGuard(before)
 	case "socks5", "socks4", "socks":
-		cfg = parseSocks(before)
+		cfg, err = parseSocks(before)
 	default:
-		return nil
+		return nil, fmt.Errorf("unsupported scheme %q", proto)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", proto, err)
 	}
 	if cfg == nil {
-		return nil
+		return nil, fmt.Errorf("%s: invalid link", proto)
 	}
 
 	cfg.Raw = raw
@@ -106,7 +142,7 @@ func ParseSingle(raw string) *ProxyConfig {
 		cfg.Protocol = proto
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 func extractFragment(raw string) (string, string) {
@@ -180,7 +216,30 @@ func defaultPort(portStr string, def int) int {
 	return p
 }
 
-func parseShadowsocks(raw string) *ProxyConfig {
+// requireMethodPassword rejects ss userinfo that does not carry a usable
+// method:password pair — without both, the shadowsocks outbound cannot work.
+func requireMethodPassword(userinfo string) error {
+	method, password, ok := strings.Cut(userinfo, ":")
+	if !ok || method == "" || password == "" {
+		return errors.New("missing method:password")
+	}
+	return nil
+}
+
+// requirePort parses a strict 1..65535 port (no default: protocols without a
+// default port must carry one).
+func requirePort(portStr string) (int, error) {
+	if portStr == "" {
+		return 0, errors.New("missing port")
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p < 1 || p > 65535 {
+		return 0, errors.New("invalid port")
+	}
+	return p, nil
+}
+
+func parseShadowsocks(raw string) (*ProxyConfig, error) {
 	const prefix = "ss://"
 	rest := raw[len(prefix):]
 
@@ -188,51 +247,62 @@ func parseShadowsocks(raw string) *ProxyConfig {
 	if found {
 		userinfo, err := Base64Decode(userinfoB64)
 		if err != nil {
-			return nil
+			return nil, errors.New("invalid base64 userinfo")
 		}
-		_, _, _ = strings.Cut(userinfo, ":")
+		if err := requireMethodPassword(userinfo); err != nil {
+			return nil, err
+		}
 		host, portStr := splitHostPort(hostPart)
-		if host == "" || portStr == "" {
-			return nil
+		if host == "" {
+			return nil, errors.New("missing server")
 		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil || port < 1 || port > 65535 {
-			return nil
+		port, err := requirePort(portStr)
+		if err != nil {
+			return nil, err
 		}
-		return &ProxyConfig{Server: host, Port: port}
+		return &ProxyConfig{Server: host, Port: port}, nil
 	}
 
 	decoded, err := Base64Decode(rest)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid base64 payload")
 	}
-	_, hostPart, found = strings.Cut(decoded, "@")
+	userinfo, hostPart, found := strings.Cut(decoded, "@")
 	if !found {
-		return nil
+		return nil, errors.New("missing server")
+	}
+	if err := requireMethodPassword(userinfo); err != nil {
+		return nil, err
 	}
 	host, portStr := splitHostPort(hostPart)
-	if host == "" || portStr == "" {
-		return nil
+	if host == "" {
+		return nil, errors.New("missing server")
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return nil
+	port, err := requirePort(portStr)
+	if err != nil {
+		return nil, err
 	}
-	return &ProxyConfig{Server: host, Port: port}
+	return &ProxyConfig{Server: host, Port: port}, nil
 }
 
-func parseVMess(raw string) *ProxyConfig {
+func parseVMess(raw string) (*ProxyConfig, error) {
 	const prefix = "vmess://"
 	b64 := raw[len(prefix):]
 
 	data, err := Base64Decode(b64)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid base64")
 	}
 
 	var v map[string]interface{}
 	if err := json.Unmarshal([]byte(data), &v); err != nil {
-		return nil
+		return nil, errors.New("invalid json")
+	}
+
+	// id (UUID) is mandatory: buildOutbound would otherwise fall back to a
+	// zero UUID and the outbound can never authenticate.
+	if id, _ := v["id"].(string); id == "" {
+		return nil, errors.New("missing uuid")
 	}
 
 	server, _ := v["add"].(string)
@@ -240,119 +310,150 @@ func parseVMess(raw string) *ProxyConfig {
 		server, _ = v["address"].(string)
 	}
 	if server == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
 
-	port := 0
-	if p, ok := v["port"].(float64); ok {
+	rawPort, exists := v["port"]
+	if !exists {
+		return nil, errors.New("missing port")
+	}
+	var port int
+	switch p := rawPort.(type) {
+	case float64:
 		port = int(p)
-	} else if p, ok := v["port"].(string); ok {
-		port, _ = strconv.Atoi(p)
+	case string:
+		if p == "" {
+			return nil, errors.New("missing port")
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, errors.New("invalid port")
+		}
+		port = n
+	default:
+		return nil, errors.New("invalid port")
 	}
 	if port < 1 || port > 65535 {
-		return nil
+		return nil, errors.New("invalid port")
 	}
 
 	name, _ := v["ps"].(string)
 
-	return &ProxyConfig{Server: server, Port: port, Name: name}
+	return &ProxyConfig{Server: server, Port: port, Name: name}, nil
 }
 
-func parseVLess(raw string) *ProxyConfig {
+// checkXHTTP validates the xhttp transport parameters. An xhttp outbound
+// without path, host or mode cannot be rendered into a working xray config,
+// so the link is rejected at parse time.
+func checkXHTTP(q url.Values) error {
+	if q.Get("type") != "xhttp" {
+		return nil
+	}
+	if q.Get("path") == "" {
+		return errors.New("xhttp missing path")
+	}
+	if q.Get("host") == "" {
+		return errors.New("xhttp missing host")
+	}
+	if q.Get("mode") == "" {
+		return errors.New("xhttp missing mode")
+	}
+	return nil
+}
+
+func parseVLess(raw string) (*ProxyConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid url")
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
-	portStr := u.Port()
-	if portStr == "" {
-		return nil
+	port, err := requirePort(u.Port())
+	if err != nil {
+		return nil, err
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return nil
+	if err := checkXHTTP(u.Query()); err != nil {
+		return nil, err
 	}
-	return &ProxyConfig{Server: host, Port: port}
+	return &ProxyConfig{Server: host, Port: port}, nil
 }
 
-func parseTrojan(raw string) *ProxyConfig {
+func parseTrojan(raw string) (*ProxyConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid url")
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
-	portStr := u.Port()
-	if portStr == "" {
-		return nil
+	port, err := requirePort(u.Port())
+	if err != nil {
+		return nil, err
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return nil
+	if err := checkXHTTP(u.Query()); err != nil {
+		return nil, err
 	}
-	return &ProxyConfig{Server: host, Port: port}
+	return &ProxyConfig{Server: host, Port: port}, nil
 }
 
-func parseHysteria2(raw string) *ProxyConfig {
+func parseHysteria2(raw string) (*ProxyConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid url")
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
 	port := defaultPort(u.Port(), 443)
 	if port < 1 || port > 65535 {
-		return nil
+		return nil, errors.New("invalid port")
 	}
-	return &ProxyConfig{Server: host, Port: port}
+	return &ProxyConfig{Server: host, Port: port}, nil
 }
 
-func parseTUIC(raw string) *ProxyConfig {
+func parseTUIC(raw string) (*ProxyConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid url")
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
 	port := defaultPort(u.Port(), 443)
 	if port < 1 || port > 65535 {
-		return nil
+		return nil, errors.New("invalid port")
 	}
-	return &ProxyConfig{Server: host, Port: port}
+	return &ProxyConfig{Server: host, Port: port}, nil
 }
 
-func parseWireGuard(raw string) *ProxyConfig {
+func parseWireGuard(raw string) (*ProxyConfig, error) {
 	const prefix = "wireguard://"
 	rest := raw[len(prefix):]
 
 	if strings.Contains(rest, "@") {
 		u, err := url.Parse(raw)
 		if err != nil {
-			return nil
+			return nil, errors.New("invalid url")
 		}
 		host := u.Hostname()
 		if host == "" {
-			return nil
+			return nil, errors.New("missing server")
 		}
 		port := defaultPort(u.Port(), 51820)
 		if port < 1 || port > 65535 {
-			return nil
+			return nil, errors.New("invalid port")
 		}
-		return &ProxyConfig{Server: host, Port: port}
+		return &ProxyConfig{Server: host, Port: port}, nil
 	}
 
 	data, err := Base64Decode(rest)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid base64")
 	}
 
 	var wg struct {
@@ -360,7 +461,7 @@ func parseWireGuard(raw string) *ProxyConfig {
 		Server   string `json:"server"`
 	}
 	if err := json.Unmarshal([]byte(data), &wg); err != nil {
-		return nil
+		return nil, errors.New("invalid json")
 	}
 
 	endpoint := wg.Endpoint
@@ -368,30 +469,30 @@ func parseWireGuard(raw string) *ProxyConfig {
 		endpoint = wg.Server
 	}
 	if endpoint == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
 
 	host, portStr := splitHostPort(endpoint)
 	if host == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
 	port := defaultPort(portStr, 51820)
 
-	return &ProxyConfig{Server: host, Port: port}
+	return &ProxyConfig{Server: host, Port: port}, nil
 }
 
-func parseSocks(raw string) *ProxyConfig {
+func parseSocks(raw string) (*ProxyConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil
+		return nil, errors.New("invalid url")
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil
+		return nil, errors.New("missing server")
 	}
 	port := defaultPort(u.Port(), 1080)
 	if port < 1 || port > 65535 {
-		return nil
+		return nil, errors.New("invalid port")
 	}
-	return &ProxyConfig{Server: host, Port: port}
+	return &ProxyConfig{Server: host, Port: port}, nil
 }
