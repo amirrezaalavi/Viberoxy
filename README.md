@@ -2,7 +2,7 @@
 
 A zero-dependency Go daemon that aggregates proxy subscriptions into a pool of reliable xray WANs and exposes them through HTTPS CONNECT and SOCKS5 front-ends.
 
-[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-success)](go.mod)
 
 ---
@@ -18,12 +18,13 @@ Subscription URL → Fetch → Speed test → Sort → WAN pool (xray) → Load 
 3. **Keeps** the top N configs running as persistent xray WANs on fixed ports
 4. **Rotates** slow configs one at a time (graceful drain, no mid-session breaks)
 5. **Exposes** all WANs behind a health-aware least-connections load balancer with both an HTTPS CONNECT proxy (`PROXY_PORT`) and a SOCKS5 listener (`SOCKS_PORT`)
+6. **Maintains** a pool of tested replacement candidates and exposes a private control API for inspecting, dropping, and replacing WANs
 
 ---
 
 ## Prerequisites
 
-- **Go 1.26+**
+- **Go 1.21+**
 - **[Xray-core](https://github.com/XTLS/Xray-core)** installed in PATH
 
 ---
@@ -56,6 +57,7 @@ All config via environment variables:
 | `PROXY_PORT` | No | `1080` | User-facing HTTPS CONNECT proxy port |
 | `SOCKS_PORT` | No | `0` (off) | User-facing SOCKS5 listener (TCP CONNECT only; UDP ASSOCIATE/BIND rejected with REP 0x07). No auth (RFC 1929 not implemented) |
 | `METRICS_PORT` | No | `0` (off) | Prometheus-format `/metrics` + `/healthz` + `/readyz` endpoint port. `/readyz` returns 200 only when at least one **routable** WAN exists (active, under fail threshold, with a live xray process); otherwise returns `503 not ready` |
+| `API_PORT` | No | `1980` | Private JSON control API for WAN state, candidates, manual replacement, and cycle control. Keep this listener on a trusted interface; it includes mutating endpoints and has no built-in authentication |
 | `MINIMUM_SPEED` | No | `5.0` | Mbps threshold — don't replace WANs above this |
 | `MAX_TEST_PER_CYCLE` | No | `20` | Max configs speed-tested per runCycle (subscription is latency-sorted, so testing beyond this is wasted) |
 | `KEEPALIVE_INTERVAL` | No | `300` | Seconds between end-to-end WAN health probes (min 10) |
@@ -74,6 +76,8 @@ All config via environment variables:
 
 ```bash
 export SUBSCRIBER_URL="https://example.com/sub"
+export METRICS_PORT=2111
+export API_PORT=1980
 go run .
 ```
 
@@ -84,6 +88,21 @@ SUBSCRIBER_URL="https://example.com/sub" WAN_COUNT=3 PROXY_PORT=8888 go run .
 ```
 
 The proxy starts as soon as the first WAN passes the `MINIMUM_SPEED` threshold (degraded boot, disable with `ALLOW_DEGRADED_BOOT=false`) and keeps filling slots until `WAN_COUNT` is reached. Debug output is written to `sorted.txt` each cycle.
+
+When running with [viber-console](https://github.com/yolka-wiz/viber-console), point its two Viberoxy clients at the matching listeners:
+
+```bash
+VIBEROXY_METRICS_URL=http://127.0.0.1:2111
+VIBEROXY_API_URL=http://127.0.0.1:1980
+```
+
+Observability and control deliberately use separate listeners. This keeps the mutating WAN controls away from networks that only need to scrape metrics.
+
+The proxy, observability listener, and control API are started only after Viberoxy promotes a WAN. With the default `ALLOW_DEGRADED_BOOT=true`, that means after the first WAN becomes active; with degraded boot disabled, Viberoxy waits for all `WAN_COUNT` slots. During initial subscription testing, ports may therefore remain closed even though the process is alive.
+
+### Supported xray outbounds
+
+Viberoxy promotes Shadowsocks, VMess, VLESS, Trojan, and SOCKS5 configs. VLESS and Trojan Reality links preserve `pbk` (public key), `sid` (short ID), and `spx` (SpiderX), and `xhttp` transport is supported alongside TCP/HTTP, WebSocket, and gRPC. Hysteria2, TUIC, and WireGuard links may be parsed from a subscription but are skipped during WAN promotion because they are not implemented as xray outbounds here.
 
 ---
 
@@ -102,6 +121,9 @@ User → SOCKS5          (SOCKS_PORT) ─┤
           Speed Tester (10800+) + stability probes (optional)
                 ↑
           Fetcher ← SUBSCRIBER_URL (latency-sorted)
+
+Operator → Observability (METRICS_PORT) → /metrics, /healthz, /readyz
+Operator → Control API  (API_PORT)     → WAN state, candidates, drop, cycle
 ```
 
 ### WAN Lifecycle
@@ -117,6 +139,40 @@ Each slot transitions through: `empty → testing → active → draining → em
 - Only **one WAN replaced per cycle** (prevents mass disconnects)
 - WANs running above `MINIMUM_SPEED` are never replaced
 - Service ports are fixed per slot — the load balancer never needs to update its routing
+
+### Candidate Pool and Manual WAN Replacement
+
+Successful cycle results are retained in a thread-safe candidate pool, ordered by measured speed. The pool is capped at 50 entries. A manually dropped WAN is excluded in memory, stopped, and replaced on the same fixed slot port with the best eligible candidate after that candidate passes a fresh test.
+
+If no eligible candidate is available, the slot remains empty and Viberoxy queues a new fetch/test cycle. Exclusions are intentionally in-memory only and reset when Viberoxy restarts.
+
+---
+
+## HTTP Endpoints
+
+Viberoxy uses two independent HTTP listeners:
+
+### Observability (`METRICS_PORT`)
+
+Disabled by default. Set `METRICS_PORT` to a non-zero port to enable it.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/healthz` | Process liveness |
+| `GET` | `/readyz` | Readiness; 200 only when at least one WAN is routable |
+
+### Control API (`API_PORT`, default `1980`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/viberoxy/wans` | Per-slot state, speed, connections, exit IP, last probe, and failure count |
+| `GET` | `/api/viberoxy/candidates` | Current tested replacement candidates |
+| `GET` | `/api/viberoxy/cycle` | Last cycle, next cycle, and countdown |
+| `POST` | `/api/viberoxy/cycle/trigger` | Queue an immediate fetch/test cycle; repeated requests are coalesced |
+| `POST` | `/api/viberoxy/wans/{index}/drop` | Exclude and replace one WAN; returns 200 when replaced or 202 when a new cycle was queued |
+
+The control API has no built-in authentication and currently listens on all interfaces for its configured port. Restrict it with host/container networking or firewall rules so only viber-console and trusted operators can reach it; do not publish port `1980` directly to the internet.
 
 ---
 
@@ -155,6 +211,8 @@ Note: DNS resolution stays with the client in v1 (TCP routing only). If a proxie
 ```
 viberoxy/
 ├── main.go       — env parsing, startup, run loop, cycle logic
+├── api.go        — private JSON control API (WANs, candidates, drop, cycle)
+├── candidate.go  — thread-safe tested replacement-candidate pool
 ├── parser.go     — subscription parser (ss, vmess, vless, trojan, hysteria2, tuic, wireguard, socks5)
 ├── xray.go       — xray config builder, process lifecycle
 ├── tester.go     — SOCKS5 dial, download measurer, speed tester
