@@ -343,7 +343,8 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			result := TestSpeedWithStability(c, testPort, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
 			releaseTest()
 			tested++
-			if result.Error != nil || result.Speed < cfg.MinimumSpeed {
+			if !result.Qualifies(cfg.MinimumSpeed, cfg.MaxTTFB()) {
+				logRejection("startup", result, cfg)
 				continue
 			}
 			emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -360,8 +361,10 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			}
 			pool.SetActive(slotIdx, cmd, path)
 			pool.SetSlotSpeedMbps(slotIdx, result.Speed)
+			pool.SetSlotTTFB(slotIdx, int(result.TTFB.Milliseconds()))
 			pool.SetSlotStability(slotIdx, result.StabilityScore)
-			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed, "stability", result.StabilityScore)
+			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server,
+				"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(), "stability", result.StabilityScore)
 
 			// Degraded boot: serve traffic as soon as the first WAN is up,
 			// then keep filling slots until the full WAN_COUNT is reached.
@@ -726,7 +729,7 @@ var rotation = newRotator()
 // (speed bar, no server:port already active/draining, no exit IP already
 // served by an active path — unknown exit IPs skip that check); and
 // finally hysteresis (candidate >= (1+hysteresis) x incumbent).
-func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64, cooldown time.Duration) rotationDecision {
+func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64, maxTTFB time.Duration, cooldown time.Duration) rotationDecision {
 	r.mu.Lock()
 	nowFn, exitFn := r.now, r.exitIP
 	hyst, dwell := r.hysteresis, r.minDwell
@@ -789,14 +792,23 @@ func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64,
 		ip := exitFn(c)
 		return ip != "" && activeExit[ip] // exit-IP duplicate
 	}
-	cand := bestNewCandidate(results, minSpeed, blocked)
+	cand := bestNewCandidate(results, minSpeed, maxTTFB, blocked)
 	if cand == nil {
-		return rotationDecision{Victim: -1, Reason: "no candidate cleared the speed bar, wan dedupe and exit-ip dedupe"}
+		return rotationDecision{Victim: -1, Reason: "no candidate cleared the speed bar, ttfb ceiling, wan dedupe and exit-ip dedupe"}
 	}
 
-	// Hysteresis: only a clear win rotates an incumbent.
+	// Hysteresis: only a clear win rotates an incumbent. The objective is
+	// latency, so when both sides expose a TTFB the candidate must be at
+	// least `hysteresis` lower; the speed rule remains the fallback for
+	// incumbents promoted before the TTFB measurement existed.
 	incumbent := pool.SlotSpeedMbps(victim)
-	if cand.Speed < (1+hyst)*incumbent {
+	if incumbentTTFB := pool.SlotTTFBMs(victim); incumbentTTFB > 0 && cand.TTFB > 0 {
+		if float64(cand.TTFB.Milliseconds()) > (1-hyst)*float64(incumbentTTFB) {
+			return rotationDecision{Victim: -1, Reason: fmt.Sprintf(
+				"hysteresis: candidate ttfb %dms > %.0fms (1-%.2f) x incumbent %dms",
+				cand.TTFB.Milliseconds(), (1-hyst)*float64(incumbentTTFB), hyst, incumbentTTFB)}
+		}
+	} else if cand.Speed < (1+hyst)*incumbent {
 		return rotationDecision{Victim: -1, Reason: fmt.Sprintf(
 			"hysteresis: candidate %.2f < %.2f (1+%.2f) x incumbent %.2f",
 			cand.Speed, (1+hyst)*incumbent, hyst, incumbent)}
@@ -830,7 +842,7 @@ func swapResultOf(reason string) string {
 // stamps lastSwap to start the cooldown. Returns true iff a swap cut
 // over. Every verdict increments viberoxy_swap_total{result} (SPEC-M).
 func (r *rotator) maybeSwap(pool *WANPool, cfg *proxycfg.Config, results []*TestResult) bool {
-	d := r.decide(pool, results, cfg.MinimumSpeed, time.Duration(cfg.FetchInterval)*time.Second)
+	d := r.decide(pool, results, cfg.MinimumSpeed, cfg.MaxTTFB(), time.Duration(cfg.FetchInterval)*time.Second)
 	if d.Victim < 0 {
 		metricSwapTotal.Inc(swapResultOf(d.Reason))
 		slog.Info("cycle: rotation skipped", "reason", d.Reason)
@@ -897,6 +909,31 @@ func reapCompletedDrains(pool *WANPool, drainMax time.Duration) []int {
 // (default 600s): the hard-stop age at which a draining slot is reaped
 // even with in-flight connections; normally the drain completes earlier
 // (inflight == 0) — see WANPool.DrainExpired.
+// logRejection records why a tested config was not promoted. The TTFB
+// rejection is the one that is easy to misread as "nothing works": the
+// config downloads faster than MINIMUM_SPEED yet is still refused because it
+// is too slow to answer, so it is logged rather than silently dropped.
+func logRejection(stage string, r *TestResult, cfg *proxycfg.Config) {
+	if r == nil {
+		return
+	}
+	server := ""
+	if r.Config != nil {
+		server = r.Config.Server
+	}
+	switch {
+	case r.Error != nil:
+		slog.Debug("candidate rejected", "stage", stage, "server", server, "reason", r.Error.Error())
+	case r.Speed < cfg.MinimumSpeed:
+		slog.Info("candidate rejected", "stage", stage, "server", server,
+			"reason", fmt.Sprintf("speed %.2f Mbps < MINIMUM_SPEED %.2f", r.Speed, cfg.MinimumSpeed))
+	default:
+		slog.Info("candidate rejected", "stage", stage, "server", server,
+			"reason", fmt.Sprintf("ttfb %dms > MAX_TTFB_MS=%d", r.TTFB.Milliseconds(), cfg.MaxTTFBMs),
+			"speed", r.Speed)
+	}
+}
+
 func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, drainMax time.Duration) {
 	markCycleStarted(time.Now())
 	defer func() {
@@ -988,7 +1025,8 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		results = append(results, result)
 
 		// Fill empty slots immediately as soon as a config passes.
-		if result.Error != nil || result.Speed < cfg.MinimumSpeed {
+		if !result.Qualifies(cfg.MinimumSpeed, cfg.MaxTTFB()) {
+			logRejection("cycle", result, cfg)
 			continue
 		}
 		emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -1009,8 +1047,10 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		}
 		pool.SetActive(slotIdx, cmd, path)
 		pool.SetSlotSpeedMbps(slotIdx, result.Speed)
+		pool.SetSlotTTFB(slotIdx, int(result.TTFB.Milliseconds()))
 		pool.SetSlotStability(slotIdx, result.StabilityScore)
-		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed, "stability", result.StabilityScore)
+		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server,
+			"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(), "stability", result.StabilityScore)
 	}
 
 	writeSortedTxt(results)

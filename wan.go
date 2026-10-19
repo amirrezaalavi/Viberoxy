@@ -75,6 +75,11 @@ type WANSlot struct {
 	// install one, vacant when the slot is empty.
 	Current   *atomic.Pointer[path.Path]
 	SpeedMbps float64
+	// TTFBMs is the time-to-first-byte (ms) measured on the speed test
+	// that promoted this occupant. It is the latency the promotion and
+	// rotation gates use; 0 = unknown (tests that failed before the first
+	// response byte, or a slot filled before the gate existed).
+	TTFBMs int
 	// StabilityScore ranks upstream exit churn (distinct exit IPs minus
 	// 1; 0 = stable or never probed). Used for replacement preference
 	// only — a churny slot is never rejected on this alone.
@@ -365,6 +370,7 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 	}
 
 	p.SetSlotSpeedMbps(index, result.Speed)
+	p.SetSlotTTFB(index, int(result.TTFB.Milliseconds()))
 	p.SetSlotStability(index, result.StabilityScore)
 	return result, nil
 }
@@ -418,6 +424,7 @@ func (p *WANPool) Swap(index int, expected, newPath *path.Path, configPath strin
 	slot.ServicePort = newPath.Port
 	slot.releasePort = releasePort
 	slot.SpeedMbps = 0
+	slot.TTFBMs = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
 	slot.drainReason = DrainReplace
@@ -572,6 +579,7 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.Cmd = nil
 	slot.ConfigPath = ""
 	slot.SpeedMbps = 0
+	slot.TTFBMs = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
 	slot.drainReason = DrainReplace
@@ -723,6 +731,31 @@ func (p *WANPool) SlotSpeedMbps(index int) float64 {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 	return slot.SpeedMbps
+}
+
+// SlotTTFBMs returns the last measured time-to-first-byte (ms) for a slot
+// (0 = unknown).
+func (p *WANPool) SlotTTFBMs(index int) int {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.TTFBMs
+}
+
+// SetSlotTTFB records the measured time-to-first-byte (ms) for a slot and
+// exposes it as the viberoxy_wan_ttfb_ms gauge.
+func (p *WANPool) SetSlotTTFB(index, ttfbMs int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	slot.TTFBMs = ttfbMs
+	slot.mu.Unlock()
+	metricWanTTFBMs.Set(float64(ttfbMs), strconv.Itoa(index))
 }
 
 // SetSlotSpeedMbps records the measured speed for a slot.

@@ -8,10 +8,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"viberoxy/internal/proxycfg"
 )
@@ -19,12 +21,32 @@ import (
 type TestResult struct {
 	Config *proxycfg.ProxyConfig
 	Speed  float64
+	// TTFB is the time from starting the speed-test request to the first
+	// response byte, measured on the SAME request that measured Speed
+	// (httptrace GotFirstResponseByte). It covers dial + handshake +
+	// request round trip — i.e. what a user feels before data flows — and
+	// is 0 when the measurement never got that far (failed test).
+	TTFB time.Duration
 	// StabilityScore is the number of distinct exit IPs observed across
 	// STABILITY_PROBES probes minus one: 0 means a single stable exit IP
 	// (or no probes run), higher means more upstream exit churn. It is
 	// used only for ranking/preference — never to reject a config.
 	StabilityScore int
 	Error          error
+}
+
+// Qualifies reports whether this result clears the promotion bars: a
+// successful measurement, at least minSpeed Mbps, and — when maxTTFB > 0 —
+// a time-to-first-byte within the ceiling. Throughput is a floor, not the
+// objective: a node that downloads 50 Mbps but needs seconds before the
+// first byte is what makes browsing feel broken, and no amount of bandwidth
+// compensates. With maxTTFB == 0 the ceiling is disabled and this reduces to
+// the historical MINIMUM_SPEED gate.
+func (r *TestResult) Qualifies(minSpeed float64, maxTTFB time.Duration) bool {
+	if r == nil || r.Error != nil || r.Speed < minSpeed {
+		return false
+	}
+	return maxTTFB <= 0 || r.TTFB <= maxTTFB
 }
 
 // startTestXray starts the temp xray for a speed test. It is a variable so
@@ -84,11 +106,11 @@ func TestSpeedWithStability(cfg *proxycfg.ProxyConfig, testPort int, timeout tim
 	if err := waitPortReady(socksAddr, 5*time.Second); err != nil {
 		return &TestResult{Config: cfg, Error: fmt.Errorf("xray not ready: %w", err)}
 	}
-	speed, err := DownloadMeasurer(socksAddr, downloadURL, downloadSize, timeout)
+	speed, ttfb, err := downloadMeasurer(socksAddr, downloadURL, downloadSize, timeout)
 	if err != nil {
 		return &TestResult{Config: cfg, Error: err}
 	}
-	result := &TestResult{Config: cfg, Speed: speed}
+	result := &TestResult{Config: cfg, Speed: speed, TTFB: ttfb}
 	if stabilityProbes > 0 {
 		result.StabilityScore = measureStability(socksAddr, stabilityProbes, timeout)
 	}
@@ -118,7 +140,19 @@ func SortResults(results []*TestResult) []*TestResult {
 	return sorted
 }
 
+// DownloadMeasurer measures throughput through the given SOCKS5 listener.
+// It keeps the historical (speed, error) signature; downloadMeasurer is the
+// full form that also reports the time to first response byte.
 func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, timeout time.Duration) (float64, error) {
+	speed, _, err := downloadMeasurer(socksAddr, downloadURL, downloadSize, timeout)
+	return speed, err
+}
+
+// downloadMeasurer performs one measured GET through the SOCKS5 listener at
+// socksAddr and returns the throughput in Mbps plus the time from starting
+// the request to the first response byte (TTFB; dial, TLS handshake and
+// request round trip included). TTFB is 0 when the response never arrived.
+func downloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, timeout time.Duration) (float64, time.Duration, error) {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return socks5Dial(ctx, socksAddr, addr)
@@ -134,13 +168,21 @@ func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, 
 
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
+		return 0, 0, fmt.Errorf("create request: %w", err)
 	}
 
 	start := time.Now()
+	// GotFirstResponseByte runs on the transport's goroutine, so the sample
+	// is published atomically. It fires once per request.
+	var firstByte atomic.Int64
+	trace := &httptrace.ClientTrace{
+		GotFirstResponseByte: func() { firstByte.Store(int64(time.Since(start))) },
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("http get: %w", err)
+		return 0, 0, fmt.Errorf("http get: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -151,7 +193,7 @@ func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, 
 
 	n, err := io.Copy(io.Discard, reader)
 	if err != nil {
-		return 0, fmt.Errorf("read body: %w", err)
+		return 0, 0, fmt.Errorf("read body: %w", err)
 	}
 
 	elapsed := time.Since(start).Seconds()
@@ -159,7 +201,7 @@ func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, 
 		elapsed = 0.001
 	}
 
-	return float64(n*8) / elapsed / 1_000_000, nil
+	return float64(n*8) / elapsed / 1_000_000, time.Duration(firstByte.Load()), nil
 }
 
 // ProbeWANURL is the endpoint used by keepalive probes. It is a variable so
@@ -340,15 +382,16 @@ func measureStability(socksAddr string, probes int, timeout time.Duration) int {
 }
 
 // bestNewCandidate picks the best replacement candidate among tested
-// results: the fastest config that cleared minimumSpeed and is not already
-// active. Speed ties (within a small epsilon) are broken by the lower
-// StabilityScore (more stable), then earlier test order. Returns nil when
-// no candidate qualifies. Speed-first: a slower but more stable config is
-// never preferred over a faster one.
-func bestNewCandidate(results []*TestResult, minimumSpeed float64, alreadyActive func(*proxycfg.ProxyConfig) bool) *TestResult {
+// results: the LOWEST time-to-first-byte config that cleared minimumSpeed,
+// the maxTTFB ceiling (when > 0) and the blocked() filter. Latency is the
+// primary key — throughput is a floor (minimumSpeed), not the objective,
+// because a high-bandwidth/high-latency node is what makes browsing feel
+// broken. Ties break by higher speed, then lower StabilityScore (more
+// stable), then earlier test order. Returns nil when no candidate qualifies.
+func bestNewCandidate(results []*TestResult, minimumSpeed float64, maxTTFB time.Duration, alreadyActive func(*proxycfg.ProxyConfig) bool) *TestResult {
 	var best *TestResult
 	for _, r := range results {
-		if r.Error != nil || r.Speed < minimumSpeed {
+		if !r.Qualifies(minimumSpeed, maxTTFB) {
 			continue
 		}
 		if alreadyActive != nil && alreadyActive(r.Config) {
@@ -358,12 +401,19 @@ func bestNewCandidate(results []*TestResult, minimumSpeed float64, alreadyActive
 			best = r
 			continue
 		}
+		if r.TTFB < best.TTFB {
+			best = r // strictly lower latency wins
+			continue
+		}
+		if r.TTFB > best.TTFB {
+			continue
+		}
 		if r.Speed > best.Speed+0.001 {
-			best = r // strictly faster wins
+			best = r // latency tie: faster wins
 			continue
 		}
 		if r.Speed > best.Speed-0.001 && r.StabilityScore < best.StabilityScore {
-			best = r // speed tie within epsilon: more stable wins
+			best = r // latency+speed tie: more stable wins
 		}
 	}
 	return best

@@ -151,6 +151,66 @@ func TestDownloadMeasurer(t *testing.T) {
 	}
 }
 
+// TestDownloadMeasurer_TTFB pins the httptrace plumbing: the reported
+// time-to-first-byte must reflect a server that stalls before its first
+// response byte, on the same request that measures throughput.
+func TestDownloadMeasurer_TTFB(t *testing.T) {
+	socksListener, socksAddr := startTestSocksServer(t)
+	defer socksListener.Close()
+
+	const delay = 150 * time.Millisecond
+	data := make([]byte, 20000)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(delay) // nothing is written until after this
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.Write(data)
+	}))
+	defer slow.Close()
+
+	speed, ttfb, err := downloadMeasurer(socksAddr, slow.URL, int64(len(data)), 5*time.Second)
+	if err != nil {
+		t.Fatalf("downloadMeasurer error: %v", err)
+	}
+	if speed <= 0 {
+		t.Errorf("expected speed > 0, got %f", speed)
+	}
+	if ttfb < delay {
+		t.Errorf("ttfb = %v, want >= %v (server stalls that long before the first byte)", ttfb, delay)
+	}
+	if ttfb > 3*time.Second {
+		t.Errorf("ttfb = %v, implausibly large for a %v server stall", ttfb, delay)
+	}
+}
+
+// TestTestResultQualifies pins the promotion gate: success, a throughput
+// floor, and an optional latency ceiling that rejects a fast downloader.
+func TestTestResultQualifies(t *testing.T) {
+	const min = 5.0
+	const ceiling = 2500 * time.Millisecond
+
+	tests := []struct {
+		name string
+		r    *TestResult
+		max  time.Duration
+		want bool
+	}{
+		{"nil result", nil, ceiling, false},
+		{"failed test", &TestResult{Speed: 50, TTFB: 100 * time.Millisecond, Error: fmt.Errorf("boom")}, ceiling, false},
+		{"below speed floor", &TestResult{Speed: 4.9, TTFB: 100 * time.Millisecond}, ceiling, false},
+		{"fast download, slow answer", &TestResult{Speed: 50, TTFB: 3 * time.Second}, ceiling, false},
+		{"qualifies", &TestResult{Speed: 50, TTFB: 200 * time.Millisecond}, ceiling, true},
+		{"ceiling disabled accepts a slow answer", &TestResult{Speed: 50, TTFB: 9 * time.Second}, 0, true},
+		{"exactly at the ceiling qualifies", &TestResult{Speed: 50, TTFB: ceiling}, ceiling, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.r.Qualifies(min, tt.max); got != tt.want {
+				t.Errorf("Qualifies(%v, %v) = %v, want %v", min, tt.max, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDownloadMeasurer_Timeout(t *testing.T) {
 	socksListener, socksAddr := startTestSocksServer(t)
 	defer socksListener.Close()
@@ -807,6 +867,7 @@ func TestBestNewCandidate(t *testing.T) {
 		name    string
 		results []*TestResult
 		min     float64
+		maxTTFB time.Duration
 		active  func(*proxycfg.ProxyConfig) bool
 		want    int // index into results, or -1 for nil
 	}{
@@ -876,6 +937,38 @@ func TestBestNewCandidate(t *testing.T) {
 			},
 			min: 5.0, want: 1,
 		},
+		{
+			name: "lowest latency wins when both qualify",
+			results: []*TestResult{
+				{Speed: 50, TTFB: 1200 * time.Millisecond},
+				{Speed: 20, TTFB: 300 * time.Millisecond},
+			},
+			min: 5.0, maxTTFB: 2500 * time.Millisecond, want: 1,
+		},
+		{
+			name: "fast but too slow to answer is excluded by the ceiling",
+			results: []*TestResult{
+				{Speed: 50, TTFB: 3000 * time.Millisecond},
+				{Speed: 20, TTFB: 300 * time.Millisecond},
+			},
+			min: 5.0, maxTTFB: 2500 * time.Millisecond, want: 1,
+		},
+		{
+			name: "ceiling 0 disables the gate but ranking stays latency-first",
+			results: []*TestResult{
+				{Speed: 50, TTFB: 5 * time.Second},
+				{Speed: 20, TTFB: 300 * time.Millisecond},
+			},
+			min: 5.0, maxTTFB: 0, want: 1,
+		},
+		{
+			name: "all candidates over the ceiling yields nil",
+			results: []*TestResult{
+				{Speed: 50, TTFB: 9 * time.Second},
+				{Speed: 20, TTFB: 8 * time.Second},
+			},
+			min: 5.0, maxTTFB: 2500 * time.Millisecond, want: -1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -883,7 +976,7 @@ func TestBestNewCandidate(t *testing.T) {
 			if active == nil {
 				active = neverActive
 			}
-			got := bestNewCandidate(tt.results, tt.min, active)
+			got := bestNewCandidate(tt.results, tt.min, tt.maxTTFB, active)
 			if tt.want == -1 {
 				if got != nil {
 					t.Errorf("bestNewCandidate = %+v, want nil", got)

@@ -3,6 +3,7 @@ package proxycfg
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func setenv(t *testing.T, key, value string) {
@@ -43,6 +44,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"PROXY_PORT",
 		"SOCKS_PORT",
 		"MINIMUM_SPEED",
+		"MAX_TTFB_MS",
 		"METRICS_PORT",
 		"ACCESS_LOG",
 		"KEEPALIVE_INTERVAL",
@@ -372,6 +374,52 @@ func TestParseConfig_ZeroDownloadSize(t *testing.T) {
 	_, err := ParseConfig()
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestParseConfig_MaxTTFB(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	cfg, err := ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.MaxTTFBMs != 2500 {
+		t.Errorf("default MaxTTFBMs = %d, want 2500", cfg.MaxTTFBMs)
+	}
+	if got := cfg.MaxTTFB(); got != 2500*time.Millisecond {
+		t.Errorf("MaxTTFB() = %v, want 2.5s", got)
+	}
+
+	setenv(t, "MAX_TTFB_MS", "1200")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.MaxTTFBMs != 1200 {
+		t.Errorf("MaxTTFBMs = %d, want 1200", cfg.MaxTTFBMs)
+	}
+
+	// 0 is the documented way to disable the ceiling.
+	setenv(t, "MAX_TTFB_MS", "0")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if got := cfg.MaxTTFB(); got != 0 {
+		t.Errorf("MaxTTFB() with MAX_TTFB_MS=0 = %v, want 0 (disabled)", got)
+	}
+}
+
+func TestParseConfig_InvalidMaxTTFB(t *testing.T) {
+	for _, v := range []string{"-1", "abc", "60001"} {
+		t.Run(v, func(t *testing.T) {
+			setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+			setenv(t, "MAX_TTFB_MS", v)
+			if _, err := ParseConfig(); err == nil {
+				t.Fatalf("MAX_TTFB_MS=%q: expected error, got nil", v)
+			}
+		})
 	}
 }
 

@@ -7,23 +7,28 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"viberoxy/internal/auth"
 )
 
 type Config struct {
-	SubscriberURL     string
-	FetchInterval     int
-	TestTimeout       int
-	DownloadSize      int64
-	DownloadEndpoint  string
-	DownloadFallback  string
-	WanCount          int
-	WanBasePort       int
-	TestBasePort      int
-	ProxyPort         int
-	SocksPort         int
-	MetricsPort       int
-	MinimumSpeed      float64
+	SubscriberURL    string
+	FetchInterval    int
+	TestTimeout      int
+	DownloadSize     int64
+	DownloadEndpoint string
+	DownloadFallback string
+	WanCount         int
+	WanBasePort      int
+	TestBasePort     int
+	ProxyPort        int
+	SocksPort        int
+	MetricsPort      int
+	MinimumSpeed     float64
+	// MaxTTFBMs is the promotion ceiling on time-to-first-byte, in
+	// milliseconds (MAX_TTFB_MS). A candidate whose measured TTFB exceeds
+	// it is rejected however fast it downloads; 0 disables the ceiling.
+	MaxTTFBMs         int
 	MaxTestPerCycle   int
 	KeepaliveInterval int
 	WanFailThreshold  int
@@ -64,6 +69,15 @@ func (c *Config) MaxTestPerCycleVal() int {
 		return c.MaxTestPerCycle
 	}
 	return 20
+}
+
+// MaxTTFB returns the configured promotion ceiling on time-to-first-byte as
+// a duration; 0 means the ceiling is disabled.
+func (c *Config) MaxTTFB() time.Duration {
+	if c == nil || c.MaxTTFBMs <= 0 {
+		return 0
+	}
+	return time.Duration(c.MaxTTFBMs) * time.Millisecond
 }
 
 func ParseConfig() (*Config, error) {
@@ -224,6 +238,24 @@ func ParseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: MINIMUM_SPEED=%q: must be >= 0.1", v)
 		}
 		cfg.MinimumSpeed = n
+	}
+
+	// MAX_TTFB_MS: promotion ceiling on time-to-first-byte, in
+	// milliseconds, measured on the speed-test request itself (dial + TLS
+	// + first response byte). A candidate over the ceiling is rejected no
+	// matter how fast it downloads: MINIMUM_SPEED alone happily promotes a
+	// high-bandwidth/high-latency node, which is what makes browsing feel
+	// broken. 0 disables the ceiling (historical behavior).
+	cfg.MaxTTFBMs = 2500
+	if v := os.Getenv("MAX_TTFB_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be a valid integer", v)
+		}
+		if n < 0 || n > 60000 {
+			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be between 0 and 60000", v)
+		}
+		cfg.MaxTTFBMs = n
 	}
 
 	cfg.MaxTestPerCycle = 20

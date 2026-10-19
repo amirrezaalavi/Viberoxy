@@ -99,7 +99,7 @@ func TestRotation_TROT01_EqualQualityCandidateNoSwap(t *testing.T) {
 		rotResult("cand-b.example", 1002, 11),   // +10%
 		rotResult("cand-c.example", 1003, 11.9), // just under the +30% bar
 	}
-	if d := r.decide(pool, results, cfg.MinimumSpeed, 300*time.Second); d.Victim != -1 {
+	if d := r.decide(pool, results, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != -1 {
 		t.Fatalf("decide() = victim %d candidate %+v (%s); equal-quality candidates must not churn the pool",
 			d.Victim, d.Candidate, d.Reason)
 	}
@@ -170,23 +170,23 @@ func TestRotation_TROT03_DwellAndCooldownRespected(t *testing.T) {
 	// MIN_DWELL: activated 1 minute ago (< 10 min) -> refused even
 	// though the candidate is 4x better.
 	fresh := rotPool(t, 10, 0, time.Minute, "")
-	if d := r.decide(fresh, better, cfg.MinimumSpeed, 300*time.Second); d.Victim != -1 {
+	if d := r.decide(fresh, better, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != -1 {
 		t.Fatalf("decide() swapped after only 1m of dwell (%s); MIN_DWELL %s must hold", d.Reason, rotationMinDwell)
 	}
 	// Dwell satisfied (11 min >= 10 min): the same candidate qualifies.
 	aged := rotPool(t, 10, 0, 11*time.Minute, "")
-	if d := r.decide(aged, better, cfg.MinimumSpeed, 300*time.Second); d.Victim != 0 {
+	if d := r.decide(aged, better, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != 0 {
 		t.Fatalf("decide() = victim %d (%s), want the aged incumbent swapped", d.Victim, d.Reason)
 	}
 
 	// Cooldown: a swap 30s ago blocks (cooldown = 300s = FETCH_INTERVAL)...
 	r.lastSwap = rotNow.Add(-30 * time.Second)
-	if d := r.decide(aged, better, cfg.MinimumSpeed, 300*time.Second); d.Victim != -1 {
+	if d := r.decide(aged, better, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != -1 {
 		t.Fatalf("decide() swapped %s after the last swap; cooldown %s must hold", 30*time.Second, 300*time.Second)
 	}
 	// ...and once it elapses, rotation is allowed again.
 	r.lastSwap = rotNow.Add(-301 * time.Second)
-	if d := r.decide(aged, better, cfg.MinimumSpeed, 300*time.Second); d.Victim != 0 {
+	if d := r.decide(aged, better, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != 0 {
 		t.Fatalf("decide() = victim %d (%s) after cooldown elapsed, want the swap", d.Victim, d.Reason)
 	}
 }
@@ -211,19 +211,19 @@ func TestRotation_TROT04_ExitIPDuplicateRejected(t *testing.T) {
 	// candidate egressing through the same IP must not rotate in.
 	pool := rotPool(t, 10, 0, 2*time.Hour, "203.0.113.7")
 	dup := []*TestResult{{Config: &proxycfg.ProxyConfig{Protocol: "ss", Server: "203.0.113.7", Port: 9999, Raw: "ss://203.0.113.7:9999"}, Speed: 40}}
-	if d := r.decide(pool, dup, cfg.MinimumSpeed, 300*time.Second); d.Victim != -1 {
+	if d := r.decide(pool, dup, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != -1 {
 		t.Fatalf("decide() = victim %d; a candidate on the already-served exit IP 203.0.113.7 must be rejected (%s)", d.Victim, d.Reason)
 	}
 
 	// A different known exit IP clears the gate.
 	r.exitIP = func(*proxycfg.ProxyConfig) string { return "203.0.113.9" }
-	if d := r.decide(pool, dup, cfg.MinimumSpeed, 300*time.Second); d.Victim != 0 {
+	if d := r.decide(pool, dup, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != 0 {
 		t.Fatalf("decide() = victim %d (%s), want the swap for a distinct exit IP", d.Victim, d.Reason)
 	}
 
 	// Unknown candidate exit IP -> the check is skipped, not blocking.
 	r.exitIP = func(*proxycfg.ProxyConfig) string { return "" }
-	if d := r.decide(pool, dup, cfg.MinimumSpeed, 300*time.Second); d.Victim != 0 {
+	if d := r.decide(pool, dup, cfg.MinimumSpeed, cfg.MaxTTFB(), 300*time.Second); d.Victim != 0 {
 		t.Fatalf("decide() = victim %d (%s); an unknown candidate exit IP must skip the dedupe gate", d.Victim, d.Reason)
 	}
 }

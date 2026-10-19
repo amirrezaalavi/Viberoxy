@@ -77,7 +77,8 @@ All configuration is environment-variable driven; invalid values hard-exit at st
 | `WAN_COUNT` | No | `4` | Max concurrent WANs (1–5) |
 | `WAN_BASE_PORT` | No | `10700` | First xray service port (slots use `WAN_BASE_PORT + slot`) |
 | `TEST_BASE_PORT` | No | `10800` | First speed-test port (shared allocator range) |
-| `MINIMUM_SPEED` | No | `5.0` | Mbps threshold — configs below it are never promoted; incumbents above it are never rotated out |
+| `MINIMUM_SPEED` | No | `5.0` | Mbps **floor** — configs below it are never promoted; incumbents above it are never rotated out |
+| `MAX_TTFB_MS` | No | `2500` | Time-to-first-byte ceiling (ms) measured on the speed-test request. Faster-downloading configs over the ceiling are still refused; `0` disables the ceiling. Ranking is latency-first: the candidate with the lowest TTFB that clears `MINIMUM_SPEED` wins |
 | `MAX_TEST_PER_CYCLE` | No | `20` | Max configs speed-tested per cycle while the pool has room (1–500). When the pool is **full**, up to 2 NEW candidates are still evaluated per cycle |
 | `ACCESS_LOG` | No | `true` | One structured log line per proxied connection |
 | `ALLOW_DEGRADED_BOOT` | No | `true` | Start the front-ends as soon as the first WAN is active (vs waiting for a full pool) |
