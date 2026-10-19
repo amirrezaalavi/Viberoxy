@@ -773,6 +773,48 @@ func (p *WANPool) SetSlotTTFB(index, ttfbMs int) {
 	slot.mu.Unlock()
 }
 
+// SetSlotExitIP records the exit IP observed when the slot was promoted (the
+// canary loop refreshes it later). Empty values are ignored.
+func (p *WANPool) SetSlotExitIP(index int, ip string) {
+	if index < 0 || index >= len(p.Slots) || ip == "" {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	slot.ExitIP = ip
+	slot.mu.Unlock()
+}
+
+// SlotExitIP returns the last known exit IP for a slot ("" = unknown).
+func (p *WANPool) SlotExitIP(index int) string {
+	if index < 0 || index >= len(p.Slots) {
+		return ""
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.ExitIP
+}
+
+// HasExitIP reports whether any ACTIVE slot already egresses from ip. Used to
+// flag duplicate-egress WANs: they fail together and change the client-visible
+// IP least, but an empty slot is still worth more than diversity, so this is
+// advisory (logged) rather than a rejection.
+func (p *WANPool) HasExitIP(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	for _, slot := range p.Slots {
+		slot.mu.Lock()
+		state, slotIP := slot.State, slot.ExitIP
+		slot.mu.Unlock()
+		if state == StateActive && slotIP == ip {
+			return true
+		}
+	}
+	return false
+}
+
 // SetSlotSpeedMbps records the measured speed for a slot.
 func (p *WANPool) SetSlotSpeedMbps(index int, speed float64) {
 	if index < 0 || index >= len(p.Slots) {

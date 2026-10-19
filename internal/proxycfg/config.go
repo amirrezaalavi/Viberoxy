@@ -28,7 +28,12 @@ type Config struct {
 	// MaxTTFBMs is the promotion ceiling on time-to-first-byte, in
 	// milliseconds (MAX_TTFB_MS). A candidate whose measured TTFB exceeds
 	// it is rejected however fast it downloads; 0 disables the ceiling.
-	MaxTTFBMs         int
+	MaxTTFBMs int
+	// PromotePasses is how many independent end-to-end passes a config must
+	// complete before it may be promoted (PROMOTE_PASSES). 1 keeps the
+	// historical single-sample behavior; 2 adds one confirmation GET through
+	// the same temp xray, which is also where the exit IP is observed.
+	PromotePasses     int
 	MaxTestPerCycle   int
 	KeepaliveInterval int
 	WanFailThreshold  int
@@ -256,6 +261,23 @@ func ParseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be between 0 and 60000", v)
 		}
 		cfg.MaxTTFBMs = n
+	}
+
+	// PROMOTE_PASSES: independent end-to-end passes required before a config
+	// is promoted. The first pass is the measured download; each extra pass
+	// is a lightweight 2xx GET through the same temp xray (the first of them
+	// doubles as the exit-IP observation). One sample is not evidence: the
+	// live box served links that failed one of three later checks.
+	cfg.PromotePasses = 2
+	if v := os.Getenv("PROMOTE_PASSES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: PROMOTE_PASSES=%q: must be a valid integer", v)
+		}
+		if n < 1 || n > 5 {
+			return nil, fmt.Errorf("error: PROMOTE_PASSES=%q: must be between 1 and 5", v)
+		}
+		cfg.PromotePasses = n
 	}
 
 	cfg.MaxTestPerCycle = 20

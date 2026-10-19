@@ -45,6 +45,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"SOCKS_PORT",
 		"MINIMUM_SPEED",
 		"MAX_TTFB_MS",
+		"PROMOTE_PASSES",
 		"METRICS_PORT",
 		"ACCESS_LOG",
 		"KEEPALIVE_INTERVAL",
@@ -374,6 +375,34 @@ func TestParseConfig_ZeroDownloadSize(t *testing.T) {
 	_, err := ParseConfig()
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestParseConfig_PromotePasses(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	cfg, err := ParseConfig()
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.PromotePasses != 2 {
+		t.Errorf("default PromotePasses = %d, want 2", cfg.PromotePasses)
+	}
+
+	setenv(t, "PROMOTE_PASSES", "3")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.PromotePasses != 3 {
+		t.Errorf("PromotePasses = %d, want 3", cfg.PromotePasses)
+	}
+
+	for _, bad := range []string{"0", "6", "x"} {
+		setenv(t, "PROMOTE_PASSES", bad)
+		if _, err := ParseConfig(); err == nil {
+			t.Errorf("PROMOTE_PASSES=%q: expected error, got nil", bad)
+		}
 	}
 }
 

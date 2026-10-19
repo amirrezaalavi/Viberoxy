@@ -989,3 +989,78 @@ func TestBestNewCandidate(t *testing.T) {
 		})
 	}
 }
+
+// TestConfirmPasses pins PROMOTE_PASSES semantics: passes-1 confirmation
+// probes, a URL that is used as-is, and any failed pass failing the
+// candidate instead of being ignored.
+func TestConfirmPasses(t *testing.T) {
+	t.Run("single pass does nothing", func(t *testing.T) {
+		calls := 0
+		err := confirmPasses("x", "https://example.test/f", 1, time.Second, func(string, string, time.Duration) error {
+			calls++
+			return nil
+		})
+		if err != nil || calls != 0 {
+			t.Fatalf("err=%v calls=%d, want no probe", err, calls)
+		}
+	})
+
+	t.Run("two passes probe once", func(t *testing.T) {
+		calls := 0
+		var gotURL string
+		err := confirmPasses("x", "https://example.test/f", 2, time.Second, func(_ string, u string, _ time.Duration) error {
+			calls++
+			gotURL = u
+			return nil
+		})
+		if err != nil || calls != 1 || gotURL != "https://example.test/f" {
+			t.Fatalf("err=%v calls=%d url=%q, want one probe of the download endpoint", err, calls, gotURL)
+		}
+	})
+
+	t.Run("third pass failure is an error naming the pass", func(t *testing.T) {
+		calls := 0
+		err := confirmPasses("x", "https://example.test/f", 3, time.Second, func(string, string, time.Duration) error {
+			calls++
+			if calls == 2 {
+				return fmt.Errorf("timeout")
+			}
+			return nil
+		})
+		if err == nil {
+			t.Fatal("expected an error when a confirmation pass fails")
+		}
+		if calls != 2 {
+			t.Errorf("probe calls = %d, want 2 (stop at the first failure)", calls)
+		}
+		if !strings.Contains(err.Error(), "confirmation pass 3/3") {
+			t.Errorf("err = %v, want it to name pass 3/3", err)
+		}
+	})
+}
+
+// TestSlotExitIPDedupe covers the exit-IP bookkeeping used for diversity
+// reporting: the recorded IP is visible, empty writes are ignored, and a
+// duplicate is only reported for ACTIVE slots.
+func TestSlotExitIPDedupe(t *testing.T) {
+	pool := NewWANPool(2, 20700)
+	pool.Slots[0].State = StateActive
+	pool.SetSlotExitIP(0, "203.0.113.7")
+	if got := pool.SlotExitIP(0); got != "203.0.113.7" {
+		t.Fatalf("SlotExitIP(0) = %q", got)
+	}
+	pool.SetSlotExitIP(0, "")
+	if got := pool.SlotExitIP(0); got != "203.0.113.7" {
+		t.Errorf("empty write clobbered the IP: %q", got)
+	}
+	if pool.HasExitIP("203.0.113.7") != true {
+		t.Error("HasExitIP should see the active slot's IP")
+	}
+	if pool.HasExitIP("198.51.100.1") {
+		t.Error("HasExitIP reported an unrelated IP")
+	}
+	pool.Slots[0].State = StateDraining
+	if pool.HasExitIP("203.0.113.7") {
+		t.Error("a draining slot must not count as an active duplicate")
+	}
+}

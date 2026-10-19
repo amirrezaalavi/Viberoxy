@@ -376,8 +376,11 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			pool.SetSlotSpeedMbps(slotIdx, result.Speed)
 			pool.SetSlotTTFB(slotIdx, int(result.TTFB.Milliseconds()))
 			pool.SetSlotStability(slotIdx, result.StabilityScore)
+			pool.SetSlotExitIP(slotIdx, result.ExitIP)
+			logDuplicateExitIP("startup", result, pool, slotIdx)
 			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server,
-				"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(), "stability", result.StabilityScore)
+				"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(),
+				"exit_ip", result.ExitIP, "stability", result.StabilityScore)
 
 			// Degraded boot: serve traffic as soon as the first WAN is up,
 			// then keep filling slots until the full WAN_COUNT is reached.
@@ -956,6 +959,28 @@ func reapCompletedDrains(pool *WANPool, drainMax time.Duration) []int {
 // (default 600s): the hard-stop age at which a draining slot is reaped
 // even with in-flight connections; normally the drain completes earlier
 // (inflight == 0) — see WANPool.DrainExpired.
+// logDuplicateExitIP warns when a freshly promoted WAN egresses from an IP an
+// existing active WAN already uses. It is advisory on purpose: refusing the
+// candidate would leave a slot empty, and an empty slot serves nothing. The
+// rotation gates already prefer a distinct exit IP when swapping.
+func logDuplicateExitIP(stage string, r *TestResult, pool *WANPool, slotIdx int) {
+	if r == nil || r.ExitIP == "" {
+		return
+	}
+	// The new slot's own IP was just recorded, so count > 1 means a duplicate.
+	dupes := 0
+	for i := range pool.Slots {
+		if pool.Slots[i].State == StateActive && pool.SlotExitIP(i) == r.ExitIP {
+			dupes++
+		}
+	}
+	if dupes > 1 {
+		slog.Warn("wan egresses from an exit IP another WAN already uses",
+			"stage", stage, "index", slotIdx, "exit_ip", r.ExitIP,
+			"active_with_same_ip", dupes)
+	}
+}
+
 // logRejection records why a tested config was not promoted. The TTFB
 // rejection is the one that is easy to misread as "nothing works": the
 // config downloads faster than MINIMUM_SPEED yet is still refused because it
@@ -1096,8 +1121,11 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		pool.SetSlotSpeedMbps(slotIdx, result.Speed)
 		pool.SetSlotTTFB(slotIdx, int(result.TTFB.Milliseconds()))
 		pool.SetSlotStability(slotIdx, result.StabilityScore)
+		pool.SetSlotExitIP(slotIdx, result.ExitIP)
+		logDuplicateExitIP("cycle", result, pool, slotIdx)
 		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server,
-			"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(), "stability", result.StabilityScore)
+			"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(),
+			"exit_ip", result.ExitIP, "stability", result.StabilityScore)
 	}
 
 	writeSortedTxt(results)
@@ -1129,6 +1157,8 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+
+	promotePasses = cfg.PromotePasses
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

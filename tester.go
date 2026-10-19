@@ -32,7 +32,13 @@ type TestResult struct {
 	// (or no probes run), higher means more upstream exit churn. It is
 	// used only for ranking/preference — never to reject a config.
 	StabilityScore int
-	Error          error
+	// ExitIP is the exit IP observed by the confirmation pass through the
+	// candidate's own xray ("" when PROMOTE_PASSES is 1 or the probe could
+	// not be made). It lets the pool answer "does this WAN egress where
+	// another one already egresses?" immediately instead of waiting for the
+	// first canary.
+	ExitIP string
+	Error  error
 }
 
 // Qualifies reports whether this result clears the promotion bars: a
@@ -48,6 +54,12 @@ func (r *TestResult) Qualifies(minSpeed float64, maxTTFB time.Duration) bool {
 	}
 	return maxTTFB <= 0 || r.TTFB <= maxTTFB
 }
+
+// promotePasses is how many independent end-to-end passes a config must
+// complete before it can be promoted. main() sets it from PROMOTE_PASSES
+// (default 2); it stays 1 here so direct callers (unit tests) keep the
+// historical single-sample behavior.
+var promotePasses = 1
 
 // startTestXray starts the temp xray for a speed test. It is a variable so
 // tests can observe the flags a test instance is started with without
@@ -111,10 +123,66 @@ func TestSpeedWithStability(cfg *proxycfg.ProxyConfig, testPort int, timeout tim
 		return &TestResult{Config: cfg, Error: err}
 	}
 	result := &TestResult{Config: cfg, Speed: speed, TTFB: ttfb}
+	// Confirmation passes (PROMOTE_PASSES): one sample is not evidence. Each
+	// extra pass is a real 2xx GET through the same temp xray, and the first
+	// of them doubles as the exit-IP observation. A failed pass fails the
+	// candidate — that is the point.
+	if promotePasses > 1 {
+		if err := confirmPasses(socksAddr, downloadURL, promotePasses, timeout, confirmOnce); err != nil {
+			return &TestResult{Config: cfg, Speed: speed, TTFB: ttfb, Error: err}
+		}
+		// Exit IP is opportunistic: an unreachable IP-echo endpoint must not
+		// fail a candidate that just proved it carries traffic twice.
+		if ip, err := probeExitIP(socksAddr, timeout); err == nil {
+			result.ExitIP = ip
+		}
+	}
 	if stabilityProbes > 0 {
 		result.StabilityScore = measureStability(socksAddr, stabilityProbes, timeout)
 	}
 	return result
+}
+
+// passProbe is one confirmation pass: a cheap 2xx GET through the candidate's
+// own xray. Injectable so tests never need a live tunnel.
+type passProbe func(socksAddr, probeURL string, timeout time.Duration) error
+
+// confirmPasses runs the PROMOTE_PASSES-1 confirmation passes a candidate
+// needs after its measured download. Every pass must succeed: a tunnel that
+// only sometimes answers is exactly what a single sample promotes by mistake.
+//
+// The probe target is the download endpoint that just worked, not a third
+// party: a confirmation step must never introduce its own single point of
+// failure (an IP-echo service being blocked would otherwise reject every
+// candidate the download had just proven).
+func confirmPasses(socksAddr, probeURL string, passes int, timeout time.Duration, probe passProbe) error {
+	for i := 1; i < passes; i++ {
+		if err := probe(socksAddr, probeURL, timeout); err != nil {
+			return fmt.Errorf("confirmation pass %d/%d: %w", i+1, passes, err)
+		}
+	}
+	return nil
+}
+
+// confirmOnce is one confirmation pass through the SOCKS5 listener: dial,
+// handshake, one GET, require a 2xx, and touch at most one body byte (the
+// point is that the request/response round trip happens again, not the body).
+// An empty 2xx body (generate_204-style endpoints) still counts.
+func confirmOnce(socksAddr, probeURL string, timeout time.Duration) error {
+	resp, conn, err := probeRoundTrip(socksAddr, probeURL, timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("confirmation status: %s", resp.Status)
+	}
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1)); err != nil {
+		return fmt.Errorf("read confirmation body: %w", err)
+	}
+	return nil
 }
 
 func TestAll(configs []*proxycfg.ProxyConfig, testPortBase int, timeout time.Duration, downloadURL string, downloadSize int64) []*TestResult {
