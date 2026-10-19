@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/url"
 	"strconv"
 	"strings"
@@ -247,34 +246,23 @@ func buildOutbound(cfg *proxycfg.ProxyConfig, muxEnabled bool) ([]OutboundConfig
 		}
 
 	case "hysteria2", "tuic", "wireguard":
-		slog.Warn("protocol not supported as xray outbound, using freedom fallback",
-			"protocol", cfg.Protocol)
-		settings = map[string]interface{}{
-			"domainStrategy": "UseIP",
-		}
-		return []OutboundConfig{
-			{
-				Protocol: "freedom",
-				Settings: marshalRaw(settings),
-			},
-		}, nil
+		// xray-core has no outbound for these protocols. This used to
+		// return a freedom outbound, i.e. the user's traffic silently
+		// egressed DIRECTLY while the WAN looked healthy — the worst
+		// possible failure mode (a leak plus a false positive). Fail
+		// loudly instead; the promotion-site leak guard
+		// (proxycfg.IsXraySupported) is now only a second line of defense.
+		return nil, fmt.Errorf("protocol %q has no xray-core outbound: refusing to fall back to direct egress", cfg.Protocol)
 
 	default:
-		settings = map[string]interface{}{
-			"domainStrategy": "UseIP",
-		}
-		return []OutboundConfig{
-			{
-				Protocol: "freedom",
-				Settings: marshalRaw(settings),
-			},
-		}, nil
+		// Same rule for an unknown protocol: never a silent direct path.
+		return nil, fmt.Errorf("protocol %q has no xray-core outbound: refusing to fall back to direct egress", cfg.Protocol)
 	}
 
 	obMux := mux
 	// A socks5 outbound tunnels raw bytes through a plain SOCKS proxy to the
 	// real target: nothing at the far end decodes smux frames, so mux would
-	// corrupt every stream (mirrors the freedom-fallback no-mux rule).
+	// corrupt every stream.
 	if cfg.Protocol == "socks5" {
 		obMux = nil
 	}
