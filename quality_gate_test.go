@@ -211,3 +211,50 @@ func TestSlotExitIPDiversity(t *testing.T) {
 		t.Fatalf("active exit IPs after empty set = %v, want 2 entries", got)
 	}
 }
+
+func TestMeasureWithVerify(t *testing.T) {
+	// One pass is the historical behaviour: a single measurement, no repeat.
+	calls := 0
+	speed, ttfb, err := measureWithVerify(1, func() (float64, time.Duration, error) {
+		calls++
+		return 10, 100 * time.Millisecond, nil
+	})
+	if err != nil || speed != 10 || ttfb != 100*time.Millisecond || calls != 1 {
+		t.Fatalf("single pass = (%v,%v,%v) calls=%d", speed, ttfb, err, calls)
+	}
+
+	// Three passes keep the best throughput and the lowest TTFB.
+	vals := []struct {
+		s float64
+		t time.Duration
+	}{
+		{10, 300 * time.Millisecond},
+		{30, 90 * time.Millisecond},
+		{20, 150 * time.Millisecond},
+	}
+	i := 0
+	speed, ttfb, err = measureWithVerify(3, func() (float64, time.Duration, error) {
+		v := vals[i]
+		i++
+		return v.s, v.t, nil
+	})
+	if err != nil {
+		t.Fatalf("three passes error: %v", err)
+	}
+	if speed != 30 || ttfb != 90*time.Millisecond {
+		t.Fatalf("three passes = (%v,%v), want best speed 30 and lowest ttfb 90ms", speed, ttfb)
+	}
+
+	// A failure on a later pass rejects and names the pass.
+	i = 0
+	_, _, err = measureWithVerify(3, func() (float64, time.Duration, error) {
+		i++
+		if i == 2 {
+			return 0, 0, errors.New("stalled")
+		}
+		return 10, time.Millisecond, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "verify pass 2/3") {
+		t.Fatalf("flaky pass error = %v, want it to name pass 2/3", err)
+	}
+}

@@ -35,6 +35,12 @@ type Config struct {
 	// the ceiling (MAX_TTFB_MS=0). Mbps-only promotion was how 5-second
 	// paths kept entering the pool.
 	MaxTTFB time.Duration
+	// VerifyPasses is how many consecutive end-to-end test downloads a
+	// candidate must complete before it may be promoted (VERIFY_PASSES,
+	// default 2, 1 disables the repeat). A node that passes once and then
+	// stalls was the remaining false positive: it entered the pool, failed
+	// its canaries and got ejected minutes later.
+	VerifyPasses int
 	// QualityIPGates enables the two exit-IP gates at promotion time: a
 	// candidate egressing from this host's own IP is not proxying (a
 	// freedom/direct leak), and two active WANs must not share one exit
@@ -311,6 +317,20 @@ func ParseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be between 0 and 60000", v)
 		}
 		cfg.MaxTTFB = time.Duration(n) * time.Millisecond
+	}
+
+	// VERIFY_PASSES: consecutive successful test downloads required before
+	// promotion (1 = the historical single-shot behaviour).
+	cfg.VerifyPasses = 2
+	if v := os.Getenv("VERIFY_PASSES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: VERIFY_PASSES=%q: must be a valid integer", v)
+		}
+		if n < 1 || n > 5 {
+			return nil, fmt.Errorf("error: VERIFY_PASSES=%q: must be between 1 and 5", v)
+		}
+		cfg.VerifyPasses = n
 	}
 
 	// QUALITY_IP_GATES: refuse a candidate that egresses from this host's

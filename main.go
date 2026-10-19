@@ -199,6 +199,7 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	// TTFB ceiling and this host's own exit IP. Kept as function values so
 	// decide()'s signature and its tests stay unchanged; both are inert
 	// until this point (0 / "") so unit tests never hit the network.
+	verifyPasses = cfg.VerifyPasses
 	candidateMaxTTFB = func() time.Duration { return cfg.MaxTTFB }
 	candidateHostIP = func() string {
 		if !cfg.QualityIPGates {

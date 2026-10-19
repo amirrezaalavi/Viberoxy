@@ -142,6 +142,13 @@ func Admissible(r *TestResult, minSpeed float64, maxTTFB time.Duration, hostIP s
 	return ""
 }
 
+// verifyPasses is how many consecutive successful test downloads a candidate
+// must complete before promotion (VERIFY_PASSES, default 2). It is a package
+// variable, like candidateMaxTTFB, so the tester signature the replacement
+// plumbing depends on stays stable; startup installs the configured value.
+// 1 restores the historical single-shot behaviour.
+var verifyPasses = 1
+
 // startTestXray starts the temp xray for a speed test. It is a variable so
 // tests can observe the flags a test instance is started with without
 // spawning a process (F-11 test/prod mux parity).
@@ -166,6 +173,34 @@ func acquireCycleTestPort(pool *WANPool, base, seq int) (port int, release func(
 		return p, func() { _ = a.Release(p) }, true
 	}
 	return base + seq, func() {}, true
+}
+
+// measureWithVerify runs measure `passes` times (minimum once) and keeps the
+// best speed and the lowest TTFB. Any failed pass rejects: a node that
+// completes one download and then stalls used to pass, take a WAN slot and
+// be ejected minutes later.
+func measureWithVerify(passes int, measure func() (float64, time.Duration, error)) (float64, time.Duration, error) {
+	if passes < 1 {
+		passes = 1
+	}
+	var speed float64
+	var ttfb time.Duration
+	for pass := 1; pass <= passes; pass++ {
+		s, t, err := measure()
+		if err != nil {
+			if passes == 1 {
+				return 0, 0, err
+			}
+			return 0, 0, fmt.Errorf("verify pass %d/%d: %w", pass, passes, err)
+		}
+		if pass == 1 || t < ttfb {
+			ttfb = t
+		}
+		if s > speed {
+			speed = s
+		}
+	}
+	return speed, ttfb, nil
 }
 
 // TestSpeed speed-tests one config through a temp xray. It never runs
@@ -203,7 +238,13 @@ func TestSpeedWithStability(cfg *proxycfg.ProxyConfig, testPort int, timeout tim
 	if err := waitPortReady(socksAddr, 5*time.Second); err != nil {
 		return &TestResult{Config: cfg, Error: fmt.Errorf("xray not ready: %w", err)}
 	}
-	speed, ttfb, err := DownloadMeasurerTTFB(socksAddr, downloadURL, downloadSize, timeout)
+	// Repeat the download before believing it. One shot admitted nodes that
+	// pass once and then stall: they took a WAN slot, failed their canaries
+	// and were ejected minutes later, which the client experiences as
+	// "connected, then broken". Any failed pass rejects the candidate.
+	speed, ttfb, err := measureWithVerify(verifyPasses, func() (float64, time.Duration, error) {
+		return DownloadMeasurerTTFB(socksAddr, downloadURL, downloadSize, timeout)
+	})
 	if err != nil {
 		return &TestResult{Config: cfg, Error: err}
 	}
