@@ -319,6 +319,10 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 		slog.Info("startup: testing configs...", "count", len(configs))
 		skippedUnsupported := map[string]bool{}
 		var tested int
+		// latencyFallback is the healthiest config the TTFB ceiling refused:
+		// kept only so an all-rejected batch cannot leave the proxy with no
+		// WAN at all (see the availability guard after the test loop).
+		var latencyFallback *TestResult
 		for _, c := range configs {
 			if pool.ActiveCount() >= cfg.WanCount {
 				break
@@ -345,6 +349,15 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			tested++
 			if !result.Qualifies(cfg.MinimumSpeed, cfg.MaxTTFB()) {
 				logRejection("startup", result, cfg)
+				// Track the best candidate rejected *only* by the latency
+				// ceiling: it is healthy enough to serve if nothing better
+				// exists at all.
+				if result.Error == nil && result.Speed >= cfg.MinimumSpeed &&
+					cfg.MaxTTFB() > 0 && result.TTFB > cfg.MaxTTFB() {
+					if latencyFallback == nil || result.TTFB < latencyFallback.TTFB {
+						latencyFallback = result
+					}
+				}
 				continue
 			}
 			emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -376,6 +389,34 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 
 		if pool.ActiveCount() >= cfg.WanCount {
 			break
+		}
+
+		// Availability guard: a ceiling that rejects every candidate must not
+		// leave the proxy with zero WANs. A slow-but-working path beats no
+		// path, so promote the fastest responder and say so loudly — the
+		// alternative is a service that never starts serving.
+		if pool.ActiveCount() == 0 && latencyFallback != nil {
+			if emptySlots := pool.GetSlotsByState(StateEmpty); len(emptySlots) > 0 {
+				slotIdx := emptySlots[0]
+				pool.StartTesting(slotIdx, latencyFallback.Config)
+				if cmd, p, err := StartXray(latencyFallback.Config, cfg.WanBasePort+slotIdx, cfg.XrayMux); err != nil {
+					slog.Error("startup: latency-fallback xray failed", "error", err)
+					pool.ResetEmpty(slotIdx)
+				} else {
+					pool.SetActive(slotIdx, cmd, p)
+					pool.SetSlotSpeedMbps(slotIdx, latencyFallback.Speed)
+					pool.SetSlotTTFB(slotIdx, int(latencyFallback.TTFB.Milliseconds()))
+					pool.SetSlotStability(slotIdx, latencyFallback.StabilityScore)
+					slog.Warn("startup: latency ceiling relaxed — no candidate cleared MAX_TTFB_MS, promoting the fastest responder",
+						"index", slotIdx, "server", latencyFallback.Config.Server,
+						"ttfb_ms", latencyFallback.TTFB.Milliseconds(), "max_ttfb_ms", cfg.MaxTTFBMs,
+						"speed", latencyFallback.Speed)
+					if cfg.AllowDegradedBoot && !proxyStarted && pool.ActiveCount() >= 1 {
+						startServices()
+						slog.Info("viberoxy started (degraded)", "wans", pool.ActiveCount(), "needed", cfg.WanCount)
+					}
+				}
+			}
 		}
 
 		// Preserve active slots across retries: only reset slots that are
