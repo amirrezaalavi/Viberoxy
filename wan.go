@@ -755,7 +755,6 @@ func (p *WANPool) SetSlotTTFB(index, ttfbMs int) {
 	slot.mu.Lock()
 	slot.TTFBMs = ttfbMs
 	slot.mu.Unlock()
-	metricWanTTFBMs.Set(float64(ttfbMs), strconv.Itoa(index))
 }
 
 // SetSlotSpeedMbps records the measured speed for a slot.

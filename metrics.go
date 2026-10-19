@@ -330,6 +330,7 @@ func init() {
 	metricsRegistry.Register(metricWansActive)
 	metricsRegistry.Register(metricWanSpeedMbps)
 	metricsRegistry.Register(metricWanStability)
+	metricsRegistry.Register(metricWanTTFBMs)
 	metricsRegistry.Register(metricProxyConnections)
 	metricsRegistry.Register(metricProxyBytes)
 	metricsRegistry.Register(metricProxyLatency)

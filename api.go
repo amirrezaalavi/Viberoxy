@@ -20,6 +20,7 @@ type WANSlotInfo struct {
 	Index            int     `json:"index"`
 	State            string  `json:"state"`
 	SpeedMbps        float64 `json:"speed_mbps"`
+	TTFBMs           int     `json:"ttfb_ms"`
 	Conns            int64   `json:"conns"`
 	ExitIP           string  `json:"exit_ip"`
 	LastProbe        string  `json:"last_probe"`
@@ -285,6 +286,7 @@ func wanSlotInfo(pool *WANPool, index int) WANSlotInfo {
 	slot.mu.Lock()
 	state := slot.State
 	speed := slot.SpeedMbps
+	ttfbMs := slot.TTFBMs
 	exitIP := slot.ExitIP
 	lastProbe := slot.LastProbe
 	cur := slot.Current.Load()
@@ -294,6 +296,7 @@ func wanSlotInfo(pool *WANPool, index int) WANSlotInfo {
 		Index:            index,
 		State:            state.String(),
 		SpeedMbps:        speed,
+		TTFBMs:           ttfbMs,
 		Conns:            cur.Conns(),
 		ExitIP:           exitIP,
 		LastProbe:        lastProbe.Format(time.RFC3339),
