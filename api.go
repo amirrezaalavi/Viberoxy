@@ -122,6 +122,8 @@ func NewAPIHandler(pool *WANPool, configs ...*proxycfg.Config) http.Handler {
 		dropOpts.DownloadSize = cfg.DownloadSize
 		dropOpts.StabilityProbes = cfg.StabilityProbes
 		dropOpts.XrayMux = cfg.XrayMux
+		dropOpts.MinSpeed = cfg.MinimumSpeed
+		dropOpts.MaxTTFB = cfg.MaxTTFB()
 	}
 
 	mux := http.NewServeMux()

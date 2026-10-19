@@ -674,6 +674,10 @@ func canaryProbe(socksAddr string, endpoints []string, timeout time.Duration) (b
 // candidate pool. The pool lives in internal/cands and cannot see main's
 // TestResult, so the value fields are copied here and Config stays shared
 // by pointer.
+// toCands converts tested results into candidate-pool entries. The pool is a
+// cache of everything tested — an entry here is a candidate, not yet an
+// approved WAN — so promotion bars are NOT applied here: the two install
+// paths (runCycle's promotion and DropAndReplace) each apply them.
 func toCands(results []*TestResult) []*cands.Entry {
 	entries := make([]*cands.Entry, len(results))
 	for i, r := range results {
@@ -905,6 +909,8 @@ func (r *rotator) maybeSwap(pool *WANPool, cfg *proxycfg.Config, results []*Test
 		DownloadSize:    cfg.DownloadSize,
 		StabilityProbes: cfg.StabilityProbes,
 		XrayMux:         cfg.XrayMux,
+		MinSpeed:        cfg.MinimumSpeed,
+		MaxTTFB:         cfg.MaxTTFB(),
 		TestPorts:       pool.TestPorts(),
 		SparePorts:      pool.SparePorts(),
 	}

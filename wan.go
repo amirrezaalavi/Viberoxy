@@ -186,6 +186,13 @@ type DropAndReplaceOptions struct {
 	XrayMux         bool
 	TestCandidate   ReplacementTester
 	StartCandidate  ReplacementStarter
+	// MinSpeed and MaxTTFB are the promotion bars the replacement must also
+	// clear. DropAndReplace re-tests its candidate, so without this an
+	// operator-triggered drop could install a WAN that runCycle would have
+	// refused (below the speed floor, or too slow to answer). Zero values
+	// disable the respective bar (legacy callers / tests).
+	MinSpeed float64
+	MaxTTFB  time.Duration
 	// TestPorts is the shared speed-test port budget (F-13): when wired,
 	// each candidate test checks a port out of it and returns it when the
 	// test ends, so a cycle test and an API-triggered replacement test can
@@ -311,6 +318,15 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 			return nil, fmt.Errorf("%w: %v", ErrReplacementTestFailed, result.Error)
 		}
 		return nil, ErrReplacementTestFailed
+	}
+	// Apply the same promotion bars runCycle uses. A rejection here leaves the
+	// slot untouched; the caller can queue a regular cycle instead.
+	if !result.Qualifies(opts.MinSpeed, opts.MaxTTFB) {
+		reason := fmt.Sprintf("speed %.2f Mbps", result.Speed)
+		if opts.MaxTTFB > 0 && result.TTFB > opts.MaxTTFB {
+			reason = fmt.Sprintf("ttfb %dms > %dms", result.TTFB.Milliseconds(), opts.MaxTTFB.Milliseconds())
+		}
+		return nil, fmt.Errorf("%w: candidate rejected (%s)", ErrNoReplacementCandidate, reason)
 	}
 
 	// Start the replacement. An occupied slot starts on a SPARE service
