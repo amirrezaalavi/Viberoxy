@@ -761,6 +761,39 @@ func (p *WANPool) SetSlotStability(index int, score int) {
 	metricWanStability.Set(float64(score), strconv.Itoa(index))
 }
 
+// SetSlotExitIP records the exit IP measured for a slot's current path at
+// promotion time, so the leak and duplicate-exit gates have a value before
+// the first canary probe fires (which used to be the only writer).
+func (p *WANPool) SetSlotExitIP(index int, ip string) {
+	if index < 0 || index >= len(p.Slots) || ip == "" {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	slot.ExitIP = ip
+	slot.mu.Unlock()
+}
+
+// ActiveExitIPs returns the exit IPs currently served by ACTIVE paths, for
+// the duplicate-exit gate. Slots whose exit IP was never observed
+// contribute nothing (unknown must never block a candidate).
+func (p *WANPool) ActiveExitIPs() map[string]bool {
+	out := make(map[string]bool)
+	for _, idx := range p.GetSlotsByState(StateActive) {
+		if idx < 0 || idx >= len(p.Slots) {
+			continue
+		}
+		slot := p.Slots[idx]
+		slot.mu.Lock()
+		ip := slot.ExitIP
+		slot.mu.Unlock()
+		if ip != "" {
+			out[ip] = true
+		}
+	}
+	return out
+}
+
 // PickReplacementSlot returns the index of the active slot to prefer when
 // replacing a WAN: the one with the highest stability score (least stable
 // exit IP, i.e. most churn). Equal scores resolve to the lowest index, so

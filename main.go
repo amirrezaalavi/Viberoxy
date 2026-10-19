@@ -193,7 +193,19 @@ func listenHost(cfg *proxycfg.Config) string {
 }
 
 func startup(cfg *proxycfg.Config, ctx context.Context) {
-	slog.Info("starting viberoxy...")
+	slog.Info("starting viberoxy...", "max_ttfb_ms", cfg.MaxTTFB.Milliseconds())
+
+	// The rotator's quality-gate inputs (SPEC-R candidate filtering): the
+	// TTFB ceiling and this host's own exit IP. Kept as function values so
+	// decide()'s signature and its tests stay unchanged; both are inert
+	// until this point (0 / "") so unit tests never hit the network.
+	candidateMaxTTFB = func() time.Duration { return cfg.MaxTTFB }
+	candidateHostIP = func() string {
+		if !cfg.QualityIPGates {
+			return ""
+		}
+		return hostExitIP(time.Duration(cfg.TestTimeout) * time.Second)
+	}
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
 	candidatePool = cands.NewPool(50)
@@ -343,7 +355,11 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			result := TestSpeedWithStability(c, testPort, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
 			releaseTest()
 			tested++
-			if result.Error != nil || result.Speed < cfg.MinimumSpeed {
+			// One gate for startup, the cycle fill and the rotator: speed
+			// floor, TTFB ceiling, direct-egress leak, duplicate exit IP.
+			if reason := Admissible(result, cfg.MinimumSpeed, cfg.MaxTTFB, gateHostIP(cfg), gateActiveExit(pool, cfg)); reason != "" {
+				slog.Info("startup: candidate rejected", "server", c.Server, "port", c.Port,
+					"reason", reason, "speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(), "exit_ip", result.ExitIP)
 				continue
 			}
 			emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -361,7 +377,9 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			pool.SetActive(slotIdx, cmd, path)
 			pool.SetSlotSpeedMbps(slotIdx, result.Speed)
 			pool.SetSlotStability(slotIdx, result.StabilityScore)
-			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed, "stability", result.StabilityScore)
+			pool.SetSlotExitIP(slotIdx, result.ExitIP)
+			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed, "stability", result.StabilityScore,
+				"ttfb_ms", result.TTFB.Milliseconds(), "exit_ip", result.ExitIP)
 
 			// Degraded boot: serve traffic as soon as the first WAN is up,
 			// then keep filling slots until the full WAN_COUNT is reached.
@@ -719,6 +737,30 @@ func newRotator() *rotator {
 // rotation is the process-wide SPEC-R rotator runCycle swaps through.
 var rotation = newRotator()
 
+// gateHostIP and gateActiveExit feed Admissible's two exit-IP gates. They
+// are inert when QUALITY_IP_GATES is off (local/fake-WAN fixtures, where
+// every proxy shares the host's own exit IP).
+func gateHostIP(cfg *proxycfg.Config) string {
+	if cfg == nil || !cfg.QualityIPGates {
+		return ""
+	}
+	return hostExitIP(time.Duration(cfg.TestTimeout) * time.Second)
+}
+
+func gateActiveExit(pool *WANPool, cfg *proxycfg.Config) map[string]bool {
+	if cfg == nil || !cfg.QualityIPGates || pool == nil {
+		return nil
+	}
+	return pool.ActiveExitIPs()
+}
+
+// The rotator's quality-gate inputs, installed by startup once the config is
+// parsed. Zero values (tests, early calls) disable both gates.
+var (
+	candidateMaxTTFB = func() time.Duration { return 0 }
+	candidateHostIP  = func() string { return "" }
+)
+
 // decide picks at most ONE SPEC-R swap for a cycle, or reports why
 // none may happen. Gates, in order: FETCH_INTERVAL cooldown; worst
 // incumbent (lowest score; PickReplacementSlot's instability preference
@@ -767,18 +809,9 @@ func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64,
 			age.Round(time.Second), dwell)}
 	}
 
-	// Exit IPs the canary loop recorded for the active paths ("" =
-	// never probed = unknown).
-	activeExit := make(map[string]bool, len(active))
-	for _, idx := range active {
-		slot := pool.Slots[idx]
-		slot.mu.Lock()
-		ip := slot.ExitIP
-		slot.mu.Unlock()
-		if ip != "" {
-			activeExit[ip] = true
-		}
-	}
+	// Exit IPs the canary loop (and promotion) recorded for the active
+	// paths ("" = never probed = unknown).
+	activeExit := pool.ActiveExitIPs()
 	blocked := func(c *proxycfg.ProxyConfig) bool {
 		if c == nil {
 			return true
@@ -787,11 +820,13 @@ func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64,
 			return true // already serving another active/draining path
 		}
 		ip := exitFn(c)
-		return ip != "" && activeExit[ip] // exit-IP duplicate
+		return ip != "" && activeExit[ip] // exit-IP duplicate (server-IP heuristic)
 	}
-	cand := bestNewCandidate(results, minSpeed, blocked)
+	// bestAdmissibleCandidate adds the measured-exit gates (direct egress,
+	// duplicate exit IP) and the TTFB ceiling on top of blocked.
+	cand := bestAdmissibleCandidate(results, minSpeed, candidateMaxTTFB(), candidateHostIP(), activeExit, blocked)
 	if cand == nil {
-		return rotationDecision{Victim: -1, Reason: "no candidate cleared the speed bar, wan dedupe and exit-ip dedupe"}
+		return rotationDecision{Victim: -1, Reason: "no candidate cleared the speed bar, ttfb ceiling, wan dedupe, leak and exit-ip gates"}
 	}
 
 	// Hysteresis: only a clear win rotates an incumbent.
@@ -987,8 +1022,10 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		}
 		results = append(results, result)
 
-		// Fill empty slots immediately as soon as a config passes.
-		if result.Error != nil || result.Speed < cfg.MinimumSpeed {
+		// Fill empty slots immediately as soon as a config passes the gate.
+		if reason := Admissible(result, cfg.MinimumSpeed, cfg.MaxTTFB, gateHostIP(cfg), gateActiveExit(pool, cfg)); reason != "" {
+			slog.Info("cycle: candidate rejected", "server", c.Server, "port", c.Port,
+				"reason", reason, "speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(), "exit_ip", result.ExitIP)
 			continue
 		}
 		emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -1010,7 +1047,9 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		pool.SetActive(slotIdx, cmd, path)
 		pool.SetSlotSpeedMbps(slotIdx, result.Speed)
 		pool.SetSlotStability(slotIdx, result.StabilityScore)
-		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed, "stability", result.StabilityScore)
+		pool.SetSlotExitIP(slotIdx, result.ExitIP)
+		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed, "stability", result.StabilityScore,
+			"ttfb_ms", result.TTFB.Milliseconds(), "exit_ip", result.ExitIP)
 	}
 
 	writeSortedTxt(results)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"viberoxy/internal/auth"
 )
 
@@ -28,6 +29,18 @@ type Config struct {
 	KeepaliveInterval int
 	WanFailThreshold  int
 	StabilityProbes   int
+	// MaxTTFB is the responsiveness ceiling for a promoted config: a
+	// candidate whose first response byte takes longer than this is
+	// rejected no matter how many Mbps it can eventually move. 0 disables
+	// the ceiling (MAX_TTFB_MS=0). Mbps-only promotion was how 5-second
+	// paths kept entering the pool.
+	MaxTTFB time.Duration
+	// QualityIPGates enables the two exit-IP gates at promotion time: a
+	// candidate egressing from this host's own IP is not proxying (a
+	// freedom/direct leak), and two active WANs must not share one exit
+	// IP. Env QUALITY_IP_GATES (default true). Off for local/fake-WAN
+	// fixtures, where every "proxy" shares the host's own exit.
+	QualityIPGates    bool
 	AccessLog         bool
 	AllowDegradedBoot bool
 	// AllowHTTPSubscription opts in to plain http:// SUBSCRIBER_URL values
@@ -281,6 +294,36 @@ func ParseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: STABILITY_PROBES=%q: must be between 0 and 5", v)
 		}
 		cfg.StabilityProbes = n
+	}
+
+	// MAX_TTFB_MS: responsiveness ceiling in milliseconds for promotion and
+	// rotation (0 disables). A candidate that needs longer than this for its
+	// first response byte is rejected however fast it eventually streams:
+	// ranking by Mbps alone is what let multi-second-latency paths into the
+	// pool while rejecting low-latency, modest-bandwidth ones.
+	cfg.MaxTTFB = 2500 * time.Millisecond
+	if v := os.Getenv("MAX_TTFB_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be a valid integer", v)
+		}
+		if n < 0 || n > 60000 {
+			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be between 0 and 60000", v)
+		}
+		cfg.MaxTTFB = time.Duration(n) * time.Millisecond
+	}
+
+	// QUALITY_IP_GATES: refuse a candidate that egresses from this host's
+	// own IP (it is not proxying at all) and a candidate whose exit IP is
+	// already served by an active WAN. Both need one direct exit-IP probe,
+	// cached; unknown never blocks. Disable for local/fake-WAN setups.
+	cfg.QualityIPGates = true
+	if v := os.Getenv("QUALITY_IP_GATES"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: QUALITY_IP_GATES=%q: must be a boolean", v)
+		}
+		cfg.QualityIPGates = b
 	}
 
 	// METRICS_PORT: 0 disables the observability server (/metrics, /healthz,

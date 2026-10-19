@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"viberoxy/internal/proxycfg"
 )
@@ -19,12 +20,126 @@ import (
 type TestResult struct {
 	Config *proxycfg.ProxyConfig
 	Speed  float64
+	// TTFB is the time from the start of the test download to the first
+	// response byte through the tunnel. It is the responsiveness signal
+	// Mbps alone hides: a 50 Mbps path with a 3 s first byte feels broken,
+	// a 1 Mbps path with a 30 ms first byte does not. MAX_TTFB_MS rejects
+	// candidates above the ceiling (0 disables).
+	TTFB time.Duration
+	// ExitIP is the exit IP observed through the tunnel once the download
+	// succeeded ("" when the probe failed). It is used for two gates: a
+	// candidate egressing from this host's own IP is not proxying at all
+	// (direct/freedom leak), and two active WANs must not share an exit.
+	ExitIP string
 	// StabilityScore is the number of distinct exit IPs observed across
 	// STABILITY_PROBES probes minus one: 0 means a single stable exit IP
 	// (or no probes run), higher means more upstream exit churn. It is
 	// used only for ranking/preference — never to reject a config.
 	StabilityScore int
 	Error          error
+}
+
+// exitIPTTL caches the host's own direct exit IP for this long: the value
+// only changes when the host's upstream changes, and the leak gate must not
+// add a probe per candidate.
+var exitIPTTL = 10 * time.Minute
+
+var (
+	hostExitIPMu     sync.Mutex
+	hostExitIPValue  string
+	hostExitIPAt     time.Time
+	hostExitIPFailAt time.Time
+)
+
+// exitIPFailureBackoff throttles retries after a failed direct probe, so a
+// host without reachable ipify does not pay a fresh timeout per candidate.
+var exitIPFailureBackoff = 60 * time.Second
+
+// directExitIPFunc fetches this host's exit IP with NO proxy in the path. It
+// is a variable so tests can inject a value instead of reaching the network.
+var directExitIPFunc = func(timeout time.Duration) (string, error) {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(ProbeWANURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("direct probe status: %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(string(body))
+	if ip == "" {
+		return "", fmt.Errorf("direct probe body empty")
+	}
+	return ip, nil
+}
+
+// hostExitIP returns this host's own (unproxied) exit IP, cached for
+// exitIPTTL. "" means UNKNOWN: callers must skip the leak gate rather than
+// guess — a false leak verdict would empty the pool. A failed probe is
+// remembered for exitIPFailureBackoff so it is not retried per candidate.
+func hostExitIP(timeout time.Duration) string {
+	hostExitIPMu.Lock()
+	ip, at, failedAt := hostExitIPValue, hostExitIPAt, hostExitIPFailAt
+	hostExitIPMu.Unlock()
+	if ip != "" && time.Since(at) < exitIPTTL {
+		return ip
+	}
+	if !failedAt.IsZero() && time.Since(failedAt) < exitIPFailureBackoff {
+		return ip
+	}
+	got, err := directExitIPFunc(timeout)
+	if err != nil || got == "" {
+		hostExitIPMu.Lock()
+		hostExitIPFailAt = time.Now()
+		hostExitIPMu.Unlock()
+		return ip
+	}
+	hostExitIPMu.Lock()
+	hostExitIPValue, hostExitIPAt = got, time.Now()
+	hostExitIPFailAt = time.Time{}
+	hostExitIPMu.Unlock()
+	return got
+}
+
+// Admissible is the single promotion gate shared by startup, the cycle fill
+// and the rotator, so those three paths cannot drift apart. It returns ""
+// when the result may be promoted, else the reason it must not be.
+//
+//	"" // eligible
+//	"test failed: …"
+//	"below speed floor"
+//	"above ttfb ceiling"
+//	"duplicate exit ip"
+//	"direct egress (leak)"   — the candidate's exit IP is this host's own
+//
+// An unknown exit IP ("" on either side) never triggers the two IP gates.
+func Admissible(r *TestResult, minSpeed float64, maxTTFB time.Duration, hostIP string, activeExit map[string]bool) string {
+	if r == nil {
+		return "nil result"
+	}
+	if r.Error != nil {
+		return "test failed: " + r.Error.Error()
+	}
+	if r.Speed < minSpeed {
+		return "below speed floor"
+	}
+	if maxTTFB > 0 && r.TTFB > maxTTFB {
+		return fmt.Sprintf("above ttfb ceiling (%s > %s)", r.TTFB.Round(time.Millisecond), maxTTFB)
+	}
+	if r.ExitIP != "" {
+		if hostIP != "" && r.ExitIP == hostIP {
+			return "direct egress (leak)"
+		}
+		if activeExit[r.ExitIP] {
+			return "duplicate exit ip"
+		}
+	}
+	return ""
 }
 
 // startTestXray starts the temp xray for a speed test. It is a variable so
@@ -65,6 +180,10 @@ func TestSpeed(cfg *proxycfg.ProxyConfig, testPort int, timeout time.Duration, d
 // torn down) and the distinct IP count becomes the result's
 // StabilityScore. With stabilityProbes == 0 the behavior is identical to
 // TestSpeed.
+//
+// Regardless of stabilityProbes, a successful download is followed by ONE
+// exit-IP probe: the observed IP is what Admissible's leak and duplicate
+// gates run on. A failed probe leaves ExitIP empty and the gates skip.
 func TestSpeedWithStability(cfg *proxycfg.ProxyConfig, testPort int, timeout time.Duration, downloadURL string, downloadSize int64, stabilityProbes int) *TestResult {
 	start := time.Now()
 	defer func() { metricTestDuration.Observe(time.Since(start).Seconds()) }()
@@ -84,11 +203,15 @@ func TestSpeedWithStability(cfg *proxycfg.ProxyConfig, testPort int, timeout tim
 	if err := waitPortReady(socksAddr, 5*time.Second); err != nil {
 		return &TestResult{Config: cfg, Error: fmt.Errorf("xray not ready: %w", err)}
 	}
-	speed, err := DownloadMeasurer(socksAddr, downloadURL, downloadSize, timeout)
+	speed, ttfb, err := DownloadMeasurerTTFB(socksAddr, downloadURL, downloadSize, timeout)
 	if err != nil {
 		return &TestResult{Config: cfg, Error: err}
 	}
-	result := &TestResult{Config: cfg, Speed: speed}
+	result := &TestResult{Config: cfg, Speed: speed, TTFB: ttfb}
+	// Best-effort, one probe: unknown exit IP only skips the IP gates.
+	if ip, err := probeExitIP(socksAddr, timeout); err == nil {
+		result.ExitIP = ip
+	}
 	if stabilityProbes > 0 {
 		result.StabilityScore = measureStability(socksAddr, stabilityProbes, timeout)
 	}
@@ -118,7 +241,19 @@ func SortResults(results []*TestResult) []*TestResult {
 	return sorted
 }
 
+// DownloadMeasurer measures throughput through the tunnel (Mbps). See
+// DownloadMeasurerTTFB for the responsiveness-annotated variant.
 func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, timeout time.Duration) (float64, error) {
+	speed, _, err := DownloadMeasurerTTFB(socksAddr, downloadURL, downloadSize, timeout)
+	return speed, err
+}
+
+// DownloadMeasurerTTFB is DownloadMeasurer plus the time to first body byte:
+// the clock starts before the request is sent and stops on the first
+// successful read, so it covers connect + protocol handshake + TLS + the
+// target's own thinking time. That is the number a user experiences as
+// "does this node feel alive", which a whole-transfer average hides.
+func DownloadMeasurerTTFB(socksAddr string, downloadURL string, downloadSize int64, timeout time.Duration) (float64, time.Duration, error) {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return socks5Dial(ctx, socksAddr, addr)
@@ -134,13 +269,13 @@ func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, 
 
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
+		return 0, 0, fmt.Errorf("create request: %w", err)
 	}
 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("http get: %w", err)
+		return 0, 0, fmt.Errorf("http get: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -149,17 +284,28 @@ func DownloadMeasurer(socksAddr string, downloadURL string, downloadSize int64, 
 		reader = io.LimitReader(resp.Body, downloadSize)
 	}
 
+	// First byte decides TTFB: read once by hand, then copy the rest.
+	var ttfb time.Duration
+	first := make([]byte, 1)
+	firstN, err := reader.Read(first)
+	if firstN > 0 {
+		ttfb = time.Since(start)
+	} else if err != nil {
+		return 0, 0, fmt.Errorf("read first byte: %w", err)
+	}
+
 	n, err := io.Copy(io.Discard, reader)
 	if err != nil {
-		return 0, fmt.Errorf("read body: %w", err)
+		return 0, 0, fmt.Errorf("read body: %w", err)
 	}
+	n += int64(firstN)
 
 	elapsed := time.Since(start).Seconds()
 	if elapsed <= 0 {
 		elapsed = 0.001
 	}
 
-	return float64(n*8) / elapsed / 1_000_000, nil
+	return float64(n*8) / elapsed / 1_000_000, ttfb, nil
 }
 
 // ProbeWANURL is the endpoint used by keepalive probes. It is a variable so
@@ -345,13 +491,24 @@ func measureStability(socksAddr string, probes int, timeout time.Duration) int {
 // StabilityScore (more stable), then earlier test order. Returns nil when
 // no candidate qualifies. Speed-first: a slower but more stable config is
 // never preferred over a faster one.
+//
+// It is the speed-only view; bestAdmissibleCandidate adds the quality gates
+// (TTFB ceiling, direct-egress leak, duplicate exit IP).
 func bestNewCandidate(results []*TestResult, minimumSpeed float64, alreadyActive func(*proxycfg.ProxyConfig) bool) *TestResult {
+	return bestAdmissibleCandidate(results, minimumSpeed, 0, "", nil, alreadyActive)
+}
+
+// bestAdmissibleCandidate is bestNewCandidate restricted to results that
+// pass Admissible. blocked is the caller's own exclusion (server:port
+// already served, etc.) and may be nil. Ties keep bestNewCandidate's
+// preference order.
+func bestAdmissibleCandidate(results []*TestResult, minimumSpeed float64, maxTTFB time.Duration, hostIP string, activeExit map[string]bool, blocked func(*proxycfg.ProxyConfig) bool) *TestResult {
 	var best *TestResult
 	for _, r := range results {
-		if r.Error != nil || r.Speed < minimumSpeed {
+		if Admissible(r, minimumSpeed, maxTTFB, hostIP, activeExit) != "" {
 			continue
 		}
-		if alreadyActive != nil && alreadyActive(r.Config) {
+		if blocked != nil && blocked(r.Config) {
 			continue
 		}
 		if best == nil {

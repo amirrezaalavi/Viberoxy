@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/url"
 	"strconv"
 	"strings"
@@ -247,28 +246,18 @@ func buildOutbound(cfg *proxycfg.ProxyConfig, muxEnabled bool) ([]OutboundConfig
 		}
 
 	case "hysteria2", "tuic", "wireguard":
-		slog.Warn("protocol not supported as xray outbound, using freedom fallback",
-			"protocol", cfg.Protocol)
-		settings = map[string]interface{}{
-			"domainStrategy": "UseIP",
-		}
-		return []OutboundConfig{
-			{
-				Protocol: "freedom",
-				Settings: marshalRaw(settings),
-			},
-		}, nil
+		// xray-core has no outbound for these protocols. Until this change the
+		// builder emitted a `freedom` (direct) outbound instead, which is a
+		// double failure: the operator is told the node works while all traffic
+		// egresses from the host itself. Refuse loudly. The promote-site leak
+		// guard (proxycfg.IsXraySupported) is the first line of defence; this
+		// error is the backstop a new call path cannot bypass.
+		return nil, fmt.Errorf("protocol %q has no xray outbound: refusing to build a direct (freedom) config", cfg.Protocol)
 
 	default:
-		settings = map[string]interface{}{
-			"domainStrategy": "UseIP",
-		}
-		return []OutboundConfig{
-			{
-				Protocol: "freedom",
-				Settings: marshalRaw(settings),
-			},
-		}, nil
+		// Same reasoning: an unknown protocol must never silently become a
+		// direct outbound that passes every speed test.
+		return nil, fmt.Errorf("unsupported protocol %q: no xray outbound", cfg.Protocol)
 	}
 
 	obMux := mux

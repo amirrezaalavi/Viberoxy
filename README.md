@@ -105,6 +105,8 @@ All configuration is environment-variable driven; invalid values hard-exit at st
 | `WAN_FAIL_THRESHOLD` | `2` | Two meanings: (a) selection excludes a path at this many consecutive failures; (b) canary failures before a slot is marked draining (health flavor, reversible) |
 | `HEALTH_ENDPOINTS` | `https://www.gstatic.com/generate_204,https://www.cloudflare.com/cdn-cgi/trace` | Canary endpoints (comma/whitespace separated). A path fails only if **all** endpoints fail; ipify is never used for health (exit-IP reporting only) |
 | `STABILITY_PROBES` | `0` (off) | Exit-IP probes per passed speed test (0–5). Ranking only: replacement *prefers* the churniest active WAN, never rejects on this |
+| `MAX_TTFB_MS` | `2500` | Responsiveness ceiling: a candidate whose **first response byte** takes longer is rejected however many Mbps it can eventually move (`0` disables). Measured over the same test download, so it includes connect + handshake + TLS. Addresses the failure mode where a 50 Mbps / 3 s node outranked a 1 Mbps / 30 ms node |
+| `QUALITY_IP_GATES` | `true` | Reject two kinds of exit-IP mistake at promotion: a candidate egressing from **this host's own IP** is not proxying at all (a freedom/direct leak), and a candidate whose exit IP is already served by an active WAN is a duplicate failure domain. Needs one direct exit-IP probe (cached 10 min, failures backed off 60 s); an unknown IP never blocks. Turn off for local/fake-WAN setups, where every proxy shares the host exit |
 
 ### Split routing
 

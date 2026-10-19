@@ -110,9 +110,10 @@ func TestBuildXrayConfig_MuxDisabled(t *testing.T) {
 	}
 }
 
-func TestBuildXrayConfig_FreedomFallbackNoMux(t *testing.T) {
-	// hysteria2 is a freedom fallback: mux must never be emitted there,
-	// even when the caller requests mux on.
+func TestBuildXrayConfig_RejectsHysteria2(t *testing.T) {
+	// hysteria2 has no xray outbound. The builder used to emit a freedom
+	// (direct) outbound for it, which turned the node into plain internet
+	// access that still passed every speed test. It must refuse instead.
 	raw := "hysteria2://auth@1.2.3.4:443"
 	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
@@ -120,19 +121,11 @@ func TestBuildXrayConfig_FreedomFallbackNoMux(t *testing.T) {
 	}
 
 	data, err := BuildXrayConfig(cfg, 10802, true)
-	if err != nil {
-		t.Fatalf("BuildXrayConfig error: %v", err)
+	if err == nil {
+		t.Fatalf("BuildXrayConfig(hysteria2) = no error, want a hard error (data=%s)", data)
 	}
-
-	var xc XrayConfig
-	if err := json.Unmarshal(data, &xc); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if xc.Outbounds[0].Protocol != "freedom" {
-		t.Fatalf("outbound protocol = %q, want freedom", xc.Outbounds[0].Protocol)
-	}
-	if xc.Outbounds[0].Mux != nil {
-		t.Error("expected no mux on freedom fallback outbound")
+	if data != nil {
+		t.Error("BuildXrayConfig(hysteria2) returned data alongside the error")
 	}
 }
 
@@ -466,82 +459,48 @@ func TestBuildXrayConfig_SOCKS5_NoAuth(t *testing.T) {
 	}
 }
 
-func TestBuildXrayConfig_Fallback(t *testing.T) {
+func TestBuildXrayConfig_RejectsHysteria2WithName(t *testing.T) {
 	raw := "hysteria2://auth123@1.2.3.4:443#MyHy2"
 	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
 
-	data, err := BuildXrayConfig(cfg, 10806)
-	if err != nil {
-		t.Fatalf("BuildXrayConfig error: %v", err)
-	}
-
-	var xc XrayConfig
-	if err := json.Unmarshal(data, &xc); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	if len(xc.Outbounds) != 1 {
-		t.Fatalf("expected 1 outbound, got %d", len(xc.Outbounds))
-	}
-	if xc.Outbounds[0].Protocol != "freedom" {
-		t.Errorf("protocol = %q, want freedom", xc.Outbounds[0].Protocol)
-	}
-
-	var settings struct {
-		DomainStrategy string `json:"domainStrategy"`
-	}
-	if err := json.Unmarshal(xc.Outbounds[0].Settings, &settings); err != nil {
-		t.Fatalf("unmarshal settings: %v", err)
-	}
-	if settings.DomainStrategy != "UseIP" {
-		t.Errorf("domainStrategy = %q, want UseIP", settings.DomainStrategy)
+	if _, err := BuildXrayConfig(cfg, 10806); err == nil {
+		t.Fatal("BuildXrayConfig(hysteria2) = no error, want a hard error")
 	}
 }
 
-func TestBuildXrayConfig_Fallback_TUIC(t *testing.T) {
+func TestBuildXrayConfig_RejectsTUIC(t *testing.T) {
 	raw := "tuic://uuid:pass@1.2.3.4:443#MyTUIC"
 	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
 
-	data, err := BuildXrayConfig(cfg, 10807)
-	if err != nil {
-		t.Fatalf("BuildXrayConfig error: %v", err)
-	}
-
-	var xc XrayConfig
-	if err := json.Unmarshal(data, &xc); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	if xc.Outbounds[0].Protocol != "freedom" {
-		t.Errorf("protocol = %q, want freedom", xc.Outbounds[0].Protocol)
+	if _, err := BuildXrayConfig(cfg, 10807); err == nil {
+		t.Fatal("BuildXrayConfig(tuic) = no error, want a hard error")
 	}
 }
 
-func TestBuildXrayConfig_Fallback_WireGuard(t *testing.T) {
+func TestBuildXrayConfig_RejectsWireGuard(t *testing.T) {
 	raw := "wireguard://key@1.2.3.4:51820#MyWG"
 	cfg := proxycfg.ParseSingle(raw)
 	if cfg == nil {
 		t.Fatal("expected config, got nil")
 	}
 
-	data, err := BuildXrayConfig(cfg, 10808)
-	if err != nil {
-		t.Fatalf("BuildXrayConfig error: %v", err)
+	if _, err := BuildXrayConfig(cfg, 10808); err == nil {
+		t.Fatal("BuildXrayConfig(wireguard) = no error, want a hard error")
 	}
+}
 
-	var xc XrayConfig
-	if err := json.Unmarshal(data, &xc); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	if xc.Outbounds[0].Protocol != "freedom" {
-		t.Errorf("protocol = %q, want freedom", xc.Outbounds[0].Protocol)
+func TestBuildXrayConfig_RejectsUnknownProtocol(t *testing.T) {
+	// A protocol the switch does not know must never fall through to a
+	// direct (freedom) outbound: that is a silent traffic leak.
+	cfg := &proxycfg.ProxyConfig{Protocol: "quantum", Server: "1.2.3.4", Port: 443, Raw: "quantum://x@1.2.3.4:443"}
+	if _, err := BuildXrayConfig(cfg, 10809); err == nil {
+		t.Fatal("BuildXrayConfig(unknown protocol) = no error, want a hard error")
 	}
 }
 
@@ -753,7 +712,6 @@ func TestBuildXrayConfig_ValidJSON(t *testing.T) {
 		"vless://uuid@1.2.3.4:443?type=tcp",
 		"trojan://pass@1.2.3.4:443",
 		"socks5://user:pass@1.2.3.4:1080",
-		"hysteria2://auth@1.2.3.4:443",
 	}
 	for _, raw := range tests {
 		cfg := proxycfg.ParseSingle(raw)
