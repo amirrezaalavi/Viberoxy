@@ -193,7 +193,14 @@ func listenHost(cfg *proxycfg.Config) string {
 }
 
 func startup(cfg *proxycfg.Config, ctx context.Context) {
-	slog.Info("starting viberoxy...")
+	slog.Info("starting viberoxy...",
+		"wan_count", cfg.WanCount,
+		"download_bytes", cfg.DownloadSize,
+		"max_ttfb_ms", cfg.MaxTTFBMs,
+		"minimum_speed_mbps", cfg.MinimumSpeed,
+		"promote_passes", cfg.PromotePasses,
+		"degraded_fallback", cfg.AllowDegradedFallback,
+		"reject_direct_exit", cfg.RejectDirectExit)
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
 	// ALLOW_DEGRADED_FALLBACK: with it off, a connection that has no
