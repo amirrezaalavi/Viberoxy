@@ -196,6 +196,10 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	slog.Info("starting viberoxy...")
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
+	// ALLOW_DEGRADED_FALLBACK: with it off, a connection that has no
+	// routable WAN fails fast instead of being routed through a degraded
+	// (already failing) path.
+	pool.AllowDegradedFallback = cfg.AllowDegradedFallback
 	candidatePool = cands.NewPool(50)
 
 	// F-13 port discipline: one shared allocator for every speed-test port

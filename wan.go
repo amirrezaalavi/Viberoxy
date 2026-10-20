@@ -112,6 +112,15 @@ type WANPool struct {
 	Slots    []*WANSlot
 	BasePort int
 
+	// AllowDegradedFallback decides what selection does when no routable
+	// WAN is left: with it enabled (the default) the connection is served
+	// by a degraded path or by a draining slot — availability first, the
+	// event counted in viberoxy_selection_last_resort_total — and with it
+	// disabled the connection fails fast instead of being routed through a
+	// path that is already known to be failing. Wired once at startup from
+	// ALLOW_DEGRADED_FALLBACK.
+	AllowDegradedFallback bool
+
 	// replaceMu serializes the two short critical sections of a make-
 	// before-break replacement — the candidate pick and the Swap cutover —
 	// so concurrent drops cannot interleave their slot bookkeeping. It is
@@ -222,7 +231,7 @@ func NewWANPool(count int, basePort int) *WANPool {
 		slot.Current.Store(path.NewVacant(i, basePort+i))
 		slots[i] = slot
 	}
-	return &WANPool{Slots: slots, BasePort: basePort}
+	return &WANPool{Slots: slots, BasePort: basePort, AllowDegradedFallback: true}
 }
 
 // DropAndReplace replaces the config serving a WAN slot make-before-break
@@ -1058,8 +1067,18 @@ type SelectOptions struct {
 // returned release must be called exactly once by the winner's owner;
 // (nil, nil) means no candidate at all, which callers map to their
 // historical no-candidate semantics (503 / REP 0x01).
+//
+// With ALLOW_DEGRADED_FALLBACK=false the degraded and last-resort tiers are
+// dropped: a connection that has no routable WAN fails fast (502/503)
+// instead of being routed through a path that is already known to be
+// failing. The routable tier is untouched — this only changes what happens
+// when it is EMPTY.
 func (p *WANPool) Select(opts SelectOptions) (*path.Path, func()) {
 	routable, degraded, lastResort := p.eligibleTries(opts.Tried, opts.Threshold, true)
+	if !p.AllowDegradedFallback {
+		degraded = nil
+		lastResort = nil
+	}
 	siteKey := ""
 	if opts.ClientID != "" && affinity.Sticky(opts.Hostport) {
 		siteKey = affinity.SiteKey(opts.Hostport)
