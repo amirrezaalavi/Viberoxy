@@ -337,6 +337,13 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 		}
 		return nil, fmt.Errorf("%w: candidate rejected (%s)", ErrNoReplacementCandidate, reason)
 	}
+	// Non-leak check on the re-tested candidate (advisory unless
+	// REJECT_DIRECT_EXIT is on): the candidate must not egress with this
+	// machine's own address.
+	if checkDirectEgress("replace", result) {
+		return nil, fmt.Errorf("%w: candidate rejected (exit ip %s is this machine's own address)",
+			ErrNoReplacementCandidate, result.ExitIP)
+	}
 
 	// Start the replacement. An occupied slot starts on a SPARE service
 	// port so the old process keeps listening on its own port until the

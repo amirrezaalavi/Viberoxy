@@ -202,6 +202,11 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 	pool.AllowDegradedFallback = cfg.AllowDegradedFallback
 	candidatePool = cands.NewPool(50)
 
+	// Non-leak evidence: remember this machine's own exit IP so a candidate
+	// that egresses with the same address can be reported (and, with
+	// REJECT_DIRECT_EXIT, rejected).
+	initDirectEgressCheck(cfg)
+
 	// F-13 port discipline: one shared allocator for every speed-test port
 	// (the cycle's tests and the drop/replace API draw from the same pool,
 	// so they can never fight over one listener port) plus spare service
@@ -362,6 +367,12 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 						latencyFallback = result
 					}
 				}
+				continue
+			}
+			// Non-leak check: a candidate that egresses with this machine's
+			// own address is not going through its tunnel (advisory unless
+			// REJECT_DIRECT_EXIT is on).
+			if checkDirectEgress("startup", result) {
 				continue
 			}
 			emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -1103,6 +1114,10 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		// Fill empty slots immediately as soon as a config passes.
 		if !result.Qualifies(cfg.MinimumSpeed, cfg.MaxTTFB()) {
 			logRejection("cycle", result, cfg)
+			continue
+		}
+		// Non-leak check (advisory unless REJECT_DIRECT_EXIT is on).
+		if checkDirectEgress("cycle", result) {
 			continue
 		}
 		emptySlots := pool.GetSlotsByState(StateEmpty)
