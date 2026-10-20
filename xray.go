@@ -41,7 +41,7 @@ type XrayConfig = xraycfg.XrayConfig
 // internal/xraycfg. When muxEnabled is omitted it defaults to true: client
 // connections to this xray instance then share a single multiplexed upstream
 // connection, amortizing the TLS/protocol handshake per connection. Mux is
-// only emitted on proxied outbounds (never on the freedom fallback, never on
+// only emitted on proxied outbounds (never on a socks5 outbound, never on
 // socks5 outbounds whose plain-proxy remote cannot demultiplex smux, and never
 // when the config carries a flow such as xtls-rprx-vision).
 //

@@ -207,7 +207,7 @@ meaning changed: it now drives the canary band).
 | `ALLOW_HTTP_SUBSCRIPTION` | `false` | Opt in to plain `http://` subscriptions |
 | `FETCH_INTERVAL` | `300` (min 30) | Cycle interval **and** rotation cooldown |
 | `TEST_TIMEOUT` | `10` (min 3) | Seconds per speed test / canary timeout |
-| `DOWNLOAD_SIZE` | `10000000` (min 1000000) | Speed-test payload bytes |
+| `DOWNLOAD_SIZE` | `1000000` (min 1000000) | Speed-test payload bytes (bandwidth cost of testing every candidate) |
 | `DOWNLOAD_ENDPOINT` | `https://speed.cloudflare.com/__down?bytes=` | Empty disables the primary endpoint |
 | `DOWNLOAD_FALLBACK` | `https://proof.ovh.net/files/` | Fallback endpoint |
 | `WAN_COUNT` | `4` (1–5) | Slots |
@@ -224,6 +224,10 @@ meaning changed: it now drives the canary band).
 | `STABILITY_PROBES` | `0` (0–5) | Exit-IP probes per passed test (ranking only) |
 | `ACCESS_LOG` | `true` | Per-connection access log |
 | `ALLOW_DEGRADED_BOOT` | `true` | Serve after the first active WAN |
+| `ALLOW_DEGRADED_FALLBACK` | `true` | Serve a connection through a degraded/draining path when no routable WAN is left; `false` fails it fast |
+| `REJECT_DIRECT_EXIT` | `false` | Reject a candidate whose exit IP is this machine's own address (advisory by default) |
+| `MAX_TTFB_MS` | `2500` | Promotion ceiling on time-to-first-byte (0 = off); ranking is latency-first |
+| `PROMOTE_PASSES` | `2` (1–5) | Independent end-to-end passes before promotion (the first doubles as the exit-IP observation) |
 | `ROUTE_MODE` | `all-proxy` | `all-proxy` \| `proxy-default` \| `direct-default` |
 | `DIRECT_DOMAINS` / `PROXY_DOMAINS` | — | Comma-separated suffix lists |
 | `DIRECT_LIST_FILE` / `PROXY_LIST_FILE` | — | Newline-separated list files (`#` comments) |

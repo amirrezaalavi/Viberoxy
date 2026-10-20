@@ -398,3 +398,37 @@ func TestWANPoolDropAndReplace_SkipsActiveAndDroppedConfigs(t *testing.T) {
 		t.Errorf("slot 0 = %v/%v, want fresh config active", pool.Slots[0].Config, pool.GetState(0))
 	}
 }
+
+// TestDropAndReplaceRejectsCandidateOverCeiling pins the promotion bars on
+// the operator-triggered replacement path: it re-tests its candidate, so it
+// must refuse one the cycle would have refused instead of installing it.
+func TestDropAndReplaceRejectsCandidateOverCeiling(t *testing.T) {
+	candidates := cands.NewPool(10)
+	candidates.Update([]*cands.Entry{{
+		Config: &proxycfg.ProxyConfig{Raw: "c1", Server: "1.2.3.4", Port: 1, Protocol: "vless"},
+		Speed:  50,
+	}})
+
+	pool := NewWANPool(1, 20700)
+	started := false
+	_, err := pool.DropAndReplace(0, DropAndReplaceOptions{
+		Candidates: candidates,
+		TestPort:   10800,
+		Timeout:    3 * time.Second,
+		MinSpeed:   5,
+		MaxTTFB:    2500 * time.Millisecond,
+		TestCandidate: func(cfg *proxycfg.ProxyConfig, _ int, _ time.Duration, _ string, _ int64, _ int) *TestResult {
+			return &TestResult{Config: cfg, Speed: 50, TTFB: 4 * time.Second}
+		},
+		StartCandidate: func(*proxycfg.ProxyConfig, int, ...bool) (*xrayproc.Handle, string, error) {
+			started = true
+			return nil, "/tmp/should-not-exist.json", nil
+		},
+	})
+	if !errors.Is(err, ErrNoReplacementCandidate) {
+		t.Fatalf("err = %v, want ErrNoReplacementCandidate (latency ceiling)", err)
+	}
+	if started {
+		t.Error("a candidate over MAX_TTFB_MS must never be started")
+	}
+}

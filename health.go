@@ -61,6 +61,9 @@ func refreshPoolMetrics(pool *WANPool) {
 		if speed := pool.SlotSpeedMbps(i); speed > 0 {
 			metricWanSpeedMbps.Set(speed, strconv.Itoa(i))
 		}
+		if ttfb := pool.SlotTTFBMs(i); ttfb > 0 {
+			metricWanTTFBMs.Set(float64(ttfb), strconv.Itoa(i))
+		}
 	}
 	refreshPathSeries(pool)
 }

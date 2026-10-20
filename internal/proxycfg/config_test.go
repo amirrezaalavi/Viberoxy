@@ -3,6 +3,7 @@ package proxycfg
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func setenv(t *testing.T, key, value string) {
@@ -43,6 +44,8 @@ func TestParseConfig_Defaults(t *testing.T) {
 		"PROXY_PORT",
 		"SOCKS_PORT",
 		"MINIMUM_SPEED",
+		"MAX_TTFB_MS",
+		"PROMOTE_PASSES",
 		"METRICS_PORT",
 		"ACCESS_LOG",
 		"KEEPALIVE_INTERVAL",
@@ -75,8 +78,8 @@ func TestParseConfig_Defaults(t *testing.T) {
 	if cfg.TestTimeout != 10 {
 		t.Errorf("TestTimeout = %d, want %d", cfg.TestTimeout, 10)
 	}
-	if cfg.DownloadSize != 10000000 {
-		t.Errorf("DownloadSize = %d, want %d", cfg.DownloadSize, 10000000)
+	if cfg.DownloadSize != 1000000 {
+		t.Errorf("DownloadSize = %d, want %d", cfg.DownloadSize, 1000000)
 	}
 	if cfg.DownloadEndpoint != "https://speed.cloudflare.com/__down?bytes=" {
 		t.Errorf("DownloadEndpoint = %q, want %q", cfg.DownloadEndpoint, "https://speed.cloudflare.com/__down?bytes=")
@@ -375,6 +378,80 @@ func TestParseConfig_ZeroDownloadSize(t *testing.T) {
 	}
 }
 
+func TestParseConfig_PromotePasses(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	cfg, err := ParseConfig()
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.PromotePasses != 2 {
+		t.Errorf("default PromotePasses = %d, want 2", cfg.PromotePasses)
+	}
+
+	setenv(t, "PROMOTE_PASSES", "3")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.PromotePasses != 3 {
+		t.Errorf("PromotePasses = %d, want 3", cfg.PromotePasses)
+	}
+
+	for _, bad := range []string{"0", "6", "x"} {
+		setenv(t, "PROMOTE_PASSES", bad)
+		if _, err := ParseConfig(); err == nil {
+			t.Errorf("PROMOTE_PASSES=%q: expected error, got nil", bad)
+		}
+	}
+}
+
+func TestParseConfig_MaxTTFB(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	cfg, err := ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.MaxTTFBMs != 2500 {
+		t.Errorf("default MaxTTFBMs = %d, want 2500", cfg.MaxTTFBMs)
+	}
+	if got := cfg.MaxTTFB(); got != 2500*time.Millisecond {
+		t.Errorf("MaxTTFB() = %v, want 2.5s", got)
+	}
+
+	setenv(t, "MAX_TTFB_MS", "1200")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.MaxTTFBMs != 1200 {
+		t.Errorf("MaxTTFBMs = %d, want 1200", cfg.MaxTTFBMs)
+	}
+
+	// 0 is the documented way to disable the ceiling.
+	setenv(t, "MAX_TTFB_MS", "0")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if got := cfg.MaxTTFB(); got != 0 {
+		t.Errorf("MaxTTFB() with MAX_TTFB_MS=0 = %v, want 0 (disabled)", got)
+	}
+}
+
+func TestParseConfig_InvalidMaxTTFB(t *testing.T) {
+	for _, v := range []string{"-1", "abc", "60001"} {
+		t.Run(v, func(t *testing.T) {
+			setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+			setenv(t, "MAX_TTFB_MS", v)
+			if _, err := ParseConfig(); err == nil {
+				t.Fatalf("MAX_TTFB_MS=%q: expected error, got nil", v)
+			}
+		})
+	}
+}
+
 func TestParseConfig_NegativeMinimumSpeed(t *testing.T) {
 	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
 	setenv(t, "MINIMUM_SPEED", "-1")
@@ -431,6 +508,48 @@ func TestParseConfig_InvalidAllowDegradedBoot(t *testing.T) {
 	_, err := ParseConfig()
 	if err == nil {
 		t.Fatal("expected error for ALLOW_DEGRADED_BOOT=maybe, got nil")
+	}
+}
+
+func TestParseConfig_DegradedFallbackAndDirectExit(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	cfg, err := ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if !cfg.AllowDegradedFallback {
+		t.Error("default AllowDegradedFallback = false, want true")
+	}
+	if cfg.RejectDirectExit {
+		t.Error("default RejectDirectExit = true, want false (advisory)")
+	}
+
+	setenv(t, "ALLOW_DEGRADED_FALLBACK", "false")
+	setenv(t, "REJECT_DIRECT_EXIT", "true")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.AllowDegradedFallback {
+		t.Error("AllowDegradedFallback = true, want false")
+	}
+	if !cfg.RejectDirectExit {
+		t.Error("RejectDirectExit = false, want true")
+	}
+}
+
+func TestParseConfig_InvalidDegradedFallbackAndDirectExit(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ALLOW_DEGRADED_FALLBACK", "maybe")
+	if _, err := ParseConfig(); err == nil {
+		t.Error("expected error for ALLOW_DEGRADED_FALLBACK=maybe, got nil")
+	}
+
+	setenv(t, "ALLOW_DEGRADED_FALLBACK", "true")
+	setenv(t, "REJECT_DIRECT_EXIT", "maybe")
+	if _, err := ParseConfig(); err == nil {
+		t.Error("expected error for REJECT_DIRECT_EXIT=maybe, got nil")
 	}
 }
 

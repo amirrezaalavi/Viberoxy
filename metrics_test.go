@@ -261,6 +261,29 @@ func TestRefreshPoolMetrics(t *testing.T) {
 	}
 }
 
+// TestRefreshPoolMetricsTTFB covers both halves of the TTFB series: the
+// gauge must carry the measured value, and it must actually be REGISTERED —
+// a metric that is set but never registered renders nothing, which is how
+// the series was silently missing on the first deploy.
+func TestRefreshPoolMetricsTTFB(t *testing.T) {
+	isolateMetricSeries(t, metricWanTTFBMs, "0")
+
+	pool := NewWANPool(1, 10700)
+	pool.Slots[0].State = StateActive
+	pool.SetSlotTTFB(0, 2241)
+
+	refreshPoolMetrics(pool)
+	if v := metricWanTTFBMs.Value("0"); v != 2241 {
+		t.Errorf("wan_ttfb_ms[0] = %v, want 2241", v)
+	}
+
+	rec := httptest.NewRecorder()
+	NewObservabilityHandler(pool).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if body := rec.Body.String(); !strings.Contains(body, `viberoxy_wan_ttfb_ms{index="0"} 2241`) {
+		t.Errorf("ttfb gauge not rendered by /metrics:\n%s", body)
+	}
+}
+
 func TestMetricWanStability(t *testing.T) {
 	// Other tests write these series via SetSlotStability (pool state is
 	// per-test, but the gauge is process-global), so establish the "never

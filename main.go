@@ -193,10 +193,26 @@ func listenHost(cfg *proxycfg.Config) string {
 }
 
 func startup(cfg *proxycfg.Config, ctx context.Context) {
-	slog.Info("starting viberoxy...")
+	slog.Info("starting viberoxy...",
+		"wan_count", cfg.WanCount,
+		"download_bytes", cfg.DownloadSize,
+		"max_ttfb_ms", cfg.MaxTTFBMs,
+		"minimum_speed_mbps", cfg.MinimumSpeed,
+		"promote_passes", cfg.PromotePasses,
+		"degraded_fallback", cfg.AllowDegradedFallback,
+		"reject_direct_exit", cfg.RejectDirectExit)
 
 	pool := NewWANPool(cfg.WanCount, cfg.WanBasePort)
+	// ALLOW_DEGRADED_FALLBACK: with it off, a connection that has no
+	// routable WAN fails fast instead of being routed through a degraded
+	// (already failing) path.
+	pool.AllowDegradedFallback = cfg.AllowDegradedFallback
 	candidatePool = cands.NewPool(50)
+
+	// Non-leak evidence: remember this machine's own exit IP so a candidate
+	// that egresses with the same address can be reported (and, with
+	// REJECT_DIRECT_EXIT, rejected).
+	initDirectEgressCheck(cfg)
 
 	// F-13 port discipline: one shared allocator for every speed-test port
 	// (the cycle's tests and the drop/replace API draw from the same pool,
@@ -319,6 +335,10 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 		slog.Info("startup: testing configs...", "count", len(configs))
 		skippedUnsupported := map[string]bool{}
 		var tested int
+		// latencyFallback is the healthiest config the TTFB ceiling refused:
+		// kept only so an all-rejected batch cannot leave the proxy with no
+		// WAN at all (see the availability guard after the test loop).
+		var latencyFallback *TestResult
 		for _, c := range configs {
 			if pool.ActiveCount() >= cfg.WanCount {
 				break
@@ -343,7 +363,23 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			result := TestSpeedWithStability(c, testPort, time.Duration(cfg.TestTimeout)*time.Second, buildDownloadURL(cfg, cfg.DownloadSize), cfg.DownloadSize, cfg.StabilityProbes)
 			releaseTest()
 			tested++
-			if result.Error != nil || result.Speed < cfg.MinimumSpeed {
+			if !result.Qualifies(cfg.MinimumSpeed, cfg.MaxTTFB()) {
+				logRejection("startup", result, cfg)
+				// Track the best candidate rejected *only* by the latency
+				// ceiling: it is healthy enough to serve if nothing better
+				// exists at all.
+				if result.Error == nil && result.Speed >= cfg.MinimumSpeed &&
+					cfg.MaxTTFB() > 0 && result.TTFB > cfg.MaxTTFB() {
+					if latencyFallback == nil || result.TTFB < latencyFallback.TTFB {
+						latencyFallback = result
+					}
+				}
+				continue
+			}
+			// Non-leak check: a candidate that egresses with this machine's
+			// own address is not going through its tunnel (advisory unless
+			// REJECT_DIRECT_EXIT is on).
+			if checkDirectEgress("startup", result) {
 				continue
 			}
 			emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -360,8 +396,13 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 			}
 			pool.SetActive(slotIdx, cmd, path)
 			pool.SetSlotSpeedMbps(slotIdx, result.Speed)
+			pool.SetSlotTTFB(slotIdx, int(result.TTFB.Milliseconds()))
 			pool.SetSlotStability(slotIdx, result.StabilityScore)
-			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server, "speed", result.Speed, "stability", result.StabilityScore)
+			pool.SetSlotExitIP(slotIdx, result.ExitIP)
+			logDuplicateExitIP("startup", result, pool, slotIdx)
+			slog.Info("startup: wan active", "index", slotIdx, "server", c.Server,
+				"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(),
+				"exit_ip", result.ExitIP, "stability", result.StabilityScore)
 
 			// Degraded boot: serve traffic as soon as the first WAN is up,
 			// then keep filling slots until the full WAN_COUNT is reached.
@@ -373,6 +414,34 @@ func startup(cfg *proxycfg.Config, ctx context.Context) {
 
 		if pool.ActiveCount() >= cfg.WanCount {
 			break
+		}
+
+		// Availability guard: a ceiling that rejects every candidate must not
+		// leave the proxy with zero WANs. A slow-but-working path beats no
+		// path, so promote the fastest responder and say so loudly — the
+		// alternative is a service that never starts serving.
+		if pool.ActiveCount() == 0 && latencyFallback != nil {
+			if emptySlots := pool.GetSlotsByState(StateEmpty); len(emptySlots) > 0 {
+				slotIdx := emptySlots[0]
+				pool.StartTesting(slotIdx, latencyFallback.Config)
+				if cmd, p, err := StartXray(latencyFallback.Config, cfg.WanBasePort+slotIdx, cfg.XrayMux); err != nil {
+					slog.Error("startup: latency-fallback xray failed", "error", err)
+					pool.ResetEmpty(slotIdx)
+				} else {
+					pool.SetActive(slotIdx, cmd, p)
+					pool.SetSlotSpeedMbps(slotIdx, latencyFallback.Speed)
+					pool.SetSlotTTFB(slotIdx, int(latencyFallback.TTFB.Milliseconds()))
+					pool.SetSlotStability(slotIdx, latencyFallback.StabilityScore)
+					slog.Warn("startup: latency ceiling relaxed — no candidate cleared MAX_TTFB_MS, promoting the fastest responder",
+						"index", slotIdx, "server", latencyFallback.Config.Server,
+						"ttfb_ms", latencyFallback.TTFB.Milliseconds(), "max_ttfb_ms", cfg.MaxTTFBMs,
+						"speed", latencyFallback.Speed)
+					if cfg.AllowDegradedBoot && !proxyStarted && pool.ActiveCount() >= 1 {
+						startServices()
+						slog.Info("viberoxy started (degraded)", "wans", pool.ActiveCount(), "needed", cfg.WanCount)
+					}
+				}
+			}
 		}
 
 		// Preserve active slots across retries: only reset slots that are
@@ -630,6 +699,10 @@ func canaryProbe(socksAddr string, endpoints []string, timeout time.Duration) (b
 // candidate pool. The pool lives in internal/cands and cannot see main's
 // TestResult, so the value fields are copied here and Config stays shared
 // by pointer.
+// toCands converts tested results into candidate-pool entries. The pool is a
+// cache of everything tested — an entry here is a candidate, not yet an
+// approved WAN — so promotion bars are NOT applied here: the two install
+// paths (runCycle's promotion and DropAndReplace) each apply them.
 func toCands(results []*TestResult) []*cands.Entry {
 	entries := make([]*cands.Entry, len(results))
 	for i, r := range results {
@@ -726,7 +799,7 @@ var rotation = newRotator()
 // (speed bar, no server:port already active/draining, no exit IP already
 // served by an active path — unknown exit IPs skip that check); and
 // finally hysteresis (candidate >= (1+hysteresis) x incumbent).
-func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64, cooldown time.Duration) rotationDecision {
+func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64, maxTTFB time.Duration, cooldown time.Duration) rotationDecision {
 	r.mu.Lock()
 	nowFn, exitFn := r.now, r.exitIP
 	hyst, dwell := r.hysteresis, r.minDwell
@@ -789,14 +862,23 @@ func (r *rotator) decide(pool *WANPool, results []*TestResult, minSpeed float64,
 		ip := exitFn(c)
 		return ip != "" && activeExit[ip] // exit-IP duplicate
 	}
-	cand := bestNewCandidate(results, minSpeed, blocked)
+	cand := bestNewCandidate(results, minSpeed, maxTTFB, blocked)
 	if cand == nil {
-		return rotationDecision{Victim: -1, Reason: "no candidate cleared the speed bar, wan dedupe and exit-ip dedupe"}
+		return rotationDecision{Victim: -1, Reason: "no candidate cleared the speed bar, ttfb ceiling, wan dedupe and exit-ip dedupe"}
 	}
 
-	// Hysteresis: only a clear win rotates an incumbent.
+	// Hysteresis: only a clear win rotates an incumbent. The objective is
+	// latency, so when both sides expose a TTFB the candidate must be at
+	// least `hysteresis` lower; the speed rule remains the fallback for
+	// incumbents promoted before the TTFB measurement existed.
 	incumbent := pool.SlotSpeedMbps(victim)
-	if cand.Speed < (1+hyst)*incumbent {
+	if incumbentTTFB := pool.SlotTTFBMs(victim); incumbentTTFB > 0 && cand.TTFB > 0 {
+		if float64(cand.TTFB.Milliseconds()) > (1-hyst)*float64(incumbentTTFB) {
+			return rotationDecision{Victim: -1, Reason: fmt.Sprintf(
+				"hysteresis: candidate ttfb %dms > %.0fms (1-%.2f) x incumbent %dms",
+				cand.TTFB.Milliseconds(), (1-hyst)*float64(incumbentTTFB), hyst, incumbentTTFB)}
+		}
+	} else if cand.Speed < (1+hyst)*incumbent {
 		return rotationDecision{Victim: -1, Reason: fmt.Sprintf(
 			"hysteresis: candidate %.2f < %.2f (1+%.2f) x incumbent %.2f",
 			cand.Speed, (1+hyst)*incumbent, hyst, incumbent)}
@@ -830,7 +912,7 @@ func swapResultOf(reason string) string {
 // stamps lastSwap to start the cooldown. Returns true iff a swap cut
 // over. Every verdict increments viberoxy_swap_total{result} (SPEC-M).
 func (r *rotator) maybeSwap(pool *WANPool, cfg *proxycfg.Config, results []*TestResult) bool {
-	d := r.decide(pool, results, cfg.MinimumSpeed, time.Duration(cfg.FetchInterval)*time.Second)
+	d := r.decide(pool, results, cfg.MinimumSpeed, cfg.MaxTTFB(), time.Duration(cfg.FetchInterval)*time.Second)
 	if d.Victim < 0 {
 		metricSwapTotal.Inc(swapResultOf(d.Reason))
 		slog.Info("cycle: rotation skipped", "reason", d.Reason)
@@ -852,6 +934,8 @@ func (r *rotator) maybeSwap(pool *WANPool, cfg *proxycfg.Config, results []*Test
 		DownloadSize:    cfg.DownloadSize,
 		StabilityProbes: cfg.StabilityProbes,
 		XrayMux:         cfg.XrayMux,
+		MinSpeed:        cfg.MinimumSpeed,
+		MaxTTFB:         cfg.MaxTTFB(),
 		TestPorts:       pool.TestPorts(),
 		SparePorts:      pool.SparePorts(),
 	}
@@ -897,6 +981,53 @@ func reapCompletedDrains(pool *WANPool, drainMax time.Duration) []int {
 // (default 600s): the hard-stop age at which a draining slot is reaped
 // even with in-flight connections; normally the drain completes earlier
 // (inflight == 0) — see WANPool.DrainExpired.
+// logDuplicateExitIP warns when a freshly promoted WAN egresses from an IP an
+// existing active WAN already uses. It is advisory on purpose: refusing the
+// candidate would leave a slot empty, and an empty slot serves nothing. The
+// rotation gates already prefer a distinct exit IP when swapping.
+func logDuplicateExitIP(stage string, r *TestResult, pool *WANPool, slotIdx int) {
+	if r == nil || r.ExitIP == "" {
+		return
+	}
+	// The new slot's own IP was just recorded, so count > 1 means a duplicate.
+	dupes := 0
+	for i := range pool.Slots {
+		if pool.Slots[i].State == StateActive && pool.SlotExitIP(i) == r.ExitIP {
+			dupes++
+		}
+	}
+	if dupes > 1 {
+		slog.Warn("wan egresses from an exit IP another WAN already uses",
+			"stage", stage, "index", slotIdx, "exit_ip", r.ExitIP,
+			"active_with_same_ip", dupes)
+	}
+}
+
+// logRejection records why a tested config was not promoted. The TTFB
+// rejection is the one that is easy to misread as "nothing works": the
+// config downloads faster than MINIMUM_SPEED yet is still refused because it
+// is too slow to answer, so it is logged rather than silently dropped.
+func logRejection(stage string, r *TestResult, cfg *proxycfg.Config) {
+	if r == nil {
+		return
+	}
+	server := ""
+	if r.Config != nil {
+		server = r.Config.Server
+	}
+	switch {
+	case r.Error != nil:
+		slog.Debug("candidate rejected", "stage", stage, "server", server, "reason", r.Error.Error())
+	case r.Speed < cfg.MinimumSpeed:
+		slog.Info("candidate rejected", "stage", stage, "server", server,
+			"reason", fmt.Sprintf("speed %.2f Mbps < MINIMUM_SPEED %.2f", r.Speed, cfg.MinimumSpeed))
+	default:
+		slog.Info("candidate rejected", "stage", stage, "server", server,
+			"reason", fmt.Sprintf("ttfb %dms > MAX_TTFB_MS=%d", r.TTFB.Milliseconds(), cfg.MaxTTFBMs),
+			"speed", r.Speed)
+	}
+}
+
 func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, drainMax time.Duration) {
 	markCycleStarted(time.Now())
 	defer func() {
@@ -988,7 +1119,12 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		results = append(results, result)
 
 		// Fill empty slots immediately as soon as a config passes.
-		if result.Error != nil || result.Speed < cfg.MinimumSpeed {
+		if !result.Qualifies(cfg.MinimumSpeed, cfg.MaxTTFB()) {
+			logRejection("cycle", result, cfg)
+			continue
+		}
+		// Non-leak check (advisory unless REJECT_DIRECT_EXIT is on).
+		if checkDirectEgress("cycle", result) {
 			continue
 		}
 		emptySlots := pool.GetSlotsByState(StateEmpty)
@@ -1009,8 +1145,13 @@ func runCycle(cfg *proxycfg.Config, pool *WANPool, candidatePool *cands.Pool, dr
 		}
 		pool.SetActive(slotIdx, cmd, path)
 		pool.SetSlotSpeedMbps(slotIdx, result.Speed)
+		pool.SetSlotTTFB(slotIdx, int(result.TTFB.Milliseconds()))
 		pool.SetSlotStability(slotIdx, result.StabilityScore)
-		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server, "speed", result.Speed, "stability", result.StabilityScore)
+		pool.SetSlotExitIP(slotIdx, result.ExitIP)
+		logDuplicateExitIP("cycle", result, pool, slotIdx)
+		slog.Info("cycle: filled empty slot", "index", slotIdx, "server", result.Config.Server,
+			"speed", result.Speed, "ttfb_ms", result.TTFB.Milliseconds(),
+			"exit_ip", result.ExitIP, "stability", result.StabilityScore)
 	}
 
 	writeSortedTxt(results)
@@ -1042,6 +1183,8 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+
+	promotePasses = cfg.PromotePasses
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

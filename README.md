@@ -71,16 +71,20 @@ All configuration is environment-variable driven; invalid values hard-exit at st
 | `ALLOW_HTTP_SUBSCRIPTION` | No | `false` | Opt in to a plain `http://` subscription (startup refuses it otherwise) |
 | `FETCH_INTERVAL` | No | `300` | Seconds between fetch+test cycles (min 30). Also the rotation cooldown |
 | `TEST_TIMEOUT` | No | `10` | Seconds per speed test (min 3) |
-| `DOWNLOAD_SIZE` | No | `10000000` | Bytes for the speed-test payload (min 1000000) |
+| `DOWNLOAD_SIZE` | No | `1000000` | Bytes for the speed-test payload (min 1000000). Every candidate is measured, so the payload is the bandwidth the tests cost: 1 MB per candidate by default. Raise it for a steadier throughput number on very fast links |
 | `DOWNLOAD_ENDPOINT` | No | `https://speed.cloudflare.com/__down?bytes=` | Primary speed-test URL (empty disables it) |
 | `DOWNLOAD_FALLBACK` | No | `https://proof.ovh.net/files/` | Fallback speed-test URL |
 | `WAN_COUNT` | No | `4` | Max concurrent WANs (1–5) |
 | `WAN_BASE_PORT` | No | `10700` | First xray service port (slots use `WAN_BASE_PORT + slot`) |
 | `TEST_BASE_PORT` | No | `10800` | First speed-test port (shared allocator range) |
-| `MINIMUM_SPEED` | No | `5.0` | Mbps threshold — configs below it are never promoted; incumbents above it are never rotated out |
+| `MINIMUM_SPEED` | No | `5.0` | Mbps **floor** — configs below it are never promoted; incumbents above it are never rotated out |
+| `PROMOTE_PASSES` | No | `2` (1–5) | Independent end-to-end passes required before a config is promoted: the measured download plus `n-1` cheap 2xx GETs through the same temp xray, so a link that only sometimes answers is never served. `1` restores single-sample behavior |
+| `MAX_TTFB_MS` | No | `2500` | Time-to-first-byte ceiling (ms) measured on the speed-test request. Faster-downloading configs over the ceiling are still refused; `0` disables the ceiling. Ranking is latency-first: the candidate with the lowest TTFB that clears `MINIMUM_SPEED` wins |
 | `MAX_TEST_PER_CYCLE` | No | `20` | Max configs speed-tested per cycle while the pool has room (1–500). When the pool is **full**, up to 2 NEW candidates are still evaluated per cycle |
 | `ACCESS_LOG` | No | `true` | One structured log line per proxied connection |
 | `ALLOW_DEGRADED_BOOT` | No | `true` | Start the front-ends as soon as the first WAN is active (vs waiting for a full pool) |
+| `ALLOW_DEGRADED_FALLBACK` | No | `true` | What selection does when **no** routable WAN is left: `true` serves the connection through a degraded (already failing) path or a draining slot and counts it in `viberoxy_selection_last_resort_total`; `false` fails the connection fast (502/503) instead |
+| `REJECT_DIRECT_EXIT` | No | `false` | Reject a candidate whose observed exit IP is this machine's own address. Advisory by default — the same address is also what a self-hosted candidate behind the same public address looks like |
 | `DRAIN_MAX` | No | `600` | Seconds: hard stop for a drain. Normally a drain ends earlier, when in-flight flows finish (`inflight == 0`) |
 
 ### Listeners, auth and security
@@ -297,6 +301,8 @@ ROUTE_MODE=direct-default PROXY_DOMAINS=".google.com,.youtube.com,.instagram.com
 - **Unix only** (Linux/macOS). Windows is untested (process liveness/stop is not build-tagged per OS).
 - **No proxy authentication by default** — set `PROXY_USERS` (the loopback default bind is the baseline protection).
 - Session affinity (HRW per `(client, site)`) and the P2C scheduler **are implemented**; the site key is an embedded eTLD+1 heuristic (not a full public-suffix list), client identity is the SOCKS/CONNECT username when `PROXY_USERS` is set (else client IP — NAT caveat), and a sticky pick carrying >3x the median load spills back to P2C.
+- **A WAN that blocks one destination is not detected.** The canaries only probe the health endpoints, so a tunnel that answers `generate_204` but blocks (say) a video domain stays in the pool. There is no per-destination rescue: the connection is served by the WAN the scheduler picked (and session affinity can keep it there for the session), and no second attempt is made on a different WAN. Exit-IP diversity limits how often two "independent" WANs are actually the same upstream, but it cannot detect a domain-level block.
+- **Running on a domain network without authentication:** set `LISTEN_ADDR` to the address the service should listen on and `ALLOW_PUBLIC=true` (a non-loopback bind is otherwise refused at startup unless `PROXY_USERS`/`API_TOKEN` is set). The control API and `/metrics` are then reachable from the network **without a token** — that is the operator's choice, not a default.
 
 ---
 

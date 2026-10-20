@@ -75,6 +75,11 @@ type WANSlot struct {
 	// install one, vacant when the slot is empty.
 	Current   *atomic.Pointer[path.Path]
 	SpeedMbps float64
+	// TTFBMs is the time-to-first-byte (ms) measured on the speed test
+	// that promoted this occupant. It is the latency the promotion and
+	// rotation gates use; 0 = unknown (tests that failed before the first
+	// response byte, or a slot filled before the gate existed).
+	TTFBMs int
 	// StabilityScore ranks upstream exit churn (distinct exit IPs minus
 	// 1; 0 = stable or never probed). Used for replacement preference
 	// only — a churny slot is never rejected on this alone.
@@ -106,6 +111,15 @@ type WANSlot struct {
 type WANPool struct {
 	Slots    []*WANSlot
 	BasePort int
+
+	// AllowDegradedFallback decides what selection does when no routable
+	// WAN is left: with it enabled (the default) the connection is served
+	// by a degraded path or by a draining slot — availability first, the
+	// event counted in viberoxy_selection_last_resort_total — and with it
+	// disabled the connection fails fast instead of being routed through a
+	// path that is already known to be failing. Wired once at startup from
+	// ALLOW_DEGRADED_FALLBACK.
+	AllowDegradedFallback bool
 
 	// replaceMu serializes the two short critical sections of a make-
 	// before-break replacement — the candidate pick and the Swap cutover —
@@ -181,6 +195,13 @@ type DropAndReplaceOptions struct {
 	XrayMux         bool
 	TestCandidate   ReplacementTester
 	StartCandidate  ReplacementStarter
+	// MinSpeed and MaxTTFB are the promotion bars the replacement must also
+	// clear. DropAndReplace re-tests its candidate, so without this an
+	// operator-triggered drop could install a WAN that runCycle would have
+	// refused (below the speed floor, or too slow to answer). Zero values
+	// disable the respective bar (legacy callers / tests).
+	MinSpeed float64
+	MaxTTFB  time.Duration
 	// TestPorts is the shared speed-test port budget (F-13): when wired,
 	// each candidate test checks a port out of it and returns it when the
 	// test ends, so a cycle test and an API-triggered replacement test can
@@ -210,7 +231,7 @@ func NewWANPool(count int, basePort int) *WANPool {
 		slot.Current.Store(path.NewVacant(i, basePort+i))
 		slots[i] = slot
 	}
-	return &WANPool{Slots: slots, BasePort: basePort}
+	return &WANPool{Slots: slots, BasePort: basePort, AllowDegradedFallback: true}
 }
 
 // DropAndReplace replaces the config serving a WAN slot make-before-break
@@ -307,6 +328,22 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 		}
 		return nil, ErrReplacementTestFailed
 	}
+	// Apply the same promotion bars runCycle uses. A rejection here leaves the
+	// slot untouched; the caller can queue a regular cycle instead.
+	if !result.Qualifies(opts.MinSpeed, opts.MaxTTFB) {
+		reason := fmt.Sprintf("speed %.2f Mbps", result.Speed)
+		if opts.MaxTTFB > 0 && result.TTFB > opts.MaxTTFB {
+			reason = fmt.Sprintf("ttfb %dms > %dms", result.TTFB.Milliseconds(), opts.MaxTTFB.Milliseconds())
+		}
+		return nil, fmt.Errorf("%w: candidate rejected (%s)", ErrNoReplacementCandidate, reason)
+	}
+	// Non-leak check on the re-tested candidate (advisory unless
+	// REJECT_DIRECT_EXIT is on): the candidate must not egress with this
+	// machine's own address.
+	if checkDirectEgress("replace", result) {
+		return nil, fmt.Errorf("%w: candidate rejected (exit ip %s is this machine's own address)",
+			ErrNoReplacementCandidate, result.ExitIP)
+	}
 
 	// Start the replacement. An occupied slot starts on a SPARE service
 	// port so the old process keeps listening on its own port until the
@@ -365,6 +402,7 @@ func (p *WANPool) DropAndReplace(index int, opts DropAndReplaceOptions) (*TestRe
 	}
 
 	p.SetSlotSpeedMbps(index, result.Speed)
+	p.SetSlotTTFB(index, int(result.TTFB.Milliseconds()))
 	p.SetSlotStability(index, result.StabilityScore)
 	return result, nil
 }
@@ -418,6 +456,7 @@ func (p *WANPool) Swap(index int, expected, newPath *path.Path, configPath strin
 	slot.ServicePort = newPath.Port
 	slot.releasePort = releasePort
 	slot.SpeedMbps = 0
+	slot.TTFBMs = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
 	slot.drainReason = DrainReplace
@@ -572,6 +611,7 @@ func (p *WANPool) ResetEmpty(index int) error {
 	slot.Cmd = nil
 	slot.ConfigPath = ""
 	slot.SpeedMbps = 0
+	slot.TTFBMs = 0
 	slot.StabilityScore = 0
 	slot.DrainAt = time.Time{}
 	slot.drainReason = DrainReplace
@@ -723,6 +763,72 @@ func (p *WANPool) SlotSpeedMbps(index int) float64 {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 	return slot.SpeedMbps
+}
+
+// SlotTTFBMs returns the last measured time-to-first-byte (ms) for a slot
+// (0 = unknown).
+func (p *WANPool) SlotTTFBMs(index int) int {
+	if index < 0 || index >= len(p.Slots) {
+		return 0
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.TTFBMs
+}
+
+// SetSlotTTFB records the measured time-to-first-byte (ms) for a slot and
+// exposes it as the viberoxy_wan_ttfb_ms gauge.
+func (p *WANPool) SetSlotTTFB(index, ttfbMs int) {
+	if index < 0 || index >= len(p.Slots) {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	slot.TTFBMs = ttfbMs
+	slot.mu.Unlock()
+}
+
+// SetSlotExitIP records the exit IP observed when the slot was promoted (the
+// canary loop refreshes it later). Empty values are ignored.
+func (p *WANPool) SetSlotExitIP(index int, ip string) {
+	if index < 0 || index >= len(p.Slots) || ip == "" {
+		return
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	slot.ExitIP = ip
+	slot.mu.Unlock()
+}
+
+// SlotExitIP returns the last known exit IP for a slot ("" = unknown).
+func (p *WANPool) SlotExitIP(index int) string {
+	if index < 0 || index >= len(p.Slots) {
+		return ""
+	}
+	slot := p.Slots[index]
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.ExitIP
+}
+
+// HasExitIP reports whether any ACTIVE slot already egresses from ip. Used to
+// flag duplicate-egress WANs: they fail together and change the client-visible
+// IP least, but an empty slot is still worth more than diversity, so this is
+// advisory (logged) rather than a rejection.
+func (p *WANPool) HasExitIP(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	for _, slot := range p.Slots {
+		slot.mu.Lock()
+		state, slotIP := slot.State, slot.ExitIP
+		slot.mu.Unlock()
+		if state == StateActive && slotIP == ip {
+			return true
+		}
+	}
+	return false
 }
 
 // SetSlotSpeedMbps records the measured speed for a slot.
@@ -968,8 +1074,18 @@ type SelectOptions struct {
 // returned release must be called exactly once by the winner's owner;
 // (nil, nil) means no candidate at all, which callers map to their
 // historical no-candidate semantics (503 / REP 0x01).
+//
+// With ALLOW_DEGRADED_FALLBACK=false the degraded and last-resort tiers are
+// dropped: a connection that has no routable WAN fails fast (502/503)
+// instead of being routed through a path that is already known to be
+// failing. The routable tier is untouched — this only changes what happens
+// when it is EMPTY.
 func (p *WANPool) Select(opts SelectOptions) (*path.Path, func()) {
 	routable, degraded, lastResort := p.eligibleTries(opts.Tried, opts.Threshold, true)
+	if !p.AllowDegradedFallback {
+		degraded = nil
+		lastResort = nil
+	}
 	siteKey := ""
 	if opts.ClientID != "" && affinity.Sticky(opts.Hostport) {
 		siteKey = affinity.SiteKey(opts.Hostport)

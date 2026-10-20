@@ -7,29 +7,50 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"viberoxy/internal/auth"
 )
 
 type Config struct {
-	SubscriberURL     string
-	FetchInterval     int
-	TestTimeout       int
-	DownloadSize      int64
-	DownloadEndpoint  string
-	DownloadFallback  string
-	WanCount          int
-	WanBasePort       int
-	TestBasePort      int
-	ProxyPort         int
-	SocksPort         int
-	MetricsPort       int
-	MinimumSpeed      float64
+	SubscriberURL    string
+	FetchInterval    int
+	TestTimeout      int
+	DownloadSize     int64
+	DownloadEndpoint string
+	DownloadFallback string
+	WanCount         int
+	WanBasePort      int
+	TestBasePort     int
+	ProxyPort        int
+	SocksPort        int
+	MetricsPort      int
+	MinimumSpeed     float64
+	// MaxTTFBMs is the promotion ceiling on time-to-first-byte, in
+	// milliseconds (MAX_TTFB_MS). A candidate whose measured TTFB exceeds
+	// it is rejected however fast it downloads; 0 disables the ceiling.
+	MaxTTFBMs int
+	// PromotePasses is how many independent end-to-end passes a config must
+	// complete before it may be promoted (PROMOTE_PASSES). 1 keeps the
+	// historical single-sample behavior; 2 adds one confirmation GET through
+	// the same temp xray, which is also where the exit IP is observed.
+	PromotePasses     int
 	MaxTestPerCycle   int
 	KeepaliveInterval int
 	WanFailThreshold  int
 	StabilityProbes   int
 	AccessLog         bool
 	AllowDegradedBoot bool
+	// AllowDegradedFallback controls the runtime last-resort tiers: when
+	// no routable WAN is left, selection may fall back to a degraded
+	// (over-threshold) active path or a draining slot. true (default)
+	// keeps the availability-first behavior; false fails the connection
+	// fast instead of routing it through a known-degraded path.
+	AllowDegradedFallback bool
+	// RejectDirectExit rejects a candidate whose observed exit IP is this
+	// machine's own address (REJECT_DIRECT_EXIT). Advisory by default: the
+	// same address is also what a self-hosted candidate behind the same
+	// public address looks like.
+	RejectDirectExit bool
 	// AllowHTTPSubscription opts in to plain http:// SUBSCRIBER_URL values
 	// (ALLOW_HTTP_SUBSCRIPTION). https-only by default; false unless the
 	// env var explicitly says otherwise.
@@ -64,6 +85,15 @@ func (c *Config) MaxTestPerCycleVal() int {
 		return c.MaxTestPerCycle
 	}
 	return 20
+}
+
+// MaxTTFB returns the configured promotion ceiling on time-to-first-byte as
+// a duration; 0 means the ceiling is disabled.
+func (c *Config) MaxTTFB() time.Duration {
+	if c == nil || c.MaxTTFBMs <= 0 {
+		return 0
+	}
+	return time.Duration(c.MaxTTFBMs) * time.Millisecond
 }
 
 func ParseConfig() (*Config, error) {
@@ -118,7 +148,12 @@ func ParseConfig() (*Config, error) {
 		cfg.TestTimeout = n
 	}
 
-	cfg.DownloadSize = 10000000
+	// DOWNLOAD_SIZE: bytes moved by ONE speed test. The default is 1 MB:
+	// EVERY candidate is measured, and a 10 MB payload per candidate costs
+	// ten times the bandwidth for a speed number a 1 MB sample already
+	// gives. Raise it when a steadier throughput number matters more than
+	// the bandwidth (a 1 MB sample is noisier on very fast links).
+	cfg.DownloadSize = 1_000_000
 	if v := os.Getenv("DOWNLOAD_SIZE"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
@@ -226,6 +261,41 @@ func ParseConfig() (*Config, error) {
 		cfg.MinimumSpeed = n
 	}
 
+	// MAX_TTFB_MS: promotion ceiling on time-to-first-byte, in
+	// milliseconds, measured on the speed-test request itself (dial + TLS
+	// + first response byte). A candidate over the ceiling is rejected no
+	// matter how fast it downloads: MINIMUM_SPEED alone happily promotes a
+	// high-bandwidth/high-latency node, which is what makes browsing feel
+	// broken. 0 disables the ceiling (historical behavior).
+	cfg.MaxTTFBMs = 2500
+	if v := os.Getenv("MAX_TTFB_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be a valid integer", v)
+		}
+		if n < 0 || n > 60000 {
+			return nil, fmt.Errorf("error: MAX_TTFB_MS=%q: must be between 0 and 60000", v)
+		}
+		cfg.MaxTTFBMs = n
+	}
+
+	// PROMOTE_PASSES: independent end-to-end passes required before a config
+	// is promoted. The first pass is the measured download; each extra pass
+	// is a lightweight 2xx GET through the same temp xray (the first of them
+	// doubles as the exit-IP observation). One sample is not evidence: the
+	// live box served links that failed one of three later checks.
+	cfg.PromotePasses = 2
+	if v := os.Getenv("PROMOTE_PASSES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: PROMOTE_PASSES=%q: must be a valid integer", v)
+		}
+		if n < 1 || n > 5 {
+			return nil, fmt.Errorf("error: PROMOTE_PASSES=%q: must be between 1 and 5", v)
+		}
+		cfg.PromotePasses = n
+	}
+
 	cfg.MaxTestPerCycle = 20
 	if v := os.Getenv("MAX_TEST_PER_CYCLE"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -317,6 +387,36 @@ func ParseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: ALLOW_DEGRADED_BOOT=%q: must be a boolean (true/false)", v)
 		}
 		cfg.AllowDegradedBoot = b
+	}
+
+	// ALLOW_DEGRADED_FALLBACK: what selection does when NO routable WAN is
+	// left. true (default) keeps the availability-first behavior: the
+	// connection is served by a degraded path (over the fail threshold) or,
+	// failing that, by a draining slot, and the event is counted in
+	// viberoxy_selection_last_resort_total. false fails the connection fast
+	// (502/503) instead of routing it through a path that is already known
+	// to be failing.
+	cfg.AllowDegradedFallback = true
+	if v := os.Getenv("ALLOW_DEGRADED_FALLBACK"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: ALLOW_DEGRADED_FALLBACK=%q: must be a boolean (true/false)", v)
+		}
+		cfg.AllowDegradedFallback = b
+	}
+
+	// REJECT_DIRECT_EXIT: a candidate whose observed exit IP is this
+	// machine's own address is reported at promotion; with this enabled it
+	// is rejected instead. Advisory by default — the same address is also
+	// what a self-hosted candidate behind the same public address looks
+	// like.
+	cfg.RejectDirectExit = false
+	if v := os.Getenv("REJECT_DIRECT_EXIT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: REJECT_DIRECT_EXIT=%q: must be a boolean (true/false)", v)
+		}
+		cfg.RejectDirectExit = b
 	}
 
 	// Split routing: ROUTE_MODE picks the policy, DIRECT_DOMAINS /
