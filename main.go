@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -597,22 +598,50 @@ func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
 		return
 	}
 	results := make([]health.PathCanary, 0, len(slots))
+	dead := make(map[int]bool) // slots whose LOCAL tunnel is gone
 	for _, idx := range slots {
 		slot := pool.Slots[idx]
 		slot.mu.Lock()
 		port := slot.ServicePort
 		slot.mu.Unlock()
 		socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
-		ok, rtt := canaryProbe(socksAddr, endpoints, timeout)
+		ok, rtt, gone := canaryProbeDetailed(socksAddr, endpoints, timeout)
+		if gone {
+			dead[idx] = true
+		}
 		results = append(results, health.PathCanary{Index: idx, OK: ok, RTT: rtt})
 	}
 
-	degraded, failing := health.ApplyCanary(results)
+	// A dead tunnel is a LOCAL failure: it must never be classified as an
+	// environmental outage (that would keep the dead slot serving and
+	// record nothing), and it must trigger a refill instead of waiting for
+	// the next fetch interval.
+	if len(dead) > 0 {
+		handleDeadTunnels(pool, cfg, dead)
+	}
+
+	// The environmental breaker only judges the paths whose tunnel is
+	// actually up: a dead process says nothing about the endpoints.
+	live := results[:0:0]
+	for _, r := range results {
+		if !dead[r.Index] {
+			live = append(live, r)
+		}
+	}
+	if len(live) == 0 {
+		// Every path is dead locally — there is nothing to blame on the
+		// environment, and the refill above is the response.
+		health.SetEnvDegraded(false)
+		metricEnvDegraded.Set(0)
+		return
+	}
+
+	degraded, failing := health.ApplyCanary(live)
 	health.SetEnvDegraded(degraded)
 	metricEnvDegraded.Set(bool01(degraded)) // SPEC-M: stamped at event time too
 	if degraded {
 		slog.Warn("env_degraded: canary endpoints failing on most paths; keeping everything serving",
-			"paths", len(results), "interval", "environmental")
+			"paths", len(live), "interval", "environmental")
 		return
 	}
 
@@ -628,6 +657,13 @@ func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
 		socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
 		cur := pool.Slots[idx].Current.Load()
 		r := results[i]
+
+		if dead[idx] {
+			// Already handled as a local failure: the slot must not be
+			// counted as a success (that would un-drain it) and must not
+			// be judged against the endpoints.
+			continue
+		}
 
 		if !failingSet[idx] {
 			pool.RecordSuccess(idx)
@@ -669,15 +705,76 @@ func runCanaries(cfg *proxycfg.Config, pool *WANPool, endpoints []string) {
 	}
 }
 
+// handleDeadTunnels reacts to WAN slots whose LOCAL tunnel is gone (the
+// xray process is not running): the slot is failed and drained, and a cycle
+// is queued so the pool refills NOW instead of at the next fetch interval.
+//
+// Without this, a killed xray left the slot "active" with a dead process:
+// the canary saw every endpoint failing, concluded the ENVIRONMENT was
+// broken, recorded nothing, and kept handing the dead path to clients —
+// with a 12h fetch interval that is a 12h outage.
+func handleDeadTunnels(pool *WANPool, cfg *proxycfg.Config, dead map[int]bool) {
+	now := time.Now()
+	for idx := range dead {
+		pool.RecordFailure(idx)
+		cur := pool.Slots[idx].Current.Load()
+		if cur != nil {
+			cur.NoteCanary(now, false)
+		}
+		fails := pool.SlotConsecutiveFails(idx)
+		slog.Warn("canary: local tunnel is gone (process not running)", "index", idx, "fails", fails)
+		if pool.GetState(idx) == StateActive {
+			if err := pool.MarkDrainingHealth(idx); err != nil {
+				slog.Warn("canary: failed to mark draining", "index", idx, "error", err)
+			} else {
+				slog.Warn("canary: wan tunnel gone, marked draining", "index", idx)
+			}
+		}
+	}
+
+	// Queue a refill. The channel is buffered with capacity 1 and the send
+	// is non-blocking: a pending trigger already covers this case.
+	routable := pool.RoutableCount(cfg.WanFailThreshold)
+	if routable == 0 || len(dead) > 0 {
+		select {
+		case triggerCycle <- struct{}{}:
+			slog.Warn("canary: queued a cycle to refill the pool", "routable", routable, "dead", len(dead))
+		default:
+		}
+	}
+}
+
 // canaryProbe GETs each health endpoint through socksAddr and reports
 // whether ANY endpoint succeeded (a path's canary fails only if ALL fail)
 // plus the round-trip time of the first successful endpoint. Non-2xx/3xx
 // statuses count as endpoint failures.
 func canaryProbe(socksAddr string, endpoints []string, timeout time.Duration) (bool, time.Duration) {
+	ok, rtt, _ := canaryProbeDetailed(socksAddr, endpoints, timeout)
+	return ok, rtt
+}
+
+// canaryProbeDetailed probes the health endpoints through a WAN's own SOCKS
+// listener and classifies the outcome:
+//
+//   - ok: an endpoint answered.
+//   - dead: the LOCAL tunnel is gone — the SOCKS port refused the
+//     connection, i.e. the xray process behind this slot is not running
+//     (killed, crashed, or reaped). This is a LOCAL failure, never an
+//     environmental one: the endpoints may be perfectly reachable.
+//   - failed: the tunnel is up but every endpoint failed through it.
+//
+// The distinction matters: with all slots dead, the old code saw "every
+// path failed" and concluded the ENVIRONMENT was broken, so it recorded
+// nothing, kept the dead slots serving and waited for the next cycle — with
+// a 12h fetch interval that is a 12h outage.
+func canaryProbeDetailed(socksAddr string, endpoints []string, timeout time.Duration) (ok bool, rtt time.Duration, dead bool) {
 	for _, ep := range endpoints {
 		start := time.Now()
 		resp, conn, err := probeRoundTrip(socksAddr, ep, timeout)
 		if err != nil {
+			if isTunnelGone(err) {
+				return false, 0, true
+			}
 			continue
 		}
 		rtt := time.Since(start)
@@ -690,9 +787,18 @@ func canaryProbe(socksAddr string, endpoints []string, timeout time.Duration) (b
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		conn.Close()
-		return true, rtt
+		return true, rtt, false
 	}
-	return false, 0
+	return false, 0, false
+}
+
+// isTunnelGone reports whether err means "the local SOCKS listener is not
+// there" (the xray process is gone) rather than "the endpoint failed".
+func isTunnelGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT)
 }
 
 // toCands converts speed-test results into cands.Entry values for the

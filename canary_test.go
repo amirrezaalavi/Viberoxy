@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os/exec"
 	"testing"
 	"time"
@@ -36,11 +37,16 @@ func TestCanaryBaseInterval_MapsKeepaliveKnob(t *testing.T) {
 
 // TestRunCanaries_EnvironmentalFailureDrainsNothing is the production
 // wiring of T-HLT-03/T-CHAOS-05: when every path fails every canary
-// endpoint in the same interval (here: every path's SOCKS listener is
-// dead), the >=75% breaker declares an environmental failure and
-// runCanaries must record NOTHING — no failure counters, no MarkDraining,
-// no ejection — while the env_degraded gauge is set and the pool keeps
-// serving from its (unchanged) selection state.
+// endpoint in the same interval, the >=75% breaker declares an
+// environmental failure and runCanaries must record NOTHING — no failure
+// counters, no MarkDraining, no ejection — while the env_degraded gauge is
+// set and the pool keeps serving from its (unchanged) selection state.
+//
+// The simulated failure is a SOCKS listener that ACCEPTS and then closes:
+// the tunnel is up, the endpoint never answers. A listener that is simply
+// GONE (connection refused) is a different case — a dead local process —
+// and is handled by handleDeadTunnels, not by the environmental breaker
+// (see TestRunCanariesDeadTunnelIsNotEnvironmental).
 func TestRunCanaries_EnvironmentalFailureDrainsNothing(t *testing.T) {
 	t.Setenv("HEALTH_ENDPOINTS", "") // built-in defaults; the SOCKS dials below never leave loopback
 
@@ -49,9 +55,10 @@ func TestRunCanaries_EnvironmentalFailureDrainsNothing(t *testing.T) {
 		if err := pool.StartTesting(i, &proxycfg.ProxyConfig{Raw: "x", Server: "1.2.3.4", Port: 1}); err != nil {
 			t.Fatal(err)
 		}
-		// Non-nil handle so the slot is a real occupant; the service
-		// port is 0/1, so every canary dial fails instantly on loopback
-		// without touching the network.
+		// Non-nil handle so the slot is a real occupant. The service
+		// port points at a listener that accepts and closes: the dial
+		// succeeds, the tunnel never carries a request.
+		pool.Slots[i].ServicePort = acceptingThenClosingPort(t)
 		if err := pool.SetActive(i, xrayproc.Wrap(&exec.Cmd{}, ""), ""); err != nil {
 			t.Fatal(err)
 		}
@@ -76,4 +83,26 @@ func TestRunCanaries_EnvironmentalFailureDrainsNothing(t *testing.T) {
 			t.Errorf("slot %d path ejected during an environmental failure", i)
 		}
 	}
+}
+
+// acceptingThenClosingPort starts a listener that accepts connections and
+// closes them immediately: the SOCKS handshake never completes, but the
+// connection is NOT refused — the local process is alive.
+func acceptingThenClosingPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
 }

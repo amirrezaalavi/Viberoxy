@@ -196,6 +196,7 @@ Dial-stage retries (`internal/retry`): up to 3 attempts per connection inside a 
 - **Window:** last 60 s / 30 outcomes. Ejection on ≥ 3 consecutive hard failures across ≥ 3 distinct destination hosts, **or** ≥ 8 outcomes with ≥ 50 % failure ratio. An ejected path becomes `suspect` (not selected).
 - **Backoff:** `30 s × 2^ejectCount`, capped at 10 min; decays one step per 10 min of continuous health.
 - **Canaries:** every 15–30 s ± 20 % jitter, through each path's SOCKS listener; a path fails only if *all* endpoints fail; half-open re-admission after 2 consecutive successes.
+- **A dead tunnel is a local failure, not an environmental one:** when a WAN's SOCKS listener refuses the connection (its xray process is gone), the slot is failed and drained and a cycle is queued immediately — the pool refills in seconds instead of waiting for the next `FETCH_INTERVAL`. The ≥ 75 % environmental breaker only judges paths whose tunnel is actually up.
 - **Environmental breaker:** ≥ 75 % of paths failing in the same interval ⇒ nothing is ejected/drained, only `viberoxy_env_degraded` moves.
 
 ### Rotation (SPEC-R)
