@@ -71,7 +71,7 @@ All configuration is environment-variable driven; invalid values hard-exit at st
 | `ALLOW_HTTP_SUBSCRIPTION` | No | `false` | Opt in to a plain `http://` subscription (startup refuses it otherwise) |
 | `FETCH_INTERVAL` | No | `300` | Seconds between fetch+test cycles (min 30). Also the rotation cooldown |
 | `TEST_TIMEOUT` | No | `10` | Seconds per speed test (min 3) |
-| `DOWNLOAD_SIZE` | No | `10000000` | Bytes for the speed-test payload (min 1000000) |
+| `DOWNLOAD_SIZE` | No | `1000000` | Bytes for the speed-test payload (min 1000000). Every candidate is measured, so the payload is the bandwidth the tests cost: 1 MB per candidate by default. Raise it for a steadier throughput number on very fast links |
 | `DOWNLOAD_ENDPOINT` | No | `https://speed.cloudflare.com/__down?bytes=` | Primary speed-test URL (empty disables it) |
 | `DOWNLOAD_FALLBACK` | No | `https://proof.ovh.net/files/` | Fallback speed-test URL |
 | `WAN_COUNT` | No | `4` | Max concurrent WANs (1–5) |

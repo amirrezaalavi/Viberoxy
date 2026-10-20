@@ -207,7 +207,7 @@ meaning changed: it now drives the canary band).
 | `ALLOW_HTTP_SUBSCRIPTION` | `false` | Opt in to plain `http://` subscriptions |
 | `FETCH_INTERVAL` | `300` (min 30) | Cycle interval **and** rotation cooldown |
 | `TEST_TIMEOUT` | `10` (min 3) | Seconds per speed test / canary timeout |
-| `DOWNLOAD_SIZE` | `10000000` (min 1000000) | Speed-test payload bytes |
+| `DOWNLOAD_SIZE` | `1000000` (min 1000000) | Speed-test payload bytes (bandwidth cost of testing every candidate) |
 | `DOWNLOAD_ENDPOINT` | `https://speed.cloudflare.com/__down?bytes=` | Empty disables the primary endpoint |
 | `DOWNLOAD_FALLBACK` | `https://proof.ovh.net/files/` | Fallback endpoint |
 | `WAN_COUNT` | `4` (1–5) | Slots |

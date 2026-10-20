@@ -78,8 +78,8 @@ func TestParseConfig_Defaults(t *testing.T) {
 	if cfg.TestTimeout != 10 {
 		t.Errorf("TestTimeout = %d, want %d", cfg.TestTimeout, 10)
 	}
-	if cfg.DownloadSize != 10000000 {
-		t.Errorf("DownloadSize = %d, want %d", cfg.DownloadSize, 10000000)
+	if cfg.DownloadSize != 1000000 {
+		t.Errorf("DownloadSize = %d, want %d", cfg.DownloadSize, 1000000)
 	}
 	if cfg.DownloadEndpoint != "https://speed.cloudflare.com/__down?bytes=" {
 		t.Errorf("DownloadEndpoint = %q, want %q", cfg.DownloadEndpoint, "https://speed.cloudflare.com/__down?bytes=")

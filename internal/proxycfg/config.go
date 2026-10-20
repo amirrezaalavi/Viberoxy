@@ -137,7 +137,12 @@ func ParseConfig() (*Config, error) {
 		cfg.TestTimeout = n
 	}
 
-	cfg.DownloadSize = 10000000
+	// DOWNLOAD_SIZE: bytes moved by ONE speed test. The default is 1 MB:
+	// EVERY candidate is measured, and a 10 MB payload per candidate costs
+	// ten times the bandwidth for a speed number a 1 MB sample already
+	// gives. Raise it when a steadier throughput number matters more than
+	// the bandwidth (a 1 MB sample is noisier on very fast links).
+	cfg.DownloadSize = 1_000_000
 	if v := os.Getenv("DOWNLOAD_SIZE"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
