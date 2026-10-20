@@ -83,6 +83,8 @@ All configuration is environment-variable driven; invalid values hard-exit at st
 | `MAX_TEST_PER_CYCLE` | No | `20` | Max configs speed-tested per cycle while the pool has room (1–500). When the pool is **full**, up to 2 NEW candidates are still evaluated per cycle |
 | `ACCESS_LOG` | No | `true` | One structured log line per proxied connection |
 | `ALLOW_DEGRADED_BOOT` | No | `true` | Start the front-ends as soon as the first WAN is active (vs waiting for a full pool) |
+| `ALLOW_DEGRADED_FALLBACK` | No | `true` | What selection does when **no** routable WAN is left: `true` serves the connection through a degraded (already failing) path or a draining slot and counts it in `viberoxy_selection_last_resort_total`; `false` fails the connection fast (502/503) instead |
+| `REJECT_DIRECT_EXIT` | No | `false` | Reject a candidate whose observed exit IP is this machine's own address. Advisory by default — the same address is also what a self-hosted candidate behind the same public address looks like |
 | `DRAIN_MAX` | No | `600` | Seconds: hard stop for a drain. Normally a drain ends earlier, when in-flight flows finish (`inflight == 0`) |
 
 ### Listeners, auth and security

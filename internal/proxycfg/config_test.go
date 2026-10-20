@@ -511,6 +511,48 @@ func TestParseConfig_InvalidAllowDegradedBoot(t *testing.T) {
 	}
 }
 
+func TestParseConfig_DegradedFallbackAndDirectExit(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+
+	cfg, err := ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if !cfg.AllowDegradedFallback {
+		t.Error("default AllowDegradedFallback = false, want true")
+	}
+	if cfg.RejectDirectExit {
+		t.Error("default RejectDirectExit = true, want false (advisory)")
+	}
+
+	setenv(t, "ALLOW_DEGRADED_FALLBACK", "false")
+	setenv(t, "REJECT_DIRECT_EXIT", "true")
+	cfg, err = ParseConfig()
+	if err != nil {
+		t.Fatalf("parseConfig() error: %v", err)
+	}
+	if cfg.AllowDegradedFallback {
+		t.Error("AllowDegradedFallback = true, want false")
+	}
+	if !cfg.RejectDirectExit {
+		t.Error("RejectDirectExit = false, want true")
+	}
+}
+
+func TestParseConfig_InvalidDegradedFallbackAndDirectExit(t *testing.T) {
+	setenv(t, "SUBSCRIBER_URL", "https://example.com/sub")
+	setenv(t, "ALLOW_DEGRADED_FALLBACK", "maybe")
+	if _, err := ParseConfig(); err == nil {
+		t.Error("expected error for ALLOW_DEGRADED_FALLBACK=maybe, got nil")
+	}
+
+	setenv(t, "ALLOW_DEGRADED_FALLBACK", "true")
+	setenv(t, "REJECT_DIRECT_EXIT", "maybe")
+	if _, err := ParseConfig(); err == nil {
+		t.Error("expected error for REJECT_DIRECT_EXIT=maybe, got nil")
+	}
+}
+
 func TestParseConfig_AllowHTTPSubscriptionTrue(t *testing.T) {
 	setenv(t, "SUBSCRIBER_URL", "http://example.com/sub")
 	setenv(t, "ALLOW_HTTP_SUBSCRIPTION", "true")

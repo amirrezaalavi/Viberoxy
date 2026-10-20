@@ -40,6 +40,17 @@ type Config struct {
 	StabilityProbes   int
 	AccessLog         bool
 	AllowDegradedBoot bool
+	// AllowDegradedFallback controls the runtime last-resort tiers: when
+	// no routable WAN is left, selection may fall back to a degraded
+	// (over-threshold) active path or a draining slot. true (default)
+	// keeps the availability-first behavior; false fails the connection
+	// fast instead of routing it through a known-degraded path.
+	AllowDegradedFallback bool
+	// RejectDirectExit rejects a candidate whose observed exit IP is this
+	// machine's own address (REJECT_DIRECT_EXIT). Advisory by default: the
+	// same address is also what a self-hosted candidate behind the same
+	// public address looks like.
+	RejectDirectExit bool
 	// AllowHTTPSubscription opts in to plain http:// SUBSCRIBER_URL values
 	// (ALLOW_HTTP_SUBSCRIPTION). https-only by default; false unless the
 	// env var explicitly says otherwise.
@@ -376,6 +387,36 @@ func ParseConfig() (*Config, error) {
 			return nil, fmt.Errorf("error: ALLOW_DEGRADED_BOOT=%q: must be a boolean (true/false)", v)
 		}
 		cfg.AllowDegradedBoot = b
+	}
+
+	// ALLOW_DEGRADED_FALLBACK: what selection does when NO routable WAN is
+	// left. true (default) keeps the availability-first behavior: the
+	// connection is served by a degraded path (over the fail threshold) or,
+	// failing that, by a draining slot, and the event is counted in
+	// viberoxy_selection_last_resort_total. false fails the connection fast
+	// (502/503) instead of routing it through a path that is already known
+	// to be failing.
+	cfg.AllowDegradedFallback = true
+	if v := os.Getenv("ALLOW_DEGRADED_FALLBACK"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: ALLOW_DEGRADED_FALLBACK=%q: must be a boolean (true/false)", v)
+		}
+		cfg.AllowDegradedFallback = b
+	}
+
+	// REJECT_DIRECT_EXIT: a candidate whose observed exit IP is this
+	// machine's own address is reported at promotion; with this enabled it
+	// is rejected instead. Advisory by default — the same address is also
+	// what a self-hosted candidate behind the same public address looks
+	// like.
+	cfg.RejectDirectExit = false
+	if v := os.Getenv("REJECT_DIRECT_EXIT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("error: REJECT_DIRECT_EXIT=%q: must be a boolean (true/false)", v)
+		}
+		cfg.RejectDirectExit = b
 	}
 
 	// Split routing: ROUTE_MODE picks the policy, DIRECT_DOMAINS /
