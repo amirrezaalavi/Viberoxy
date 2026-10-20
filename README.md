@@ -301,6 +301,8 @@ ROUTE_MODE=direct-default PROXY_DOMAINS=".google.com,.youtube.com,.instagram.com
 - **Unix only** (Linux/macOS). Windows is untested (process liveness/stop is not build-tagged per OS).
 - **No proxy authentication by default** — set `PROXY_USERS` (the loopback default bind is the baseline protection).
 - Session affinity (HRW per `(client, site)`) and the P2C scheduler **are implemented**; the site key is an embedded eTLD+1 heuristic (not a full public-suffix list), client identity is the SOCKS/CONNECT username when `PROXY_USERS` is set (else client IP — NAT caveat), and a sticky pick carrying >3x the median load spills back to P2C.
+- **A WAN that blocks one destination is not detected.** The canaries only probe the health endpoints, so a tunnel that answers `generate_204` but blocks (say) a video domain stays in the pool. There is no per-destination rescue: the connection is served by the WAN the scheduler picked (and session affinity can keep it there for the session), and no second attempt is made on a different WAN. Exit-IP diversity limits how often two "independent" WANs are actually the same upstream, but it cannot detect a domain-level block.
+- **Running on a domain network without authentication:** set `LISTEN_ADDR` to the address the service should listen on and `ALLOW_PUBLIC=true` (a non-loopback bind is otherwise refused at startup unless `PROXY_USERS`/`API_TOKEN` is set). The control API and `/metrics` are then reachable from the network **without a token** — that is the operator's choice, not a default.
 
 ---
 
